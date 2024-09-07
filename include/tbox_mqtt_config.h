@@ -1,37 +1,35 @@
 //
-// Created by 叶荣杰 on 2024/9/6.
+// Created by 叶荣杰 on 2024/9/7.
 //
 
-#ifndef TSPSERVICE_TSP_MQTT_CONFIG_H
-#define TSPSERVICE_TSP_MQTT_CONFIG_H
+#ifndef TSPSERVICE_TBOX_MQTT_CONFIG_H
+#define TSPSERVICE_TBOX_MQTT_CONFIG_H
 #include "constants.h"
-#endif //TSPSERVICE_TSP_MQTT_CONFIG_H
+#endif //TSPSERVICE_TBOX_MQTT_CONFIG_H
 
-#include <set>
-
-class TspMqttConfig {
+class TboxMqttConfig {
 public:
     /**
      * 析构虚函数
      */
-    virtual ~TspMqttConfig();
+    virtual ~TboxMqttConfig();
 
     /**
      * 获取单例
      * @return 单例
      */
-    static TspMqttConfig &GetInstance();
+    static TboxMqttConfig &GetInstance();
 
     /**
      * 防止对象被复制
      */
-    TspMqttConfig(const TspMqttConfig &) = delete;
+    TboxMqttConfig(const TboxMqttConfig &) = delete;
 
     /**
      * 防止对象被赋值
      * @return
      */
-    TspMqttConfig &operator=(const TspMqttConfig &) = delete;
+    TboxMqttConfig &operator=(const TboxMqttConfig &) = delete;
 
 public:
     /**
@@ -50,7 +48,7 @@ public:
     MqttConfig get_mqtt_config() const;
 
 private:
-    TspMqttConfig();
+    TboxMqttConfig();
 
     /**
      * 生成密码
@@ -61,8 +59,4 @@ private:
 private:
     // MQTT配置
     MqttConfig mqtt_config_;
-    // 订阅主题
-    std::set<std::string> subscribe_topics_ = {
-            "FIND_VEHICLE"
-    };
 };

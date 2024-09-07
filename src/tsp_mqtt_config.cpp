@@ -5,7 +5,9 @@
 
 #include "../include/tsp_mqtt_config.h"
 
-TspMqttConfig::TspMqttConfig() = default;
+TspMqttConfig::TspMqttConfig() : mqtt_config_() {
+    mqtt_config_.subscribe_topics = subscribe_topics_;
+}
 
 TspMqttConfig::~TspMqttConfig() = default;
 
@@ -15,7 +17,7 @@ TspMqttConfig &TspMqttConfig::GetInstance() {
 }
 
 bool TspMqttConfig::SetInfo(const std::string &server_host, const std::string &username, const std::string &client_id) {
-    std::cout << "设置MQTT配置信息" << std::endl;
+    std::cout << "设置TSP MQTT配置信息" << std::endl;
     if (server_host.empty() || username.empty() || client_id.empty()) {
         return false;
     }

@@ -2,6 +2,7 @@
 // Created by 叶荣杰 on 2024/9/5.
 //
 #include <string>
+#include <set>
 
 #ifndef TSPSERVICE_CONSTANTS_H
 #define TSPSERVICE_CONSTANTS_H
@@ -24,6 +25,8 @@ struct MqttConfig {
     std::string password;
     // 使用SSL
     bool use_ssl = false;
+    // 订阅主题
+    std::set<std::string> subscribe_topics;
 };
 
 constexpr char kMqttServerUrl[] = "127.0.0.1";
