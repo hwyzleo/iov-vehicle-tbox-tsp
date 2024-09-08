@@ -79,6 +79,7 @@ void TboxMqttClient::on_connect(int rc) {
 }
 
 void TboxMqttClient::on_disconnect(int rc) {
+    std::cout << "TBOX MQTT客户端断开[" << rc << "]" << std::endl;
     is_connecting_ = false;
     is_connected_ = false;
 }
@@ -106,7 +107,7 @@ void TboxMqttClient::on_log(int level, const char *str) {
 }
 
 void TboxMqttClient::on_error() {
-
+    std::cout << "TBOX MQTT客户端报错" << std::endl;
 }
 
 bool TboxMqttClient::Init() {
@@ -183,8 +184,8 @@ bool TboxMqttClient::GetDeviceInfo(std::string &sn, std::string &vin) const {
     sn.clear();
     vin.clear();
     // 当前先写死
-    sn = "SN001";
-    vin = "HWYZTEST000000001";
+    sn = "TSPSERVICE";
+    vin = "TSPSERVICE";
     std::cout << "获取SN及VIN" << std::endl;
     return true;
 }

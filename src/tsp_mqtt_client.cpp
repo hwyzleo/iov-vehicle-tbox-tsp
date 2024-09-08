@@ -92,7 +92,7 @@ void TspMqttClient::on_publish(int rc) {
 
 void TspMqttClient::on_message(const struct mosquitto_message *message) {
     std::cout << "收到消息主题[" << message->topic << "]" << std::endl;
-    std::cout << "  内容: " << std::string(static_cast<char *>(message->payload), message->payloadlen) << std::endl;
+    std::cout << "内容: " << std::string(static_cast<char *>(message->payload), message->payloadlen) << std::endl;
     int mid = 0;
     std::string topic = message->topic;
     MqttConfig config = TspMqttConfig::GetInstance().get_mqtt_config();
@@ -197,7 +197,7 @@ bool TspMqttClient::Subscribe(int &mid, const std::string &topic, int qos) {
     int rc = this->subscribe(&mid, topic.c_str(), qos);
     std::cout << "订阅主题[" << mid << "][" << topic << "]" << std::endl;
     if (rc != MOSQ_ERR_SUCCESS) {
-        std::cout << "订阅主题:" << topic << " 失败" << std::endl;
+        std::cout << "订阅主题[" << topic << "]失败" << std::endl;
         return false;
     }
     cv_loop_.notify_all();
