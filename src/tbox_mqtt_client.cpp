@@ -3,8 +3,10 @@
 //
 #include <iostream>
 
-#include "../include/tbox_mqtt_client.h"
-#include "../include/tbox_mqtt_config.h"
+#include "../third_party/include/spdlog/spdlog.h"
+
+#include "tbox_mqtt_client.h"
+#include "tbox_mqtt_config.h"
 
 TboxMqttClient::TboxMqttClient() : mosqpp::mosquittopp() {}
 
@@ -19,7 +21,7 @@ TboxMqttClient &TboxMqttClient::GetInstance() {
 
 bool TboxMqttClient::Start() {
     if (!is_started_) {
-        std::cout << "启动TBOX MQTT客户端" << std::endl;
+        spdlog::info("启动TBOX MQTT客户端");
         this->ConnectManage();
         is_started_ = true;
     }
@@ -46,7 +48,7 @@ bool TboxMqttClient::Publish(int &mid, const std::string &topic, const void *pay
     if (!is_connected_) {
         return false;
     }
-    std::cout << "转发TSP消息[" << std::string(static_cast<const char*>(payload), payload_len) << "]至主题[" << topic << "]" << std::endl;
+    spdlog::info("转发TSP消息[{}]至主题[{}]", std::string(static_cast<const char *>(payload), payload_len), topic);
     int rc = mosquittopp::publish(&mid, topic.c_str(), payload_len, payload, qos, false);
     if (rc == MOSQ_ERR_SUCCESS) {
         cv_loop_.notify_all();
@@ -74,12 +76,12 @@ void TboxMqttClient::on_connect(int rc) {
     is_connecting_ = false;
     is_connected_ = (rc == MOSQ_ERR_SUCCESS);
     if (is_connected_) {
-        std::cout << "TBOX MQTT客户端连接成功" << std::endl;
+        spdlog::info("TBOX MQTT客户端连接成功");
     }
 }
 
 void TboxMqttClient::on_disconnect(int rc) {
-    std::cout << "TBOX MQTT客户端断开[" << rc << "]" << std::endl;
+    spdlog::info("TBOX MQTT客户端断开[{}]", rc);
     is_connecting_ = false;
     is_connected_ = false;
 }
@@ -89,9 +91,7 @@ void TboxMqttClient::on_publish(int rc) {
 }
 
 void TboxMqttClient::on_message(const struct mosquitto_message *message) {
-    std::cout << "收到消息：" << std::endl;
-    std::cout << "  主题: " << message->topic << std::endl;
-    std::cout << "  内容: " << std::string(static_cast<char *>(message->payload), message->payloadlen) << std::endl;
+    spdlog::debug("收到消息主题[{}]内容[{}]", message->topic, std::string(static_cast<char *>(message->payload), message->payloadlen));
 }
 
 void TboxMqttClient::on_subscribe(int mid, int qos_count, const int *granted_qos) {
@@ -107,15 +107,15 @@ void TboxMqttClient::on_log(int level, const char *str) {
 }
 
 void TboxMqttClient::on_error() {
-    std::cout << "TBOX MQTT客户端报错" << std::endl;
+    spdlog::info("TBOX MQTT客户端报错");
 }
 
 bool TboxMqttClient::Init() {
     if (!is_inited_) {
-        std::cout << "初始化TBOX MQTT客户端" << std::endl;
+        spdlog::info("初始化TBOX MQTT客户端");
         int rc = mosqpp::lib_init();
         if (rc == MOSQ_ERR_SUCCESS) {
-            std::cout << "TBOX MQTT客户端初始化成功" << std::endl;
+            spdlog::info("TBOX MQTT客户端初始化成功");
             is_inited_ = true;
         }
     }
@@ -127,7 +127,7 @@ void TboxMqttClient::ConnectManage() {
         bool is_first_connect = true;
         while (is_started_) {
             if (!Init()) {
-                std::cout << "TBOX MQTT客户端初始化失败" << std::endl;
+                spdlog::info("TBOX MQTT客户端初始化失败");
                 std::this_thread::sleep_for(std::chrono::seconds(kMqttReconnectIntervalSecond));
                 continue;
             }
@@ -161,20 +161,20 @@ bool TboxMqttClient::Connect() {
         return false;
     }
     MqttConfig config = TboxMqttConfig::GetInstance().get_mqtt_config();
-    std::cout << "重置客户端ID" << std::endl;
+    spdlog::info("重置客户端ID");
     int rc = this->reinitialise(config.client_id.c_str(), true);
     if (rc != MOSQ_ERR_SUCCESS) {
         return false;
     }
-    std::cout << "设置用户名密码" << std::endl;
+    spdlog::info("设置用户名密码");
     rc = this->username_pw_set(config.username.c_str(), config.password.c_str());
     if (rc != MOSQ_ERR_SUCCESS) {
         return false;
     }
-    std::cout << "连接TBOX MQTT[" << config.server_host << ":" << config.server_port << "]" << std::endl;
+    spdlog::info("连接TBOX MQTT[{}:{}]", config.server_host, config.server_port);
     rc = mosquittopp::connect(config.server_host.c_str(), config.server_port, config.keepalive);
     if (rc != MOSQ_ERR_SUCCESS) {
-        std::cout << "连接TBOX MQTT失败" << std::endl;
+        spdlog::info("连接TBOX MQTT失败");
         return false;
     }
     return true;
@@ -186,6 +186,6 @@ bool TboxMqttClient::GetDeviceInfo(std::string &sn, std::string &vin) const {
     // 当前先写死
     sn = "TSPSERVICE";
     vin = "TSPSERVICE";
-    std::cout << "获取SN及VIN" << std::endl;
+    spdlog::info("获取SN及VIN");
     return true;
 }

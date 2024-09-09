@@ -12,8 +12,10 @@ include_directories(${PROJECT_SOURCE_DIR}/third_party/include)
 
 # 添加库文件目录
 link_directories(${PROJECT_SOURCE_DIR}/third_party/lib/arm64-apple-darwin/mosquitto)
+link_directories(${PROJECT_SOURCE_DIR}/third_party/lib/arm64-apple-darwin/spdlog)
 link_libraries(mosquitto)
 link_libraries(mosquittopp)
+link_libraries(spdlog)
 
 # 添加可执行文件
 add_executable(TspService

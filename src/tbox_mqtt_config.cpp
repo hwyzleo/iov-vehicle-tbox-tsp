@@ -3,7 +3,9 @@
 //
 #include <iostream>
 
-#include "../include/tbox_mqtt_config.h"
+#include "../third_party/include/spdlog/spdlog.h"
+
+#include "tbox_mqtt_config.h"
 
 TboxMqttConfig::TboxMqttConfig() = default;
 
@@ -14,8 +16,9 @@ TboxMqttConfig &TboxMqttConfig::GetInstance() {
     return instance;
 }
 
-bool TboxMqttConfig::SetInfo(const std::string &server_host, const std::string &username, const std::string &client_id) {
-    std::cout << "设置TBOX MQTT配置信息" << std::endl;
+bool TboxMqttConfig::SetInfo(const std::string &server_host, const std::string &username,
+                             const std::string &client_id) {
+    spdlog::info("设置TBOX MQTT配置信息");
     if (server_host.empty() || username.empty() || client_id.empty()) {
         return false;
     }
