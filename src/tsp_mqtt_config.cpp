@@ -8,7 +8,10 @@
 #include "tsp_mqtt_config.h"
 
 TspMqttConfig::TspMqttConfig() : mqtt_config_() {
+    spdlog::info("初始化TSP MQTT配置信息");
     mqtt_config_.subscribe_topics = subscribe_topics_;
+    mqtt_config_.server_host = server_host_;
+    mqtt_config_.server_port = server_port_;
 }
 
 TspMqttConfig::~TspMqttConfig() = default;
@@ -18,12 +21,11 @@ TspMqttConfig &TspMqttConfig::GetInstance() {
     return instance;
 }
 
-bool TspMqttConfig::SetInfo(const std::string &server_host, const std::string &username, const std::string &client_id) {
+bool TspMqttConfig::SetInfo(const std::string &username, const std::string &client_id) {
     spdlog::info("设置TSP MQTT配置信息");
-    if (server_host.empty() || username.empty() || client_id.empty()) {
+    if (username.empty() || client_id.empty()) {
         return false;
     }
-    mqtt_config_.server_host = server_host;
     mqtt_config_.username = username;
     mqtt_config_.client_id = client_id;
     return GeneratePassword();

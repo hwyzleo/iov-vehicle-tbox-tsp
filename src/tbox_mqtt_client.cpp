@@ -157,7 +157,7 @@ bool TboxMqttClient::Connect() {
     if (!GetDeviceInfo(sn, vin)) {
         return false;
     }
-    if (!TboxMqttConfig::GetInstance().SetInfo(kMqttServerUrl, vin, sn)) {
+    if (!TboxMqttConfig::GetInstance().SetInfo(vin, sn)) {
         return false;
     }
     MqttConfig config = TboxMqttConfig::GetInstance().get_mqtt_config();

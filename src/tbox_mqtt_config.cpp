@@ -7,7 +7,11 @@
 
 #include "tbox_mqtt_config.h"
 
-TboxMqttConfig::TboxMqttConfig() = default;
+TboxMqttConfig::TboxMqttConfig() : mqtt_config_() {
+    spdlog::info("初始化TBOX MQTT配置信息");
+    mqtt_config_.server_host = server_host_;
+    mqtt_config_.server_port = server_port_;
+}
 
 TboxMqttConfig::~TboxMqttConfig() = default;
 
@@ -16,14 +20,11 @@ TboxMqttConfig &TboxMqttConfig::GetInstance() {
     return instance;
 }
 
-bool TboxMqttConfig::SetInfo(const std::string &server_host, const std::string &username,
-                             const std::string &client_id) {
+bool TboxMqttConfig::SetInfo(const std::string &username, const std::string &client_id) {
     spdlog::info("设置TBOX MQTT配置信息");
-    if (server_host.empty() || username.empty() || client_id.empty()) {
+    if (username.empty() || client_id.empty()) {
         return false;
     }
-    mqtt_config_.server_host = server_host;
-    mqtt_config_.server_port = 1884;
     mqtt_config_.username = username;
     mqtt_config_.client_id = client_id;
     return GeneratePassword();

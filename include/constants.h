@@ -28,6 +28,4 @@ struct MqttConfig {
     // 订阅主题
     std::set<std::string> subscribe_topics;
 };
-
-constexpr char kMqttServerUrl[] = "127.0.0.1";
 #endif //TSPSERVICE_CONSTANTS_H

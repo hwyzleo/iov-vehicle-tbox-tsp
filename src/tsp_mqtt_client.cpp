@@ -166,7 +166,7 @@ bool TspMqttClient::Connect() {
     if (!GetDeviceInfo(sn, vin)) {
         return false;
     }
-    if (!TspMqttConfig::GetInstance().SetInfo(kMqttServerUrl, vin, sn)) {
+    if (!TspMqttConfig::GetInstance().SetInfo(vin, sn)) {
         return false;
     }
     MqttConfig config = TspMqttConfig::GetInstance().get_mqtt_config();

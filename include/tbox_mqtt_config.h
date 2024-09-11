@@ -34,12 +34,11 @@ public:
 public:
     /**
      * 设置信息
-     * @param server_host 服务器地址
      * @param username 用户名
      * @param client_id 客户端ID
      * @return 是否设置成功
      */
-    bool SetInfo(const std::string &server_host, const std::string &username, const std::string &client_id);
+    bool SetInfo(const std::string &username, const std::string &client_id);
 
     /**
      * 获取MQTT配置
@@ -59,4 +58,8 @@ private:
 private:
     // MQTT配置
     MqttConfig mqtt_config_;
+    // 服务器地址
+    std::string server_host_ = "127.0.0.1";
+    // 服务器端口
+    int server_port_ = 1883;
 };
