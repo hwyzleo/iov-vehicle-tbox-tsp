@@ -9,6 +9,7 @@
 
 TboxMqttConfig::TboxMqttConfig() : mqtt_config_() {
     spdlog::info("初始化TBOX MQTT配置信息");
+    mqtt_config_.subscribe_topics = subscribe_topics_;
     mqtt_config_.server_host = server_host_;
     mqtt_config_.server_port = server_port_;
 }

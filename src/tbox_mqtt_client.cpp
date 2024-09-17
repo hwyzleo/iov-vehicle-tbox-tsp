@@ -2,11 +2,16 @@
 // Created by 叶荣杰 on 2024/9/7.
 //
 #include <iostream>
+#include <regex>
 
 #include "../third_party/include/spdlog/spdlog.h"
+#include "../third_party/include/nlohmann/json.hpp"
+
+using json = nlohmann::json;
 
 #include "tbox_mqtt_client.h"
 #include "tbox_mqtt_config.h"
+#include "tsp_mqtt_client.h"
 
 TboxMqttClient::TboxMqttClient() : mosqpp::mosquittopp() {}
 
@@ -57,26 +62,18 @@ bool TboxMqttClient::Publish(int &mid, const std::string &topic, const void *pay
     return false;
 }
 
-bool TboxMqttClient::Subscribe(int &mid, const std::string &topic, int qos) {
-    if (!is_connected_) {
-        return false;
-    }
-    if (topic.empty()) {
-        return false;
-    }
-    int rc = this->subscribe(&mid, topic.c_str(), qos);
-    if (rc == MOSQ_ERR_SUCCESS) {
-        cv_loop_.notify_all();
-        return true;
-    }
-    return false;
-}
-
 void TboxMqttClient::on_connect(int rc) {
     is_connecting_ = false;
     is_connected_ = (rc == MOSQ_ERR_SUCCESS);
     if (is_connected_) {
         spdlog::info("TBOX MQTT客户端连接成功");
+        MqttConfig config = TboxMqttConfig::GetInstance().get_mqtt_config();
+        std::string whole_topic = "TSP/";
+        for (const auto &topic: config.subscribe_topics) {
+            int mid = 0;
+            Subscribe(mid, whole_topic.append(topic), 1);
+        }
+        is_subscribed_ = true;
     }
 }
 
@@ -91,7 +88,27 @@ void TboxMqttClient::on_publish(int rc) {
 }
 
 void TboxMqttClient::on_message(const struct mosquitto_message *message) {
-    spdlog::debug("收到消息主题[{}]内容[{}]", message->topic, std::string(static_cast<char *>(message->payload), message->payloadlen));
+    spdlog::debug("收到消息主题[{}]内容[{}]", message->topic,
+                  std::string(static_cast<char *>(message->payload), message->payloadlen));
+    const char *char_payload = static_cast<const char *>(message->payload);
+    std::string json_string(char_payload, message->payloadlen);
+    json json_object;
+    try {
+        json_object = json::parse(json_string);
+    } catch (json::parse_error &e) {
+        std::cerr << "JSON解析错误: " << e.what() << std::endl;
+        return;
+    }
+    MqttConfig config = TboxMqttConfig::GetInstance().get_mqtt_config();
+    json_object["vin"] = config.username;
+    std::string params_json = json_object.dump();
+    int mid = 0;
+    std::string topic = message->topic;
+    std::regex pattern("TSP/");
+    std::string biz_topic = std::regex_replace(topic, pattern, "");
+    std::string prefix_topic = "UP/";
+    std::string whole_topic = prefix_topic.append(config.username).append("/").append(biz_topic);
+    TspMqttClient::GetInstance().Publish(mid, whole_topic, params_json.c_str(), static_cast<int>(params_json.length()));
 }
 
 void TboxMqttClient::on_subscribe(int mid, int qos_count, const int *granted_qos) {
@@ -180,12 +197,27 @@ bool TboxMqttClient::Connect() {
     return true;
 }
 
+bool TboxMqttClient::Subscribe(int &mid, const std::string &topic, int qos) {
+    if (!is_connected_) {
+        return false;
+    }
+    if (topic.empty()) {
+        return false;
+    }
+    int rc = this->subscribe(&mid, topic.c_str(), qos);
+    if (rc == MOSQ_ERR_SUCCESS) {
+        cv_loop_.notify_all();
+        return true;
+    }
+    return false;
+}
+
 bool TboxMqttClient::GetDeviceInfo(std::string &sn, std::string &vin) const {
     sn.clear();
     vin.clear();
     // 当前先写死
     sn = "TSPSERVICE";
-    vin = "TSPSERVICE";
+    vin = "HWYZTEST000000001";
     spdlog::info("获取SN及VIN");
     return true;
 }

@@ -58,6 +58,10 @@ private:
 private:
     // MQTT配置
     MqttConfig mqtt_config_;
+    // 订阅主题
+    std::set<std::string> subscribe_topics_ = {
+            "FIND_VEHICLE"
+    };
     // 服务器地址
     std::string server_host_ = "127.0.0.1";
     // 服务器端口

@@ -70,15 +70,6 @@ public:
      */
     bool Publish(int &mid, const std::string &topic, const void *payload = nullptr, int payload_len = 0, int qos = 1);
 
-    /**
-     * 订阅
-     * @param mid 消息ID
-     * @param topic 主题
-     * @param qos 消息质量
-     * @return 是否订阅成功
-     */
-    bool Subscribe(int &mid, const std::string &topic, int qos = 1);
-
     void on_connect(int rc) override;
 
     void on_disconnect(int rc) override;
@@ -117,6 +108,15 @@ private:
     bool Connect();
 
     /**
+     * 订阅
+     * @param mid 消息ID
+     * @param topic 主题
+     * @param qos 消息质量
+     * @return 是否订阅成功
+     */
+    bool Subscribe(int &mid, const std::string &topic, int qos = 1);
+
+    /**
      * 获取设备信息
      * @param sn 设备序列号
      * @param vin 车架号
@@ -133,6 +133,8 @@ private:
     std::atomic_bool is_connected_{false};
     // 是否连接中
     std::atomic_bool is_connecting_{false};
+    // 是否订阅
+    std::atomic_bool is_subscribed_{false};
     // 连接器
     std::thread connector;
     // 轮询锁

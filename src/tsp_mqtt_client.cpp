@@ -99,8 +99,10 @@ void TspMqttClient::on_message(const struct mosquitto_message *message) {
     std::string topic = message->topic;
     MqttConfig config = TspMqttConfig::GetInstance().get_mqtt_config();
     std::regex pattern("DOWN/" + config.username + "/");
-    std::string internal_topic = std::regex_replace(topic, pattern, "");
-    TboxMqttClient::GetInstance().Publish(mid, internal_topic, message->payload, message->payloadlen);
+    std::string biz_topic = std::regex_replace(topic, pattern, "");
+    std::string prefix_topic = "APP/";
+    std::string whole_topic = prefix_topic.append(biz_topic);
+    TboxMqttClient::GetInstance().Publish(mid, whole_topic, message->payload, message->payloadlen);
 }
 
 void TspMqttClient::on_subscribe(int mid, int qos_count, const int *granted_qos) {
