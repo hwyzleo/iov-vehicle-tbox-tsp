@@ -12,6 +12,7 @@ using json = nlohmann::json;
 #include "tbox_mqtt_client.h"
 #include "tbox_mqtt_config.h"
 #include "tsp_mqtt_client.h"
+#include "base64.h"
 
 TboxMqttClient::TboxMqttClient() : mosqpp::mosquittopp() {}
 
@@ -53,8 +54,10 @@ bool TboxMqttClient::Publish(int &mid, const std::string &topic, const void *pay
     if (!is_connected_) {
         return false;
     }
-    spdlog::info("转发TSP消息[{}]至主题[{}]", std::string(static_cast<const char *>(payload), payload_len), topic);
-    int rc = mosquittopp::publish(&mid, topic.c_str(), payload_len, payload, qos, false);
+    std::string base64_payload = base64_encode(std::string(static_cast<const char *>(payload), payload_len));
+    int rc = mosquittopp::publish(&mid, topic.c_str(), static_cast<int>(base64_payload.length()),
+                                  base64_payload.c_str(), qos, false);
+    spdlog::info("转发[{}]TSP消息[{}]至主题[{}]QOS[{}]", mid, base64_payload, topic, qos);
     if (rc == MOSQ_ERR_SUCCESS) {
         cv_loop_.notify_all();
         return true;
@@ -84,14 +87,14 @@ void TboxMqttClient::on_disconnect(int rc) {
 }
 
 void TboxMqttClient::on_publish(int rc) {
-
+    spdlog::info("转发[{}]TSP消息成功", rc);
 }
 
 void TboxMqttClient::on_message(const struct mosquitto_message *message) {
     spdlog::debug("收到消息主题[{}]内容[{}]", message->topic,
                   std::string(static_cast<char *>(message->payload), message->payloadlen));
-    const char *char_payload = static_cast<const char *>(message->payload);
-    std::string json_string(char_payload, message->payloadlen);
+    std::string payload = base64_decode(std::string(static_cast<char *>(message->payload), message->payloadlen));
+    std::string json_string(payload.c_str(), payload.length());
     json json_object;
     try {
         json_object = json::parse(json_string);

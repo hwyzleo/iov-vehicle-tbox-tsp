@@ -15,7 +15,7 @@ constexpr int kMqttLoopIntervalMilliSecond = 100;
 struct MqttConfig {
     // 服务器地址
     std::string server_host;
-    std::uint16_t server_port = 1883;
+    std::uint16_t server_port;
     int keepalive = 60;
     // 客户端ID
     std::string client_id;

@@ -60,6 +60,8 @@ bool TspMqttClient::Publish(int &mid, const std::string &topic, const void *payl
         return false;
     }
     int rc = mosquittopp::publish(&mid, topic.c_str(), payload_len, payload, qos, false);
+    spdlog::info("转发[{}]APP消息[{}]至主题[{}]QOS[{}]", mid,
+                 std::string(static_cast<const char *>(payload), payload_len), topic, qos);
     if (rc == MOSQ_ERR_SUCCESS) {
         cv_loop_.notify_all();
         return true;
