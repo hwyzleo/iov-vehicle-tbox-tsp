@@ -1,0 +1,7 @@
+tsp:
+  server:
+    host: 168.138.1.101
+    port: 1883
+
+log:
+  type: console

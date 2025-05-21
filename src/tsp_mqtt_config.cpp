@@ -1,5 +1,5 @@
 //
-// Created by 叶荣杰 on 2024/9/6.
+// Created by hwyz_leo on 2024/9/6.
 //
 #include <iostream>
 
@@ -10,8 +10,6 @@
 TspMqttConfig::TspMqttConfig() : mqtt_config_() {
     spdlog::info("初始化TSP MQTT配置信息");
     mqtt_config_.subscribe_topics = subscribe_topics_;
-    mqtt_config_.server_host = server_host_;
-    mqtt_config_.server_port = server_port_;
 }
 
 TspMqttConfig::~TspMqttConfig() = default;
@@ -19,6 +17,18 @@ TspMqttConfig::~TspMqttConfig() = default;
 TspMqttConfig &TspMqttConfig::GetInstance() {
     static TspMqttConfig instance;
     return instance;
+}
+
+bool TspMqttConfig::LoadConfig(const YAML::Node &config) {
+    spdlog::info("加载TSP MQTT配置信息");
+    std::string server_host = config["tsp"]["server"]["host"].as<std::string>();
+    auto server_port = config["tsp"]["server"]["port"].as<std::uint16_t>();
+    if (server_host.empty() || server_port == 0) {
+        return false;
+    }
+    mqtt_config_.server_host = server_host;
+    mqtt_config_.server_port = server_port;
+    return true;
 }
 
 bool TspMqttConfig::SetInfo(const std::string &username, const std::string &client_id) {

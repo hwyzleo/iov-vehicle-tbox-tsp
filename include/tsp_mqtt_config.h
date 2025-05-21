@@ -1,10 +1,11 @@
 //
-// Created by 叶荣杰 on 2024/9/6.
+// Created by hwyz_leo on 2024/9/6.
 //
 
 #ifndef TSPSERVICE_TSP_MQTT_CONFIG_H
 #define TSPSERVICE_TSP_MQTT_CONFIG_H
 #include "constants.h"
+#include "../third_party/include/yaml-cpp/yaml.h"
 #endif //TSPSERVICE_TSP_MQTT_CONFIG_H
 
 #include <set>
@@ -35,6 +36,13 @@ public:
 
 public:
     /**
+     * 加载配置
+     * @param config 配置信息
+     * @return 是否加载成功
+     */
+    bool LoadConfig(const YAML::Node &config);
+
+    /**
      * 设置信息
      * @param username 用户名
      * @param client_id 客户端ID
@@ -64,8 +72,5 @@ private:
     std::set<std::string> subscribe_topics_ = {
             "FIND_VEHICLE"
     };
-    // 服务器地址
-    std::string server_host_ = "192.168.2.223";
-    // 服务器端口
-    int server_port_ = 1883;
+
 };
