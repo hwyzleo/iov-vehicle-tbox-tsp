@@ -1,7 +1,18 @@
 tsp:
-  server:
-    host: 192.168.2.223
+  mqtt:
+    host: vagw.rox-motor.com
     port: 1883
+  http:
+    domain: sgw.rox-motor.com
+    path:
+      cert-apply: /tbox/cert/apply
+      cert-renew: /tbox/cert/renew
+
+sec:
+  cert:
+    path: ./rox-motor.crt
+  sk:
+    path: ./skstore
 
 logger:
   type: console

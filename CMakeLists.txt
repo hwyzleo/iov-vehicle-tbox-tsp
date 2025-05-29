@@ -38,8 +38,11 @@ add_executable(TspService
         src/tsp_mqtt_config.cpp
         src/tbox_mqtt_client.cpp
         src/tbox_mqtt_config.cpp
-        )
+        src/security_manager.cpp
+        src/tsp_http_client.cpp)
 
 # 添加头文件目录
 target_include_directories(TspService PRIVATE ${PROJECT_SOURCE_DIR}/include)
 target_include_directories(TspService PRIVATE ${PROJECT_SOURCE_DIR}/third_party/include)
+find_package(CURL REQUIRED)
+target_link_libraries(TspService PRIVATE ${CURL_LIBRARIES})

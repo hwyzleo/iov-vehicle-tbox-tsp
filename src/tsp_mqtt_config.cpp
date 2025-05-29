@@ -21,8 +21,8 @@ TspMqttConfig &TspMqttConfig::GetInstance() {
 
 bool TspMqttConfig::LoadConfig(const YAML::Node &config) {
     spdlog::info("加载TSP MQTT配置信息");
-    std::string server_host = config["tsp"]["server"]["host"].as<std::string>();
-    auto server_port = config["tsp"]["server"]["port"].as<std::uint16_t>();
+    std::string server_host = config["tsp"]["mqtt"]["host"].as<std::string>();
+    auto server_port = config["tsp"]["mqtt"]["port"].as<std::uint16_t>();
     if (server_host.empty() || server_port == 0) {
         return false;
     }
