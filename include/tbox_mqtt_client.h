@@ -1,5 +1,5 @@
 //
-// Created by 叶荣杰 on 2024/9/7.
+// Created by hwyz_leo on 2024/9/7.
 //
 
 #ifndef TSPSERVICE_TBOX_MQTT_CLIENT_H
@@ -27,7 +27,7 @@ public:
      * 获取单例
      * @return 单例
      */
-    static TboxMqttClient &GetInstance();
+    static TboxMqttClient &get_instance();
 
     /**
      * 防止对象被复制
@@ -46,18 +46,18 @@ public:
      * 启动
      * @return 启动是否成功
      */
-    bool Start();
+    bool start();
 
     /**
      * 停止
      */
-    void Stop();
+    void stop();
 
     /**
      * 是否连接
      * @return 是否连接成功
      */
-    bool IsConnected() const;
+    bool is_connected() const;
 
     /**
      * 发布
@@ -68,7 +68,7 @@ public:
      * @param qos 消息质量
      * @return 是否发布成功
      */
-    bool Publish(int &mid, const std::string &topic, const void *payload = nullptr, int payload_len = 0, int qos = 1);
+    bool publish(int &mid, const std::string &topic, const void *payload = nullptr, int payload_len = 0, int qos = 1);
 
     void on_connect(int rc) override;
 
@@ -94,27 +94,27 @@ private:
      * 初始化
      * @return 初始化是否成功
      */
-    bool Init();
+    bool init();
 
     /**
      * 连接管理
      */
-    void ConnectManage();
+    void connect_manage();
 
     /**
      * 连接
      * @return 是否连接成功
      */
-    bool Connect();
+    bool connect();
 
     /**
-     * 订阅
+     * 订阅TBOX主题
      * @param mid 消息ID
      * @param topic 主题
      * @param qos 消息质量
      * @return 是否订阅成功
      */
-    bool Subscribe(int &mid, const std::string &topic, int qos = 1);
+    bool subscribe_tbox(int &mid, const std::string &topic, int qos = 1);
 
     /**
      * 获取设备信息
@@ -122,7 +122,7 @@ private:
      * @param vin 车架号
      * @return 是否获取成功
      */
-    bool GetDeviceInfo(std::string &sn, std::string &vin) const;
+    bool get_device_info(std::string &sn, std::string &vin) const;
 
 private:
     // 是否初始化

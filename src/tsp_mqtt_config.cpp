@@ -14,12 +14,12 @@ TspMqttConfig::TspMqttConfig() : mqtt_config_() {
 
 TspMqttConfig::~TspMqttConfig() = default;
 
-TspMqttConfig &TspMqttConfig::GetInstance() {
+TspMqttConfig &TspMqttConfig::get_instance() {
     static TspMqttConfig instance;
     return instance;
 }
 
-bool TspMqttConfig::LoadConfig(const YAML::Node &config) {
+bool TspMqttConfig::load_config(const YAML::Node &config) {
     spdlog::info("加载TSP MQTT配置信息");
     std::string server_host = config["tsp"]["mqtt"]["host"].as<std::string>();
     auto server_port = config["tsp"]["mqtt"]["port"].as<std::uint16_t>();
@@ -31,21 +31,21 @@ bool TspMqttConfig::LoadConfig(const YAML::Node &config) {
     return true;
 }
 
-bool TspMqttConfig::SetInfo(const std::string &username, const std::string &client_id) {
+bool TspMqttConfig::set_info(const std::string &username, const std::string &client_id) {
     spdlog::info("设置TSP MQTT配置信息");
     if (username.empty() || client_id.empty()) {
         return false;
     }
     mqtt_config_.username = username;
     mqtt_config_.client_id = client_id;
-    return GeneratePassword();
+    return generate_password();
 }
 
 MqttConfig TspMqttConfig::get_mqtt_config() const {
     return mqtt_config_;
 }
 
-bool TspMqttConfig::GeneratePassword() {
+bool TspMqttConfig::generate_password() {
     // 临时默认密码
     mqtt_config_.password = "111111";
     return true;

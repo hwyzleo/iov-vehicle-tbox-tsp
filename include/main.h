@@ -11,4 +11,4 @@
  * 初始化日志
  * @param config 配置
  */
-void initLogger(const YAML::Node& config);
+void init_logger(const YAML::Node& config);

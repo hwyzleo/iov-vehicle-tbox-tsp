@@ -20,36 +20,39 @@
 // 主函数
 int main() {
     // 加载配置
-    std::string filePath = CommonFunction::GetConfigFilePath();
-    YAML::Node config = YAML::LoadFile(filePath);
+    std::string file_path = CommonFunction::get_config_file_path();
+    YAML::Node config = YAML::LoadFile(file_path);
     // 初始化日志
-    initLogger(config);
+    init_logger(config);
     // 加载TSP HTTP配置
-    TspHttpClient::GetInstance().LoadConfig(config);
+    TspHttpClient::get_instance().load_config(config);
     // TODO 从CAN服务获取车辆信息
     std::string vin = "HWYZTEST000000001";
     std::string sn = "10000000XXYY000001";
-    TspHttpClient::GetInstance().LoadVehicleInfo(vin, sn);
+    TspHttpClient::get_instance().load_vehicle_info(vin, sn);
     // 检查证书及密钥
-    SecurityManager::GetInstance().LoadConfig(config);
-    if (!SecurityManager::GetInstance().CheckCertification()) {
+    SecurityManager::get_instance().load_config(config);
+    if (!SecurityManager::get_instance().check_certification()) {
         spdlog::error("证书检查失败");
         return -1;
     }
-    SecurityManager::GetInstance().CheckSecretKey();
+    if (!SecurityManager::get_instance().check_communication_secret_key()) {
+        spdlog::error("通讯密钥检查失败");
+        return -1;
+    }
     // 加载TSP MQTT配置
-    TspMqttConfig::GetInstance().LoadConfig(config);
+    TspMqttConfig::get_instance().load_config(config);
     // 启动TSP MQTT客户端
-    TspMqttClient::GetInstance().Start();
+    TspMqttClient::get_instance().start();
     // 启动TBOX MQTT客户端
-    TboxMqttClient::GetInstance().Start();
+    TboxMqttClient::get_instance().start();
     spdlog::info("主函数运行");
     while (true) {
         std::this_thread::sleep_for(std::chrono::seconds(10));
     }
 }
 
-void initLogger(const YAML::Node &config) {
+void init_logger(const YAML::Node &config) {
     std::string logger_type = config["logger"]["type"].as<std::string>();
     if (logger_type == "file") {
         std::string logger_path = config["logger"]["path"].as<std::string>();

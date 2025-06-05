@@ -1,5 +1,5 @@
 //
-// Created by 叶荣杰 on 2024/9/7.
+// Created by hwyz_leo on 2024/9/7.
 //
 #include <iostream>
 
@@ -16,26 +16,26 @@ TboxMqttConfig::TboxMqttConfig() : mqtt_config_() {
 
 TboxMqttConfig::~TboxMqttConfig() = default;
 
-TboxMqttConfig &TboxMqttConfig::GetInstance() {
+TboxMqttConfig &TboxMqttConfig::get_instance() {
     static TboxMqttConfig instance;
     return instance;
 }
 
-bool TboxMqttConfig::SetInfo(const std::string &username, const std::string &client_id) {
+bool TboxMqttConfig::set_info(const std::string &username, const std::string &client_id) {
     spdlog::info("设置TBOX MQTT配置信息");
     if (username.empty() || client_id.empty()) {
         return false;
     }
     mqtt_config_.username = username;
     mqtt_config_.client_id = client_id;
-    return GeneratePassword();
+    return generate_password();
 }
 
 MqttConfig TboxMqttConfig::get_mqtt_config() const {
     return mqtt_config_;
 }
 
-bool TboxMqttConfig::GeneratePassword() {
+bool TboxMqttConfig::generate_password() {
     // 临时默认密码
     mqtt_config_.password = "111111";
     return true;

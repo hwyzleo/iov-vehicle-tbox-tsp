@@ -22,7 +22,7 @@ public:
      * 获取单例
      * @return 单例
      */
-    static TspHttpClient &GetInstance();
+    static TspHttpClient &get_instance();
 
     /**
      * 防止对象被复制
@@ -41,7 +41,7 @@ public:
      * @param config 配置信息
      * @return 是否加载成功
      */
-    bool LoadConfig(const YAML::Node &config);
+    bool load_config(const YAML::Node &config);
 
     /**
      * 加载车辆信息
@@ -49,14 +49,14 @@ public:
      * @param sn TBox序列号
      * @return 是否加载成功
      */
-    bool LoadVehicleInfo(const std::string vin, const std::string sn);
+    bool load_vehicle_info(const std::string vin, const std::string sn);
 
     /**
      * GET请求
      * @param path 请求路径
      * @return    请求结果
      */
-    std::string Get(const std::string &path);
+    std::string get(const std::string &path);
 
     /**
      * POST请求
@@ -64,7 +64,7 @@ public:
      * @param data 请求数据
      * @return     请求结果
      */
-    std::string Post(const std::string &path, const std::string &data);
+    std::string post(const std::string &path, const std::string &data);
 
 private:
     /**
@@ -80,14 +80,14 @@ private:
      * @param s
      * @return
      */
-    static size_t WriteCallback(void *contents, size_t size, size_t nmemb, std::string *s);
+    static size_t write_callback(void *contents, size_t size, size_t nmemb, std::string *s);
 
     /**
      * 构造请求头
      * @param headers 请求头
      * @return 请求头
      */
-    void PackageHeaders(struct curl_slist *&headers);
+    void package_headers(struct curl_slist *&headers);
 
 private:
     // 服务器域名

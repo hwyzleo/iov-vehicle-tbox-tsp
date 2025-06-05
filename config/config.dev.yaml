@@ -7,12 +7,14 @@ tsp:
     path:
       cert-apply: /tbox/cert/apply
       cert-renew: /tbox/cert/renew
+      comm-sk-apply: /tbox/sk/applyCommSk
 
 sec:
   cert:
     path: ./rox-motor.crt
   sk:
-    path: ./skstore
+    path: ./sk-store
+    default-hex: 2fc827a3a3fc0e89ad0b1ef986e315fa
 
 logger:
   type: console

@@ -10,12 +10,12 @@
 
 TspHttpClient::TspHttpClient() {}
 
-TspHttpClient &TspHttpClient::GetInstance() {
+TspHttpClient &TspHttpClient::get_instance() {
     static TspHttpClient instance;
     return instance;
 }
 
-bool TspHttpClient::LoadConfig(const YAML::Node &config) {
+bool TspHttpClient::load_config(const YAML::Node &config) {
     spdlog::info("加载TSP HTTP配置信息");
     std::string domain = config["tsp"]["http"]["domain"].as<std::string>();
     if (domain.empty()) {
@@ -25,7 +25,7 @@ bool TspHttpClient::LoadConfig(const YAML::Node &config) {
     return true;
 }
 
-bool TspHttpClient::LoadVehicleInfo(const std::string vin, const std::string sn) {
+bool TspHttpClient::load_vehicle_info(const std::string vin, const std::string sn) {
     spdlog::info("加载车辆信息");
     if (vin.empty() || sn.empty()) {
         return false;
@@ -35,7 +35,7 @@ bool TspHttpClient::LoadVehicleInfo(const std::string vin, const std::string sn)
     return true;
 }
 
-std::string TspHttpClient::Get(const std::string &path) {
+std::string TspHttpClient::get(const std::string &path) {
     std::string url = "https://" + server_domain_ + path;
     CURL *curl = curl_easy_init();
     std::string response;
@@ -47,10 +47,10 @@ std::string TspHttpClient::Get(const std::string &path) {
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
         // 设置Header
         struct curl_slist *headers = nullptr;
-        PackageHeaders(headers);
+        package_headers(headers);
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
         // 设置回调函数处理响应
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
         // 执行请求
         CURLcode res = curl_easy_perform(curl);
@@ -64,7 +64,7 @@ std::string TspHttpClient::Get(const std::string &path) {
     }
 }
 
-std::string TspHttpClient::Post(const std::string &path, const std::string &data) {
+std::string TspHttpClient::post(const std::string &path, const std::string &data) {
     std::string url = "https://" + server_domain_ + path;
     CURL *curl = curl_easy_init();
     std::string response;
@@ -73,7 +73,7 @@ std::string TspHttpClient::Post(const std::string &path, const std::string &data
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
         curl_easy_setopt(curl, CURLOPT_POST, 1L);
         // 设置回调函数处理响应
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
         // 启用SSL验证
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
@@ -83,7 +83,7 @@ std::string TspHttpClient::Post(const std::string &path, const std::string &data
         curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, data.length());
         // 设置Header
         struct curl_slist *headers = nullptr;
-        PackageHeaders(headers);
+        package_headers(headers);
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
         curl_easy_setopt(curl, CURLOPT_HTTP_CONTENT_DECODING, 0L);
         curl_easy_setopt(curl, CURLOPT_HTTP_TRANSFER_DECODING, 0L);
@@ -101,7 +101,7 @@ std::string TspHttpClient::Post(const std::string &path, const std::string &data
     }
 }
 
-size_t TspHttpClient::WriteCallback(void *contents, size_t size, size_t nmemb, std::string *s) {
+size_t TspHttpClient::write_callback(void *contents, size_t size, size_t nmemb, std::string *s) {
     size_t newLength = size * nmemb;
     std::string data((char*)contents, newLength);
     std::string chunk_buffer_;
@@ -132,7 +132,7 @@ size_t TspHttpClient::WriteCallback(void *contents, size_t size, size_t nmemb, s
     return newLength;
 }
 
-void TspHttpClient::PackageHeaders(struct curl_slist *&headers) {
+void TspHttpClient::package_headers(struct curl_slist *&headers) {
     headers = curl_slist_append(headers, "Content-Type: application/json");
     headers = curl_slist_append(headers, "Accept: application/json");
     headers = curl_slist_append(headers, ("vin: " + vin_).c_str());
