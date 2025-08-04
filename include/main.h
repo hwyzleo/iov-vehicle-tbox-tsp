@@ -7,6 +7,16 @@
 
 #endif //TSPSERVICE_MAIN_H
 
+static volatile sig_atomic_t shutdown_requested = 0;
+
+/**
+ * 信号处理
+ * @param sig 信号
+ * @param info 信号信息
+ * @param context 上下文
+ */
+static void sig_handler(int sig, siginfo_t *info, void *context);
+
 /**
  * 初始化日志
  * @param config 配置
