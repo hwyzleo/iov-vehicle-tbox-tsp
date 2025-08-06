@@ -4,15 +4,15 @@
 #include <iostream>
 #include <regex>
 
-#include "../third_party/include/spdlog/spdlog.h"
-#include "../third_party/include/nlohmann/json.hpp"
-
-using json = nlohmann::json;
+#include "spdlog/spdlog.h"
+#include "nlohmann/json.hpp"
+#include "utils.h"
 
 #include "tbox_mqtt_client.h"
 #include "tbox_mqtt_config.h"
 #include "tsp_mqtt_client.h"
-#include "common_function.h"
+
+using json = nlohmann::json;
 
 TboxMqttClient::TboxMqttClient() : mosqpp::mosquittopp() {}
 
@@ -54,7 +54,7 @@ bool TboxMqttClient::publish(int &mid, const std::string &topic, const void *pay
     if (!is_connected_) {
         return false;
     }
-    std::string base64_payload = CommonFunction::base64_encode(std::string(static_cast<const char *>(payload), payload_len));
+    std::string base64_payload = hwyz::Utils::base64_encode(std::string(static_cast<const char *>(payload), payload_len));
     int rc = mosquittopp::publish(&mid, topic.c_str(), static_cast<int>(base64_payload.length()),
                                   base64_payload.c_str(), qos, false);
     spdlog::info("转发[{}]TSP消息[{}]至主题[{}]QOS[{}]", mid, base64_payload, topic, qos);
@@ -93,7 +93,7 @@ void TboxMqttClient::on_publish(int rc) {
 void TboxMqttClient::on_message(const struct mosquitto_message *message) {
     spdlog::debug("收到消息主题[{}]内容[{}]", message->topic,
                   std::string(static_cast<char *>(message->payload), message->payloadlen));
-    std::string payload = CommonFunction::base64_decode(std::string(static_cast<char *>(message->payload), message->payloadlen));
+    std::string payload = hwyz::Utils::base64_decode(std::string(static_cast<char *>(message->payload), message->payloadlen));
     std::string json_string(payload.c_str(), payload.length());
     json json_object;
     try {

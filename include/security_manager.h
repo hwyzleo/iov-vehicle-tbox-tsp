@@ -1,13 +1,9 @@
 //
 // Created by hwyz_leo on 2025/5/21.
 //
-
 #ifndef TSPSERVICE_SECURITY_MANAGER_H
 #define TSPSERVICE_SECURITY_MANAGER_H
-
-#include "../third_party/include/yaml-cpp/yaml.h"
-
-#endif //TSPSERVICE_SECURITY_MANAGER_H
+#include "yaml-cpp/yaml.h"
 
 /**
  * 安全管理器
@@ -106,3 +102,5 @@ private:
     bool apply_communication_secret_key();
 
 };
+
+#endif //TSPSERVICE_SECURITY_MANAGER_H

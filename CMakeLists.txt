@@ -32,7 +32,6 @@ link_libraries(yaml-cpp)
 
 # 添加可执行文件
 add_executable(TspService
-        src/common_function.cpp
         src/main.cpp
         src/tsp_mqtt_client.cpp
         src/tsp_mqtt_config.cpp
@@ -44,6 +43,9 @@ add_executable(TspService
 # 添加头文件目录
 target_include_directories(TspService PRIVATE ${PROJECT_SOURCE_DIR}/include)
 target_include_directories(TspService PRIVATE ${PROJECT_SOURCE_DIR}/third_party/include)
+find_package(HWYZ REQUIRED)
+target_include_directories(TspService PUBLIC ${HWYZ_INCLUDE_DIR})
+target_link_libraries(TspService PRIVATE ${HWYZ_LIBRARIES})
 find_package(CURL REQUIRED)
 target_link_libraries(TspService PRIVATE ${CURL_LIBRARIES})
 find_package(OpenSSL REQUIRED)

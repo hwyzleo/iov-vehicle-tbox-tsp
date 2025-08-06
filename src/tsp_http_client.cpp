@@ -1,12 +1,12 @@
 //
 // Created by hwyz_leo on 2025/5/22.
 //
+#include <string>
 
-#include "tsp_http_client.h"
 #include "spdlog/spdlog.h"
 #include <curl/curl.h>
-#include <iostream>
-#include <string>
+
+#include "tsp_http_client.h"
 
 TspHttpClient::TspHttpClient() {}
 

@@ -4,13 +4,11 @@
 
 #ifndef TSPSERVICE_TSP_MQTT_CLIENT_H
 #define TSPSERVICE_TSP_MQTT_CLIENT_H
-
-#endif //TSPSERVICE_TSP_MQTT_CLIENT_H
-
 #include <thread>
 
-#include "../third_party/include/mosquitto/mosquitto.h"
-#include "../third_party/include/mosquitto/mosquittopp.h"
+#include "mosquitto/mosquitto.h"
+#include "mosquitto/mosquittopp.h"
+
 #include "constants.h"
 
 /**
@@ -150,3 +148,5 @@ private:
     // 轮询条件
     std::condition_variable cv_loop_;
 };
+
+#endif //TSPSERVICE_TSP_MQTT_CLIENT_H

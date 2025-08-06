@@ -3,7 +3,7 @@
 //
 #include <iostream>
 
-#include "../third_party/include/spdlog/spdlog.h"
+#include "spdlog/spdlog.h"
 
 #include "tsp_mqtt_config.h"
 

@@ -1,9 +1,7 @@
 //
 // Created by hwyz_leo on 2024/9/7.
 //
-#include <iostream>
-
-#include "../third_party/include/spdlog/spdlog.h"
+#include "spdlog/spdlog.h"
 
 #include "tbox_mqtt_config.h"
 

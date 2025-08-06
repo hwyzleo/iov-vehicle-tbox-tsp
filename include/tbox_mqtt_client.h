@@ -4,17 +4,15 @@
 
 #ifndef TSPSERVICE_TBOX_MQTT_CLIENT_H
 #define TSPSERVICE_TBOX_MQTT_CLIENT_H
-
-#endif //TSPSERVICE_TBOX_MQTT_CLIENT_H
-
 #include <thread>
 
-#include "../third_party/include/mosquitto/mosquitto.h"
-#include "../third_party/include/mosquitto/mosquittopp.h"
+#include "mosquitto/mosquitto.h"
+#include "mosquitto/mosquittopp.h"
+
 #include "constants.h"
 
 /**
- * TSP的MQTT客户端
+ * TBOX内部TSP服务的MQTT客户端
  */
 class TboxMqttClient : public mosqpp::mosquittopp {
 public:
@@ -142,3 +140,5 @@ private:
     // 轮询条件
     std::condition_variable cv_loop_;
 };
+
+#endif //TSPSERVICE_TBOX_MQTT_CLIENT_H

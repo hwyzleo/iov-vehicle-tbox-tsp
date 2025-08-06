@@ -1,13 +1,14 @@
 //
 // Created by hwyz_leo on 2025/5/21.
 //
+#include <iostream>
+
+#include "spdlog/spdlog.h"
+#include <nlohmann/json.hpp>
+#include "utils.h"
 
 #include "security_manager.h"
-#include "spdlog/spdlog.h"
-#include "common_function.h"
 #include "tsp_http_client.h"
-#include <nlohmann/json.hpp>
-#include <iostream>
 
 using json = nlohmann::json;
 
@@ -48,7 +49,7 @@ bool SecurityManager::check_certification() {
 }
 
 bool SecurityManager::check_certification_exist() {
-    return CommonFunction::file_exists(certification_path_);
+    return hwyz::Utils::file_exists(certification_path_);
 }
 
 bool SecurityManager::check_certification_valid() {
@@ -68,7 +69,7 @@ bool SecurityManager::apply_certification() {
         if (!response_json["data"]["p7b"].is_null()) {
             cert_data = response_json["data"]["p7b"];
         }
-        return CommonFunction::write_file(certification_path_, cert_data);
+        return hwyz::Utils::write_file(certification_path_, cert_data);
     }
     spdlog::error("从服务器下载证书失败: {}", response_json["message"]);
     return false;
@@ -81,13 +82,13 @@ bool SecurityManager::renew_certification() {
     spdlog::info("从服务器续期证书: {}", response);
     json response_json = json::parse(response);
     if (response_json["code"] == 0) {
-        spdlog::info("备份证书: {}", certification_path_ + CommonFunction::get_current_date());
-        CommonFunction::rename_file(certification_path_, certification_path_ + CommonFunction::get_current_date());
+        spdlog::info("备份证书: {}", certification_path_ + hwyz::Utils::get_current_date());
+        hwyz::Utils::rename_file(certification_path_, certification_path_ + hwyz::Utils::get_current_date());
         std::string cert_data;
         if (!response_json["data"]["p7b"].is_null()) {
             cert_data = response_json["data"]["p7b"];
         }
-        return CommonFunction::write_file(certification_path_, cert_data);
+        return hwyz::Utils::write_file(certification_path_, cert_data);
     }
     spdlog::error("从服务器续期证书失败: {}", response_json["message"]);
     return false;
@@ -107,7 +108,7 @@ bool SecurityManager::check_communication_secret_key() {
 bool SecurityManager::check_communication_secret_key_exist() {
     // TODO 检查本地安全芯片是否存在通讯密钥
     // 此处先以检查文件跑通流程
-    return CommonFunction::file_exists(secret_key_path_);
+    return hwyz::Utils::file_exists(secret_key_path_);
 }
 
 bool SecurityManager::check_communication_secret_key_valid() {
@@ -127,15 +128,15 @@ bool SecurityManager::apply_communication_secret_key() {
         spdlog::info("加密通讯密钥 + IV: {}", encrypted_comm_sk_with_iv);
         std::string comm_sk_iv = encrypted_comm_sk_with_iv.substr(0, 32);
         std::string encrypted_comm_sk = encrypted_comm_sk_with_iv.substr(32);
-        std::vector<unsigned char> encrypted_bytes = CommonFunction::hex_to_bytes(encrypted_comm_sk);
-        std::vector<unsigned char> default_sk_bytes = CommonFunction::hex_to_bytes(default_sk_hex_);
-        std::vector<unsigned char> comm_sk_iv_bytes = CommonFunction::hex_to_bytes(comm_sk_iv);
-        std::vector<unsigned char> comm_sk_bytes = CommonFunction::aes_decrypt(encrypted_bytes, default_sk_bytes,
+        std::vector<unsigned char> encrypted_bytes = hwyz::Utils::hex_to_bytes(encrypted_comm_sk);
+        std::vector<unsigned char> default_sk_bytes = hwyz::Utils::hex_to_bytes(default_sk_hex_);
+        std::vector<unsigned char> comm_sk_iv_bytes = hwyz::Utils::hex_to_bytes(comm_sk_iv);
+        std::vector<unsigned char> comm_sk_bytes = hwyz::Utils::aes_decrypt(encrypted_bytes, default_sk_bytes,
                                                                                comm_sk_iv_bytes);
         std::string comm_sk = std::string(reinterpret_cast<const char *>(comm_sk_bytes.data()), comm_sk_bytes.size());
         spdlog::info("保存通讯密钥: {}", secret_key_path_);
         // TODO 将通讯密钥写入安全芯片，这里先写本地文件
-        return CommonFunction::write_file(secret_key_path_, comm_sk);
+        return hwyz::Utils::write_file(secret_key_path_, comm_sk);
     }
     spdlog::error("从服务器申请通讯密钥失败: {}", response_json["message"]);
     return false;

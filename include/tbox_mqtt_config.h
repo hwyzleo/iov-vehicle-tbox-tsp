@@ -5,7 +5,6 @@
 #ifndef TSPSERVICE_TBOX_MQTT_CONFIG_H
 #define TSPSERVICE_TBOX_MQTT_CONFIG_H
 #include "constants.h"
-#endif //TSPSERVICE_TBOX_MQTT_CONFIG_H
 
 class TboxMqttConfig {
 public:
@@ -68,3 +67,5 @@ private:
 //    int server_port_ = 1883;
     int server_port_ = 1884;
 };
+
+#endif //TSPSERVICE_TBOX_MQTT_CONFIG_H

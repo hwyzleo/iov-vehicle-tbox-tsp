@@ -4,11 +4,11 @@
 
 #ifndef TSPSERVICE_TSP_MQTT_CONFIG_H
 #define TSPSERVICE_TSP_MQTT_CONFIG_H
-#include "constants.h"
-#include "../third_party/include/yaml-cpp/yaml.h"
-#endif //TSPSERVICE_TSP_MQTT_CONFIG_H
-
 #include <set>
+
+#include "yaml-cpp/yaml.h"
+
+#include "constants.h"
 
 class TspMqttConfig {
 public:
@@ -74,3 +74,5 @@ private:
     };
 
 };
+
+#endif //TSPSERVICE_TSP_MQTT_CONFIG_H

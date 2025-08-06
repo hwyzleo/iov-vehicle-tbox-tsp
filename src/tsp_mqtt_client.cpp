@@ -1,10 +1,9 @@
 //
 // Created by hwyz_leo on 2024/9/5.
 //
-#include <iostream>
 #include <regex>
 
-#include "../third_party/include/spdlog/spdlog.h"
+#include "spdlog/spdlog.h"
 
 #include "tsp_mqtt_client.h"
 #include "tsp_mqtt_config.h"

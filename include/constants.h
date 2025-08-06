@@ -1,11 +1,11 @@
 //
 // Created by hwyz_leo on 2024/9/5.
 //
+#ifndef TSPSERVICE_CONSTANTS_H
+#define TSPSERVICE_CONSTANTS_H
 #include <string>
 #include <set>
 
-#ifndef TSPSERVICE_CONSTANTS_H
-#define TSPSERVICE_CONSTANTS_H
 // MQTT重连间隔秒数
 constexpr int kMqttReconnectIntervalSecond = 15;
 // MQTT消息处理间隔毫秒

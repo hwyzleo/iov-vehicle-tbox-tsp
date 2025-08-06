@@ -4,12 +4,10 @@
 
 #ifndef TSPSERVICE_TSP_HTTP_CLIENT_H
 #define TSPSERVICE_TSP_HTTP_CLIENT_H
-
 #include <iostream>
-#include <curl/curl.h>
-#include "../third_party/include/yaml-cpp/yaml.h"
 
-#endif //TSPSERVICE_TSP_HTTP_CLIENT_H
+#include <curl/curl.h>
+#include "yaml-cpp/yaml.h"
 
 class TspHttpClient {
 public:
@@ -97,3 +95,5 @@ private:
     // TBox序列号
     std::string sn_;
 };
+
+#endif //TSPSERVICE_TSP_HTTP_CLIENT_H
