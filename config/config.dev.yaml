@@ -1,7 +1,6 @@
 tsp:
   mqtt:
     host: vagw.rox-motor.com
-    port: 1883
   http:
     domain: sgw.rox-motor.com
     path:

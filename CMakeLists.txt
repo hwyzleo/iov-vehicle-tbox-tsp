@@ -34,9 +34,7 @@ link_libraries(yaml-cpp)
 add_executable(TspService
         src/main.cpp
         src/tsp_mqtt_client.cpp
-        src/tsp_mqtt_config.cpp
         src/tbox_mqtt_client.cpp
-        src/tbox_mqtt_config.cpp
         src/security_manager.cpp
         src/tsp_http_client.cpp)
 

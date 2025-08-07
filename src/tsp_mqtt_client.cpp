@@ -6,7 +6,6 @@
 #include "spdlog/spdlog.h"
 
 #include "tsp_mqtt_client.h"
-#include "tsp_mqtt_config.h"
 #include "tbox_mqtt_client.h"
 
 TspMqttClient::TspMqttClient() : mosqpp::mosquittopp() {}
@@ -18,6 +17,37 @@ TspMqttClient::~TspMqttClient() {
 TspMqttClient &TspMqttClient::get_instance() {
     static TspMqttClient instance;
     return instance;
+}
+
+bool TspMqttClient::load_config(const YAML::Node &config) {
+    spdlog::info("加载TSP MQTT客户端配置信息");
+    if (!config["tsp"] || !config["tsp"]["mqtt"]) {
+        return false;
+    }
+    std::string server_host = config["tsp"]["mqtt"]["host"].as<std::string>();
+    if (server_host.empty()) {
+        return false;
+    }
+    server_host_ = server_host;
+    if (!config["tsp"]["mqtt"]["port"]) {
+        server_port_ = config["tsp"]["mqtt"]["port"].as<std::uint16_t>();
+    }
+    if (!config["tsp"]["mqtt"]["keepalive"]) {
+        keepalive_ = config["tsp"]["mqtt"]["keepalive"].as<std::uint16_t>();
+    }
+    if (!config["tsp"]["mqtt"]["use-ssl"]) {
+        use_ssl_ = config["tsp"]["mqtt"]["use-ssl"].as<bool>();
+    }
+    if (!config["tsp"]["mqtt"]["reconnect-interval-second"]) {
+        reconnect_interval_second_ = config["tsp"]["mqtt"]["reconnect-interval-second"].as<int>();
+    }
+    if (!config["tsp"]["mqtt"]["username"]) {
+        username_ = config["tsp"]["mqtt"]["username"].as<std::string>();
+    }
+    if (!config["tsp"]["mqtt"]["password"]) {
+        username_ = config["tsp"]["mqtt"]["password"].as<std::string>();
+    }
+    return true;
 }
 
 bool TspMqttClient::start() {
@@ -34,11 +64,10 @@ void TspMqttClient::stop() {
         return;
     }
     if (is_subscribed_) {
-        MqttConfig config = TspMqttConfig::get_instance().get_mqtt_config();
-        for (const auto &topic: config.subscribe_topics) {
+        for (const auto &topic: subscribe_topics_) {
             int mid = 0;
             std::string whole_topic = "DOWN/";
-            unsubscribe_tsp(mid, whole_topic.append(config.username).append("/").append(topic));
+            unsubscribe_topic(mid, whole_topic.append(username_).append("/").append(topic));
         }
         is_subscribed_ = false;
     }
@@ -73,11 +102,10 @@ void TspMqttClient::on_connect(int rc) {
     is_connected_ = (rc == MOSQ_ERR_SUCCESS);
     if (is_connected_) {
         spdlog::info("TSP MQTT客户端连接成功");
-        MqttConfig config = TspMqttConfig::get_instance().get_mqtt_config();
-        for (const auto &topic: config.subscribe_topics) {
+        for (const auto &topic: subscribe_topics_) {
             int mid = 0;
             std::string whole_topic = "DOWN/";
-            subscribe_tsp(mid, whole_topic.append(config.username).append("/").append(topic), 1);
+            subscribe_topic(mid, whole_topic.append(username_).append("/").append(topic), 1);
         }
         is_subscribed_ = true;
     }
@@ -98,8 +126,7 @@ void TspMqttClient::on_message(const struct mosquitto_message *message) {
                   std::string(static_cast<char *>(message->payload), message->payloadlen));
     int mid = 0;
     std::string topic = message->topic;
-    MqttConfig config = TspMqttConfig::get_instance().get_mqtt_config();
-    std::regex pattern("DOWN/" + config.username + "/");
+    std::regex pattern("DOWN/" + username_ + "/");
     std::string biz_topic = std::regex_replace(topic, pattern, "");
     std::string prefix_topic = "APP/";
     std::string whole_topic = prefix_topic.append(biz_topic);
@@ -140,14 +167,14 @@ void TspMqttClient::connect_manage() {
         while (is_started_) {
             if (!init()) {
                 spdlog::info("TSP MQTT客户端初始化失败");
-                std::this_thread::sleep_for(std::chrono::seconds(kMqttReconnectIntervalSecond));
+                std::this_thread::sleep_for(std::chrono::seconds(reconnect_interval_second_));
                 continue;
             }
             if (!is_connected_ && !is_connecting_) {
                 if (is_first_connect) {
                     is_first_connect = false;
                 } else {
-                    std::this_thread::sleep_for(std::chrono::seconds(kMqttReconnectIntervalSecond));
+                    std::this_thread::sleep_for(std::chrono::seconds(reconnect_interval_second_));
                 }
                 if (connect()) {
                     is_connecting_ = true;
@@ -157,34 +184,25 @@ void TspMqttClient::connect_manage() {
             }
             std::unique_lock<std::mutex> lock(mtx_loop_);
             cv_loop_.wait_for(lock, std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::milliseconds(kMqttLoopIntervalMilliSecond)));
+                    std::chrono::milliseconds(loop_interval_milli_second_)));
         }
     });
     connector.swap(th);
 }
 
 bool TspMqttClient::connect() {
-    std::string sn;
-    std::string vin;
-    if (!get_device_info(sn, vin)) {
-        return false;
-    }
-    if (!TspMqttConfig::get_instance().set_info(vin, sn)) {
-        return false;
-    }
-    MqttConfig config = TspMqttConfig::get_instance().get_mqtt_config();
     spdlog::info("重置客户端ID");
-    int rc = this->reinitialise(config.client_id.c_str(), true);
+    int rc = this->reinitialise(client_id_.c_str(), true);
     if (rc != MOSQ_ERR_SUCCESS) {
         return false;
     }
     spdlog::info("设置用户名密码");
-    rc = this->username_pw_set(config.username.c_str(), config.password.c_str());
+    rc = this->username_pw_set(username_.c_str(), password_.c_str());
     if (rc != MOSQ_ERR_SUCCESS) {
         return false;
     }
-    spdlog::info("连接TSP MQTT[{}:{}]", config.server_host, config.server_port);
-    rc = mosquittopp::connect(config.server_host.c_str(), config.server_port, config.keepalive);
+    spdlog::info("连接TSP MQTT[{}:{}]", server_host_, server_port_);
+    rc = mosquittopp::connect(server_host_.c_str(), server_port_, keepalive_);
     if (rc != MOSQ_ERR_SUCCESS) {
         spdlog::info("连接TSP MQTT失败");
         return false;
@@ -192,7 +210,7 @@ bool TspMqttClient::connect() {
     return true;
 }
 
-bool TspMqttClient::subscribe_tsp(int &mid, const std::string &topic, int qos) {
+bool TspMqttClient::subscribe_topic(int &mid, const std::string &topic, int qos) {
     if (!is_connected_) {
         return false;
     }
@@ -209,7 +227,7 @@ bool TspMqttClient::subscribe_tsp(int &mid, const std::string &topic, int qos) {
     return true;
 }
 
-bool TspMqttClient::unsubscribe_tsp(int &mid, const std::string &topic) {
+bool TspMqttClient::unsubscribe_topic(int &mid, const std::string &topic) {
     if (!is_connected_) {
         return false;
     }
@@ -223,15 +241,5 @@ bool TspMqttClient::unsubscribe_tsp(int &mid, const std::string &topic) {
         return false;
     }
     cv_loop_.notify_all();
-    return true;
-}
-
-bool TspMqttClient::get_device_info(std::string &sn, std::string &vin) const {
-    sn.clear();
-    vin.clear();
-    // 当前先写死
-    sn = "SN001";
-    vin = "HWYZTEST000000001";
-    spdlog::info("获取SN及VIN");
     return true;
 }

@@ -7,7 +7,6 @@
 
 #include "tsp_mqtt_client.h"
 #include "tbox_mqtt_client.h"
-#include "tsp_mqtt_config.h"
 #include "security_manager.h"
 #include "tsp_http_client.h"
 
@@ -15,6 +14,15 @@
 class MainApplication : public hwyz::Application {
 protected:
     bool initialize() override {
+        if (!SecurityManager::get_instance().load_config(getConfig())) {
+            return false;
+        }
+        if (!TspHttpClient::get_instance().load_config(getConfig())) {
+            return false;
+        }
+        if (!TboxMqttClient::get_instance().load_config(getConfig())) {
+            return false;
+        }
         return true;
     }
 
@@ -24,14 +32,11 @@ protected:
     }
 
     int execute() override {
-        // 加载TSP HTTP配置
-        TspHttpClient::get_instance().load_config(getConfig());
         // TODO 从CAN服务获取车辆信息
         std::string vin = "HWYZTEST000000001";
         std::string sn = "10000000XXYY000001";
         TspHttpClient::get_instance().load_vehicle_info(vin, sn);
         // 检查证书及密钥
-        SecurityManager::get_instance().load_config(getConfig());
         if (!SecurityManager::get_instance().check_certification()) {
             spdlog::error("证书检查失败");
             return -1;
@@ -40,8 +45,6 @@ protected:
             spdlog::error("通讯密钥检查失败");
             return -1;
         }
-        // 加载TSP MQTT配置
-        TspMqttConfig::get_instance().load_config(getConfig());
         // 启动TSP MQTT客户端
         TspMqttClient::get_instance().start();
         // 启动TBOX MQTT客户端

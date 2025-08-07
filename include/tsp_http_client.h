@@ -65,6 +65,14 @@ public:
     std::string post(const std::string &path, const std::string &data);
 
 private:
+    // 服务器域名
+    std::string server_domain_;
+    // 车架号
+    std::string vin_;
+    // TBox序列号
+    std::string sn_;
+
+private:
     /**
      * 构造函数
      */
@@ -87,13 +95,6 @@ private:
      */
     void package_headers(struct curl_slist *&headers);
 
-private:
-    // 服务器域名
-    std::string server_domain_;
-    // 车架号
-    std::string vin_;
-    // TBox序列号
-    std::string sn_;
 };
 
 #endif //TSPSERVICE_TSP_HTTP_CLIENT_H

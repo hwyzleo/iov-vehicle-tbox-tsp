@@ -8,6 +8,7 @@
 
 #include "mosquitto/mosquitto.h"
 #include "mosquitto/mosquittopp.h"
+#include "yaml-cpp/yaml.h"
 
 #include "constants.h"
 
@@ -39,6 +40,12 @@ public:
     TspMqttClient &operator=(const TspMqttClient &) = delete;
 
 public:
+    /**
+     * 加载配置
+     * @param config 配置信息
+     * @return 是否加载成功
+     */
+    bool load_config(const YAML::Node &config);
 
     /**
      * 启动
@@ -85,6 +92,44 @@ public:
     void on_error() override;
 
 private:
+    // 是否初始化
+    std::atomic_bool is_inited_{false};
+    // 是否启动
+    std::atomic_bool is_started_{false};
+    // 是否连接
+    std::atomic_bool is_connected_{false};
+    // 是否连接中
+    std::atomic_bool is_connecting_{false};
+    // 是否订阅
+    std::atomic_bool is_subscribed_{false};
+    // 连接器
+    std::thread connector;
+    // 轮询锁
+    std::mutex mtx_loop_;
+    // 轮询条件
+    std::condition_variable cv_loop_;
+    // 服务器地址
+    std::string server_host_;
+    // 服务器端口
+    std::uint16_t server_port_ = 1883;
+    // 保持连接时间
+    int keepalive_ = 60;
+    // 客户端ID
+    std::string client_id_;
+    // 用户名
+    std::string username_;
+    // 密码
+    std::string password_;
+    // 使用SSL
+    bool use_ssl_ = false;
+    // 订阅主题
+    std::set<std::string> subscribe_topics_;
+    // 重连间隔时间
+    int reconnect_interval_second_ = 15;
+    // 轮询间隔时间
+    int loop_interval_milli_second_ = 100;
+
+private:
 
     TspMqttClient();
 
@@ -106,47 +151,22 @@ private:
     bool connect();
 
     /**
-     * 订阅TSP主题
+     * 订阅主题
      * @param mid 消息ID
      * @param topic 主题
      * @param qos 消息质量
      * @return 是否订阅成功
      */
-    bool subscribe_tsp(int &mid, const std::string &topic, int qos = 1);
+    bool subscribe_topic(int &mid, const std::string &topic, int qos = 1);
 
     /**
-     * 取消订阅TSP主题
+     * 取消订阅主题
      * @param mid 消息ID
      * @param topic 主题
      * @return 是否取消订阅成功
      */
-    bool unsubscribe_tsp(int &mid, const std::string &topic);
+    bool unsubscribe_topic(int &mid, const std::string &topic);
 
-    /**
-     * 获取设备信息
-     * @param sn 设备序列号
-     * @param vin 车架号
-     * @return 是否获取成功
-     */
-    bool get_device_info(std::string &sn, std::string &vin) const;
-
-private:
-    // 是否初始化
-    std::atomic_bool is_inited_{false};
-    // 是否启动
-    std::atomic_bool is_started_{false};
-    // 是否连接
-    std::atomic_bool is_connected_{false};
-    // 是否连接中
-    std::atomic_bool is_connecting_{false};
-    // 是否订阅
-    std::atomic_bool is_subscribed_{false};
-    // 连接器
-    std::thread connector;
-    // 轮询锁
-    std::mutex mtx_loop_;
-    // 轮询条件
-    std::condition_variable cv_loop_;
 };
 
 #endif //TSPSERVICE_TSP_MQTT_CLIENT_H
