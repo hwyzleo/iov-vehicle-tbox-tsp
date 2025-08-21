@@ -4,6 +4,7 @@
 #include <regex>
 
 #include "spdlog/spdlog.h"
+#include "utils.h"
 
 #include "tsp_mqtt_client.h"
 #include "tbox_mqtt_client.h"
@@ -22,30 +23,26 @@ TspMqttClient &TspMqttClient::get_instance() {
 bool TspMqttClient::load_config(const YAML::Node &config) {
     spdlog::info("加载TSP MQTT客户端配置信息");
     if (!config["tsp"] || !config["tsp"]["mqtt"]) {
+        spdlog::error("未找到TSP MQTT配置");
         return false;
     }
     std::string server_host = config["tsp"]["mqtt"]["host"].as<std::string>();
     if (server_host.empty()) {
+        spdlog::error("TSP MQTT服务器地址未配置");
         return false;
     }
     server_host_ = server_host;
-    if (!config["tsp"]["mqtt"]["port"]) {
+    if (config["tsp"]["mqtt"]["port"]) {
         server_port_ = config["tsp"]["mqtt"]["port"].as<std::uint16_t>();
     }
-    if (!config["tsp"]["mqtt"]["keepalive"]) {
+    if (config["tsp"]["mqtt"]["keepalive"]) {
         keepalive_ = config["tsp"]["mqtt"]["keepalive"].as<std::uint16_t>();
     }
-    if (!config["tsp"]["mqtt"]["use-ssl"]) {
+    if (config["tsp"]["mqtt"]["use-ssl"]) {
         use_ssl_ = config["tsp"]["mqtt"]["use-ssl"].as<bool>();
     }
-    if (!config["tsp"]["mqtt"]["reconnect-interval-second"]) {
+    if (config["tsp"]["mqtt"]["reconnect-interval-second"]) {
         reconnect_interval_second_ = config["tsp"]["mqtt"]["reconnect-interval-second"].as<int>();
-    }
-    if (!config["tsp"]["mqtt"]["username"]) {
-        username_ = config["tsp"]["mqtt"]["username"].as<std::string>();
-    }
-    if (!config["tsp"]["mqtt"]["password"]) {
-        username_ = config["tsp"]["mqtt"]["password"].as<std::string>();
     }
     return true;
 }
@@ -64,11 +61,6 @@ void TspMqttClient::stop() {
         return;
     }
     if (is_subscribed_) {
-        for (const auto &topic: subscribe_topics_) {
-            int mid = 0;
-            std::string whole_topic = "DOWN/";
-            unsubscribe_topic(mid, whole_topic.append(username_).append("/").append(topic));
-        }
         is_subscribed_ = false;
     }
     this->disconnect();
@@ -87,9 +79,12 @@ bool TspMqttClient::publish(int &mid, const std::string &topic, const void *payl
     if (!is_connected_) {
         return false;
     }
-    int rc = mosquittopp::publish(&mid, topic.c_str(), payload_len, payload, qos, false);
-    spdlog::info("转发[{}]APP消息[{}]至主题[{}]QOS[{}]", mid,
-                 std::string(static_cast<const char *>(payload), payload_len), topic, qos);
+    std::string base64_payload = hwyz::Utils::base64_encode(
+            std::string(static_cast<const char *>(payload), payload_len));
+    std::string whole_topic = "UP/" + username_ + "/" + topic;
+    int rc = mosquittopp::publish(&mid, whole_topic.c_str(), static_cast<int>(base64_payload.length()),
+                                  base64_payload.c_str(), qos, false);
+    spdlog::info("发送[{}]TSP消息[{}]至主题[{}]QOS[{}]", mid, base64_payload, whole_topic, qos);
     if (rc == MOSQ_ERR_SUCCESS) {
         cv_loop_.notify_all();
         return true;
@@ -102,12 +97,12 @@ void TspMqttClient::on_connect(int rc) {
     is_connected_ = (rc == MOSQ_ERR_SUCCESS);
     if (is_connected_) {
         spdlog::info("TSP MQTT客户端连接成功");
-        for (const auto &topic: subscribe_topics_) {
-            int mid = 0;
-            std::string whole_topic = "DOWN/";
-            subscribe_topic(mid, whole_topic.append(username_).append("/").append(topic), 1);
-        }
+        int mid = 0;
         is_subscribed_ = true;
+        // 全局通知TSP连接
+        std::string timestamp = std::to_string(hwyz::Utils::get_current_timestamp_ms());
+        TboxMqttClient::get_instance().publish(mid, "GLOBAL/TSP_CONNECT", timestamp.c_str(),
+                                               timestamp.length());
     }
 }
 
@@ -152,13 +147,37 @@ void TspMqttClient::on_error() {
 bool TspMqttClient::init() {
     if (!is_inited_) {
         spdlog::info("初始化TSP MQTT客户端");
-        int rc = mosqpp::lib_init();
-        if (rc == MOSQ_ERR_SUCCESS) {
-            spdlog::info("TSP MQTT客户端初始化成功");
-            is_inited_ = true;
+        if (init_user_info()) {
+            int rc = mosqpp::lib_init();
+            if (rc == MOSQ_ERR_SUCCESS) {
+                spdlog::info("TSP MQTT客户端初始化成功");
+                is_inited_ = true;
+            }
         }
     }
     return is_inited_;
+}
+
+bool TspMqttClient::init_user_info() {
+    spdlog::info("初始化TSP MQTT用户信息");
+    username_ = hwyz::Utils::global_read_string(hwyz::global_key_t::VIN);
+    if (username_.empty()) {
+        spdlog::warn("未获取到用户名");
+        return false;
+    }
+    client_id_ = hwyz::Utils::global_read_string(hwyz::global_key_t::TBOX_SN);
+    if (client_id_.empty()) {
+        spdlog::warn("未获取到客户端ID");
+        return false;
+    }
+    password_ = generate_password(username_, client_id_);
+    return true;
+}
+
+std::string TspMqttClient::generate_password(std::string username, std::string client_id) {
+    // TODO 生成特殊的密码
+    // 这里先简单的拼接用户名及客户端ID
+    return username + client_id;
 }
 
 void TspMqttClient::connect_manage() {
@@ -191,14 +210,16 @@ void TspMqttClient::connect_manage() {
 }
 
 bool TspMqttClient::connect() {
-    spdlog::info("重置客户端ID");
+    spdlog::info("重置TSP客户端ID");
     int rc = this->reinitialise(client_id_.c_str(), true);
     if (rc != MOSQ_ERR_SUCCESS) {
+        spdlog::warn("重置TSP客户端ID失败");
         return false;
     }
-    spdlog::info("设置用户名密码");
+    spdlog::info("设置TSP用户名密码");
     rc = this->username_pw_set(username_.c_str(), password_.c_str());
     if (rc != MOSQ_ERR_SUCCESS) {
+        spdlog::warn("设置TSP用户名密码失败");
         return false;
     }
     spdlog::info("连接TSP MQTT[{}:{}]", server_host_, server_port_);
@@ -210,19 +231,21 @@ bool TspMqttClient::connect() {
     return true;
 }
 
-bool TspMqttClient::subscribe_topic(int &mid, const std::string &topic, int qos) {
+bool TspMqttClient::subscribe_topic(int &mid, const std::string &topic, TspMqttMessageHandler &handler, int qos) {
     if (!is_connected_) {
         return false;
     }
     if (topic.empty()) {
         return false;
     }
-    int rc = this->subscribe(&mid, topic.c_str(), qos);
-    spdlog::info("订阅主题[{}][{}]", mid, topic);
+    std::string whole_topic = "DOWN/" + username_ + "/" + topic;
+    int rc = this->subscribe(&mid, whole_topic.c_str(), qos);
+    spdlog::info("订阅[{}]主题[{}]QOS[{}]", mid, topic, qos);
     if (rc != MOSQ_ERR_SUCCESS) {
-        spdlog::warn("订阅主题[{}]失败[{}]", topic, rc);
+        spdlog::warn("订阅[{}]主题[{}]失败[{}]", mid, topic, rc);
         return false;
     }
+    message_handler_[topic] = &handler;
     cv_loop_.notify_all();
     return true;
 }

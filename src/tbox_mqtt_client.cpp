@@ -9,6 +9,7 @@
 #include "utils.h"
 
 #include "tbox_mqtt_client.h"
+#include "tbox_mqtt_rsms_handler.h"
 #include "tsp_mqtt_client.h"
 
 using json = nlohmann::json;
@@ -27,13 +28,11 @@ TboxMqttClient &TboxMqttClient::get_instance() {
 bool TboxMqttClient::load_config(const YAML::Node &config) {
     spdlog::info("加载TBOX MQTT客户端配置信息");
     if (config["mqtt"]) {
-        if (config["mqtt"]["server"]) {
-            if (config["mqtt"]["server"]["host"]) {
-                server_host_ = config["mqtt"]["server"]["host"].as<std::string>();
-            }
-            if (config["mqtt"]["server"]["port"]) {
-                server_port_ = config["mqtt"]["server"]["port"].as<std::uint16_t>();
-            }
+        if (config["mqtt"]["host"]) {
+            server_host_ = config["mqtt"]["host"].as<std::string>();
+        }
+        if (config["mqtt"]["port"]) {
+            server_port_ = config["mqtt"]["port"].as<std::uint16_t>();
         }
         if (config["mqtt"]["keepalive"]) {
             keepalive_ = config["mqtt"]["keepalive"].as<std::uint16_t>();
@@ -49,6 +48,9 @@ bool TboxMqttClient::load_config(const YAML::Node &config) {
         }
         if (config["mqtt"]["password"]) {
             username_ = config["mqtt"]["password"].as<std::string>();
+        }
+        if (config["mqtt"]["client-id"]) {
+            client_id_ = config["mqtt"]["client-id"].as<std::string>();
         }
     }
     return true;
@@ -78,15 +80,18 @@ bool TboxMqttClient::is_connected() const {
 
 bool TboxMqttClient::publish(int &mid, const std::string &topic, const void *payload, int payload_len, int qos) {
     if (nullptr == payload) {
+        spdlog::warn("消息[{}]内容为空", mid);
         return false;
     }
     if (!is_connected_) {
+        spdlog::warn("MQTT未连接");
         return false;
     }
-    std::string base64_payload = hwyz::Utils::base64_encode(std::string(static_cast<const char *>(payload), payload_len));
+    std::string base64_payload = hwyz::Utils::base64_encode(
+            std::string(static_cast<const char *>(payload), payload_len));
     int rc = mosquittopp::publish(&mid, topic.c_str(), static_cast<int>(base64_payload.length()),
                                   base64_payload.c_str(), qos, false);
-    spdlog::info("转发[{}]TSP消息[{}]至主题[{}]QOS[{}]", mid, base64_payload, topic, qos);
+    spdlog::info("发送[{}]TBox消息[{}]至主题[{}]QOS[{}]", mid, base64_payload, topic, qos);
     if (rc == MOSQ_ERR_SUCCESS) {
         cv_loop_.notify_all();
         return true;
@@ -99,11 +104,8 @@ void TboxMqttClient::on_connect(int rc) {
     is_connected_ = (rc == MOSQ_ERR_SUCCESS);
     if (is_connected_) {
         spdlog::info("TBOX MQTT客户端连接成功");
-        std::string whole_topic = "TSP/";
-        for (const auto &topic: subscribe_topics_) {
-            int mid = 0;
-            subscribe_topic(mid, whole_topic.append(topic), 1);
-        }
+        int mid = 0;
+        subscribe_topic(mid, "TSP/RSMS", TboxMqttRsmsHandler::get_instance(), 1);
         is_subscribed_ = true;
     }
 }
@@ -119,26 +121,11 @@ void TboxMqttClient::on_publish(int rc) {
 }
 
 void TboxMqttClient::on_message(const struct mosquitto_message *message) {
-    spdlog::debug("收到消息主题[{}]内容[{}]", message->topic,
-                  std::string(static_cast<char *>(message->payload), message->payloadlen));
-    std::string payload = hwyz::Utils::base64_decode(std::string(static_cast<char *>(message->payload), message->payloadlen));
-    std::string json_string(payload.c_str(), payload.length());
-    json json_object;
-    try {
-        json_object = json::parse(json_string);
-    } catch (json::parse_error &e) {
-        std::cerr << "JSON解析错误: " << e.what() << std::endl;
-        return;
-    }
-    json_object["vin"] = username_;
-    std::string params_json = json_object.dump();
-    int mid = 0;
     std::string topic = message->topic;
-    std::regex pattern("TSP/");
-    std::string biz_topic = std::regex_replace(topic, pattern, "");
-    std::string prefix_topic = "UP/";
-    std::string whole_topic = prefix_topic.append(username_).append("/").append(biz_topic);
-    TspMqttClient::get_instance().publish(mid, whole_topic, params_json.c_str(), static_cast<int>(params_json.length()));
+    spdlog::debug("收到TBox消息主题[{}]内容[{}]", topic, static_cast<char *>(message->payload));
+    std::string payload = hwyz::Utils::base64_decode(
+            std::string(static_cast<char *>(message->payload), message->payloadlen));
+    message_handler_[topic]->handle(payload);
 }
 
 void TboxMqttClient::on_subscribe(int mid, int qos_count, const int *granted_qos) {
@@ -199,12 +186,12 @@ void TboxMqttClient::connect_manage() {
 }
 
 bool TboxMqttClient::connect() {
-    spdlog::info("重置客户端ID");
+    spdlog::info("重置TBox客户端ID");
     int rc = this->reinitialise(client_id_.c_str(), true);
     if (rc != MOSQ_ERR_SUCCESS) {
         return false;
     }
-    spdlog::info("设置用户名密码");
+    spdlog::info("设置TBox用户名密码");
     rc = this->username_pw_set(username_.c_str(), password_.c_str());
     if (rc != MOSQ_ERR_SUCCESS) {
         return false;
@@ -218,7 +205,7 @@ bool TboxMqttClient::connect() {
     return true;
 }
 
-bool TboxMqttClient::subscribe_topic(int &mid, const std::string &topic, int qos) {
+bool TboxMqttClient::subscribe_topic(int &mid, const std::string &topic, TboxMqttMessageHandler &handler, int qos) {
     if (!is_connected_) {
         return false;
     }
@@ -226,9 +213,12 @@ bool TboxMqttClient::subscribe_topic(int &mid, const std::string &topic, int qos
         return false;
     }
     int rc = this->subscribe(&mid, topic.c_str(), qos);
-    if (rc == MOSQ_ERR_SUCCESS) {
-        cv_loop_.notify_all();
-        return true;
+    spdlog::info("订阅[{}]主题[{}]QOS[{}]", mid, topic, qos);
+    if (rc != MOSQ_ERR_SUCCESS) {
+        spdlog::warn("订阅主题[{}]失败[{}]", topic, rc);
+        return false;
     }
-    return false;
+    message_handler_[topic] = &handler;
+    cv_loop_.notify_all();
+    return true;
 }

@@ -4,12 +4,13 @@
 
 #ifndef TSPSERVICE_TBOX_MQTT_CLIENT_H
 #define TSPSERVICE_TBOX_MQTT_CLIENT_H
-
 #include <thread>
 
 #include "mosquitto/mosquitto.h"
 #include "mosquitto/mosquittopp.h"
 #include "yaml-cpp/yaml.h"
+
+#include "tbox_mqtt_message_handler.h"
 
 /**
  * TBOX内部TSP服务的MQTT客户端
@@ -110,19 +111,19 @@ private:
     // 服务器地址
     std::string server_host_ = "127.0.0.1";
     // 服务器端口
-    std::uint16_t server_port_ = 1883;
+    std::uint16_t server_port_ = 1884;
     // 保持连接时间
     int keepalive_ = 60;
     // 客户端ID
-    std::string client_id_;
+    std::string client_id_ = "TspService";
     // 用户名
     std::string username_ = "TspService";
     // 密码
     std::string password_ = "TspService";
     // 使用SSL
     bool use_ssl_ = false;
-    // 订阅主题
-    std::set<std::string> subscribe_topics_;
+    // 主题处理器
+    std::unordered_map<std::string, TboxMqttMessageHandler*> message_handler_;
     // 重连间隔时间
     int reconnect_interval_second_ = 15;
     // 轮询间隔时间
@@ -153,9 +154,10 @@ private:
      * 订阅主题
      * @param mid 消息ID
      * @param topic 主题
+     * @param handler 处理器
      * @param qos 消息质量
      * @return 是否订阅成功
      */
-    bool subscribe_topic(int &mid, const std::string &topic, int qos = 1);
+    bool subscribe_topic(int &mid, const std::string &topic, TboxMqttMessageHandler &handler, int qos = 1);
 };
 #endif //TSPSERVICE_TBOX_MQTT_CLIENT_H

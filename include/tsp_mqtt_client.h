@@ -11,6 +11,7 @@
 #include "yaml-cpp/yaml.h"
 
 #include "constants.h"
+#include "tsp_mqtt_message_handler.h"
 
 /**
  * TSP的MQTT客户端
@@ -122,8 +123,8 @@ private:
     std::string password_;
     // 使用SSL
     bool use_ssl_ = false;
-    // 订阅主题
-    std::set<std::string> subscribe_topics_;
+    // 主题处理器
+    std::unordered_map<std::string, TspMqttMessageHandler*> message_handler_;
     // 重连间隔时间
     int reconnect_interval_second_ = 15;
     // 轮询间隔时间
@@ -140,6 +141,20 @@ private:
     bool init();
 
     /**
+     * 初始化用户相关信息
+     * @return 是否成功
+     */
+    bool init_user_info();
+
+    /**
+     * 生成密码
+     * @param username 用户名
+     * @param client_id 客户端ID
+     * @return 密码
+     */
+    std::string generate_password(std::string username, std::string client_id);
+
+    /**
      * 连接管理
      */
     void connect_manage();
@@ -154,10 +169,11 @@ private:
      * 订阅主题
      * @param mid 消息ID
      * @param topic 主题
+     * @param handler 处理器
      * @param qos 消息质量
      * @return 是否订阅成功
      */
-    bool subscribe_topic(int &mid, const std::string &topic, int qos = 1);
+    bool subscribe_topic(int &mid, const std::string &topic, TspMqttMessageHandler &handler, int qos = 1);
 
     /**
      * 取消订阅主题

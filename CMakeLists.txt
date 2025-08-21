@@ -36,7 +36,8 @@ add_executable(TspService
         src/tsp_mqtt_client.cpp
         src/tbox_mqtt_client.cpp
         src/security_manager.cpp
-        src/tsp_http_client.cpp)
+        src/tsp_http_client.cpp
+        src/tbox_mqtt_rsms_handler.cpp)
 
 # 添加头文件目录
 target_include_directories(TspService PRIVATE ${PROJECT_SOURCE_DIR}/include)
@@ -46,6 +47,3 @@ target_include_directories(TspService PUBLIC ${HWYZ_INCLUDE_DIR})
 target_link_libraries(TspService PRIVATE ${HWYZ_LIBRARIES})
 find_package(CURL REQUIRED)
 target_link_libraries(TspService PRIVATE ${CURL_LIBRARIES})
-find_package(OpenSSL REQUIRED)
-target_include_directories(TspService PUBLIC ${OPENSSL_INCLUDE_DIR})
-target_link_libraries(TspService PRIVATE ${OPENSSL_LIBRARIES})
