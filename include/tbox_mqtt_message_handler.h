@@ -11,8 +11,9 @@ public:
     /**
      * 处理TBox MQTT消息
      * @param payload 数据
+     * @param payload_len 数据长度
      */
-    virtual void handle(std::string payload) = 0;
+    virtual void handle(const void *payload=nullptr, int payload_len=0) = 0;
 
     virtual ~TboxMqttMessageHandler() = default;
 };

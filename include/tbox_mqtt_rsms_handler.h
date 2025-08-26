@@ -36,8 +36,9 @@ public:
     /**
      * 处理RSMS消息
      * @param payload 数据
+     * @param payload_len 数据长度
      */
-    void handle(std::string payload) override;
+    void handle(const void *payload=nullptr, int payload_len=0) override;
 private:
     TboxMqttRsmsHandler() = default;
 };

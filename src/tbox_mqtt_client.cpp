@@ -122,10 +122,14 @@ void TboxMqttClient::on_publish(int rc) {
 
 void TboxMqttClient::on_message(const struct mosquitto_message *message) {
     std::string topic = message->topic;
-    spdlog::debug("收到TBox消息主题[{}]内容[{}]", topic, static_cast<char *>(message->payload));
-    std::string payload = hwyz::Utils::base64_decode(
-            std::string(static_cast<char *>(message->payload), message->payloadlen));
-    message_handler_[topic]->handle(payload);
+    std::vector<uint8_t> payload_vector(
+            static_cast<const uint8_t *>(message->payload),
+            static_cast<const uint8_t *>(message->payload) + message->payloadlen
+    );
+    std::string hex_payload = hwyz::Utils::bytes_to_hex(payload_vector, true);
+    spdlog::debug("收到TBox消息主题[{}]内容", topic);
+    std::cout << hex_payload << std::endl;
+    message_handler_[topic]->handle(message->payload, message->payloadlen);
 }
 
 void TboxMqttClient::on_subscribe(int mid, int qos_count, const int *granted_qos) {

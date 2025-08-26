@@ -11,8 +11,8 @@ TboxMqttRsmsHandler &TboxMqttRsmsHandler::get_instance() {
     return instance;
 }
 
-void TboxMqttRsmsHandler::handle(std::string payload) {
+void TboxMqttRsmsHandler::handle(const void *payload, int payload_len) {
     spdlog::debug("转发国标信号至TSP");
     int mid = 0;
-    TspMqttClient::get_instance().publish(mid, "RSMS", payload.data(), payload.size());
+    TspMqttClient::get_instance().publish(mid, "RSMS", payload, payload_len);
 }
