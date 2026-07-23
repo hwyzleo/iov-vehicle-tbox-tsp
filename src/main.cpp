@@ -1,6 +1,7 @@
 // src/main.cpp
 #include "application.h"
 #include "spdlog/spdlog.h"
+#include "utils.h"
 
 #include "mqtt_facade_stub.h"    // 后续替换为真正的 IPC 实现
 #include "someip_facade_stub.h"  // 后续替换为真正的 IPC 实现
