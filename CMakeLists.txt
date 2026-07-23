@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.10)
 project(TspService)
 
 # 设置C++标准
-set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -24,20 +24,22 @@ elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
 endif ()
 
 # 添加库文件目录
-link_directories(${LIB_DIR}/mosquitto)
-link_libraries(mosquitto)
-link_libraries(mosquittopp)
 link_directories(${LIB_DIR}/yaml-cpp)
 link_libraries(yaml-cpp)
+
+# mosquitto 不再直接链接（TSP 不持有 MQTT 连接，SPEC §1）
+# link_directories(${LIB_DIR}/mosquitto)
+# link_libraries(mosquitto)
+# link_libraries(mosquittopp)
 
 # 添加可执行文件
 add_executable(TspService
         src/main.cpp
-        src/tsp_mqtt_client.cpp
-        src/tbox_mqtt_client.cpp
+        src/mqtt_facade_stub.cpp
+        src/someip_facade_stub.cpp
+        src/fota_handler.cpp
         src/security_manager.cpp
-        src/tsp_http_client.cpp
-        src/tbox_mqtt_rsms_handler.cpp)
+        src/tsp_http_client.cpp)
 
 # 添加头文件目录
 target_include_directories(TspService PRIVATE ${PROJECT_SOURCE_DIR}/include)
@@ -47,3 +49,10 @@ target_include_directories(TspService PUBLIC ${HWYZ_INCLUDE_DIR})
 target_link_libraries(TspService PRIVATE ${HWYZ_LIBRARIES})
 find_package(CURL REQUIRED)
 target_link_libraries(TspService PRIVATE ${CURL_LIBRARIES})
+
+# 测试（可选）
+option(BUILD_TESTS "Build tests" OFF)
+if (BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
