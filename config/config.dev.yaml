@@ -1,6 +1,9 @@
+# TBOX-TSP 配置
 tsp:
-  mqtt:
-    host: vagw.rox-motor.com
+  # device_sn: TBOX设备序列号（也可从全局状态读取）
+  device-sn: ""
+
+  # HTTP 客户端（仅用于 SEC 证书/密钥申请，不属于 TSP 业务中继）
   http:
     domain: sgw.rox-motor.com
     path:
@@ -8,6 +11,12 @@ tsp:
       cert-renew: /tbox/cert/renew
       comm-sk-apply: /tbox/sk/applyCommSk
 
+  # FOTA 业务配置
+  fota:
+    dedup-window-ms: 60000      # 去重窗口
+    throttle-interval-ms: 5000  # 节流间隔
+
+# SEC 配置（证书/密钥管理）
 sec:
   cert:
     path: ./rox-motor.crt
@@ -15,6 +24,7 @@ sec:
     path: ./sk-store
     default-hex: 2fc827a3a3fc0e89ad0b1ef986e315fa
 
+# 日志配置
 logger:
   type: console
   path: ./log.txt
