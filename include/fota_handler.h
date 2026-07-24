@@ -5,6 +5,10 @@
 #include "someip_facade.h"
 #include "error_codes.h"
 
+#ifdef HAS_FRAMEWORK_LOG
+#include "log_adapter.h"
+#endif
+
 #include <string>
 #include <vector>
 #include <unordered_map>

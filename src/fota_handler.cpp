@@ -31,19 +31,37 @@ FotaHandler::~FotaHandler() {
 
 bool FotaHandler::initialize(const std::string& device_sn) {
     if (device_sn.empty()) {
+#ifdef HAS_FRAMEWORK_LOG
+        LogAdapter::fota().error("tsp.fota.init.failed", "device_sn 为空");
+#else
         spdlog::error("[FotaHandler] device_sn 为空");
+#endif
         return false;
     }
     device_sn_ = device_sn;
+
+#ifdef HAS_FRAMEWORK_LOG
+    LogAdapter::fota().info("tsp.fota.initialized", "FOTA 处理器初始化完成", {
+        {"device_sn", tbox::fw::log::FieldValue::makeString(device_sn_),
+                      tbox::fw::log::Sensitivity::Identifier}
+    });
+#else
     spdlog::info("[FotaHandler] 初始化: device_sn={}", device_sn_);
+#endif
 
     // 注册上行回调：当 TBOX-SOMEIP 收到 reportSoftwareInventory 时
     someip_->on_report_software_inventory(
         [this](const std::vector<uint8_t>& snapshot) {
             ErrorCode result = handle_upstream(snapshot);
             if (result != ErrorCode::SUCCESS) {
+#ifdef HAS_FRAMEWORK_LOG
+                LogAdapter::fota().warn("tsp.fota.uplink.failed", "上行处理失败", {
+                    {"error_code", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(result))}
+                });
+#else
                 spdlog::warn("[FotaHandler] 上行处理失败: {}",
                              error_code_to_string(result));
+#endif
             }
         });
 
@@ -52,7 +70,11 @@ bool FotaHandler::initialize(const std::string& device_sn) {
 
 bool FotaHandler::start() {
     if (device_sn_.empty()) {
+#ifdef HAS_FRAMEWORK_LOG
+        LogAdapter::fota().error("tsp.fota.start.failed", "未初始化");
+#else
         spdlog::error("[FotaHandler] 未初始化");
+#endif
         return false;
     }
 
@@ -60,50 +82,113 @@ bool FotaHandler::start() {
     std::string up_topic = topics::fota_up(device_sn_);
     std::string down_topic = topics::fota_down(device_sn_);
 
+    // 路由注册事件日志
+    auto route_log = LogAdapter::route();
+
     mqtt_->registerRoute("tsp_fota_up", up_topic, "up", FOTA_QOS);
     mqtt_->registerRoute("tsp_fota_down", down_topic, "down", FOTA_QOS);
+
+    // 记录路由注册成功事件
+    route_log.info("tsp.route.register.succeeded", "路由注册成功", {
+        {"topic", tbox::fw::log::FieldValue::makeString(up_topic)},
+        {"direction", tbox::fw::log::FieldValue::makeString("up")},
+        {"qos", tbox::fw::log::FieldValue::makeInt(FOTA_QOS)}
+    });
 
     // 订阅下行（SPEC §4.2）
     mqtt_->subscribe(down_topic, FOTA_QOS,
         [this](const std::string& topic, const std::vector<uint8_t>& payload) {
             ErrorCode result = handle_downstream(topic, payload);
             if (result != ErrorCode::SUCCESS) {
+#ifdef HAS_FRAMEWORK_LOG
+                LogAdapter::fota().warn("tsp.fota.downlink.failed", "下行处理失败", {
+                    {"error_code", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(result))}
+                });
+#else
                 spdlog::warn("[FotaHandler] 下行处理失败: {}",
                              error_code_to_string(result));
+#endif
             }
         });
 
     started_ = true;
+#ifdef HAS_FRAMEWORK_LOG
+    LogAdapter::fota().info("tsp.fota.started", "FOTA 处理器启动完成");
+#else
     spdlog::info("[FotaHandler] 启动完成");
+#endif
     return true;
 }
 
 void FotaHandler::stop() {
     started_ = false;
+#ifdef HAS_FRAMEWORK_LOG
+    LogAdapter::fota().info("tsp.fota.stopped", "FOTA 处理器停止");
+#else
     spdlog::info("[FotaHandler] 停止");
+#endif
 }
 
 ErrorCode FotaHandler::handle_upstream(const std::vector<uint8_t>& snapshot) {
+    // 生成 request_id 用于上下文传播
+    std::string request_id = "req-" + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+
+#ifdef HAS_FRAMEWORK_LOG
+    // 创建上下文作用域
+    tbox::fw::log::LogContext ctx;
+    ctx.request_id = request_id;
+    tbox::fw::log::ContextScope scope(ctx);
+
+    auto log = LogAdapter::fota();
+    log.debug("tsp.fota.uplink.received", "收到软件版本快照", {
+        {"payload_size", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(snapshot.size()))}
+    });
+#else
     spdlog::info("[FotaHandler] 收到上行 snapshot: size={}", snapshot.size());
+#endif
 
     // 去重检查（TBOX-TSP-1003）
     std::string hash = compute_hash(snapshot);
     if (is_duplicate(hash)) {
+#ifdef HAS_FRAMEWORK_LOG
+        log.info("tsp.fota.snapshot.duplicate", "去重命中，丢弃重复上报", {
+            {"dedup_key", tbox::fw::log::FieldValue::makeString(hash),
+                          tbox::fw::log::Sensitivity::Identifier}
+        });
+#else
         spdlog::info("[FotaHandler] 去重命中，丢弃重复上报: hash={}", hash);
+#endif
         return ErrorCode::DEDUP_HIT;
     }
 
     // 节流检查
     if (is_throttled()) {
+#ifdef HAS_FRAMEWORK_LOG
+        log.info("tsp.fota.uplink.throttled", "节流中，跳过本次上报");
+#else
         spdlog::info("[FotaHandler] 节流中，跳过本次上报");
-        return ErrorCode::SUCCESS;  // 节流不算错误
+#endif
+        return ErrorCode::SUCCESS;
     }
 
     // 发布到 up/fota（SPEC §4.1）
+    auto publish_start = std::chrono::steady_clock::now();
     std::string up_topic = topics::fota_up(device_sn_);
     bool ok = mqtt_->publish(up_topic, snapshot, FOTA_QOS);
+    auto publish_end = std::chrono::steady_clock::now();
+    auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(publish_end - publish_start).count();
+
     if (!ok) {
+#ifdef HAS_FRAMEWORK_LOG
+        log.error("tsp.fota.uplink.publish_failed", "MQTT 发布失败或超时", {
+            {"topic", tbox::fw::log::FieldValue::makeString(up_topic)},
+            {"qos", tbox::fw::log::FieldValue::makeInt(FOTA_QOS)},
+            {"duration_ms", tbox::fw::log::FieldValue::makeInt(duration_ms)}
+        });
+#else
         spdlog::error("[FotaHandler] 上行发布失败: topic={}", up_topic);
+#endif
         return ErrorCode::PUBLISH_FAILED;
     }
 
@@ -130,32 +215,86 @@ ErrorCode FotaHandler::handle_upstream(const std::vector<uint8_t>& snapshot) {
                 std::chrono::steady_clock::now().time_since_epoch()).count());
     }
 
+#ifdef HAS_FRAMEWORK_LOG
+    log.info("tsp.fota.uplink.published", "快照发布成功", {
+        {"topic", tbox::fw::log::FieldValue::makeString(up_topic)},
+        {"qos", tbox::fw::log::FieldValue::makeInt(FOTA_QOS)},
+        {"duration_ms", tbox::fw::log::FieldValue::makeInt(duration_ms)}
+    });
+#else
     spdlog::info("[FotaHandler] 上行发布成功: topic={}", up_topic);
+#endif
     return ErrorCode::SUCCESS;
 }
 
 ErrorCode FotaHandler::handle_downstream(const std::string& topic,
                                           const std::vector<uint8_t>& payload) {
+#ifdef HAS_FRAMEWORK_LOG
+    // 生成 request_id
+    std::string request_id = "req-" + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+
+    tbox::fw::log::LogContext ctx;
+    ctx.request_id = request_id;
+    tbox::fw::log::ContextScope scope(ctx);
+
+    auto log = LogAdapter::fota();
+    log.debug("tsp.fota.downlink.received", "收到 FOTA 下行", {
+        {"topic", tbox::fw::log::FieldValue::makeString(topic)},
+        {"payload_size", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(payload.size()))}
+    });
+#else
     spdlog::info("[FotaHandler] 收到下行: topic={}, size={}", topic, payload.size());
+#endif
 
     // 解析 payload（TBOX-TSP-1002）
     try {
         std::string payload_str(payload.begin(), payload.end());
         auto json = nlohmann::json::parse(payload_str);
+#ifdef HAS_FRAMEWORK_LOG
+        log.debug("tsp.fota.downlink.parsed", "下行 JSON 解析成功");
+#else
         spdlog::debug("[FotaHandler] 下行 JSON 解析成功: {}", json.dump());
+#endif
     } catch (const std::exception& e) {
+#ifdef HAS_FRAMEWORK_LOG
+        log.warn("tsp.fota.downlink.parse_failed", "下行 payload 解析失败", {
+            {"topic", tbox::fw::log::FieldValue::makeString(topic)},
+            {"payload_size", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(payload.size()))},
+            {"error_code", tbox::fw::log::FieldValue::makeInt(1002)}
+        });
+#else
         spdlog::error("[FotaHandler] 下行 payload 解析失败: {}", e.what());
+#endif
         return ErrorCode::PAYLOAD_PARSE_FAILED;
     }
 
     // 经 IPC 交 TBOX-SOMEIP（SPEC §4.2）
+    auto forward_start = std::chrono::steady_clock::now();
     bool ok = someip_->push_fota_command(payload);
+    auto forward_end = std::chrono::steady_clock::now();
+    auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(forward_end - forward_start).count();
+
     if (!ok) {
+#ifdef HAS_FRAMEWORK_LOG
+        log.error("tsp.fota.downlink.forward_failed", "推送下行到 SOMEIP 失败", {
+            {"topic", tbox::fw::log::FieldValue::makeString(topic)},
+            {"duration_ms", tbox::fw::log::FieldValue::makeInt(duration_ms)}
+        });
+#else
         spdlog::error("[FotaHandler] 推送下行到 SOMEIP 失败");
+#endif
         return ErrorCode::PUBLISH_FAILED;
     }
 
+#ifdef HAS_FRAMEWORK_LOG
+    log.info("tsp.fota.downlink.forwarded", "下行成功转交 SOME/IP 门面", {
+        {"topic", tbox::fw::log::FieldValue::makeString(topic)},
+        {"duration_ms", tbox::fw::log::FieldValue::makeInt(duration_ms)}
+    });
+#else
     spdlog::info("[FotaHandler] 下行转发成功");
+#endif
     return ErrorCode::SUCCESS;
 }
 
