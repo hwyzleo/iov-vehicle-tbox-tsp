@@ -88,8 +88,7 @@ std::string TspHttpClient::post(const std::string &path, const std::string &data
         struct curl_slist *headers = nullptr;
         package_headers(headers);
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-        curl_easy_setopt(curl, CURLOPT_HTTP_CONTENT_DECODING, 0L);
-        curl_easy_setopt(curl, CURLOPT_HTTP_TRANSFER_DECODING, 0L);
+
         // 调试日志
         // curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
         // 执行请求
@@ -109,31 +108,11 @@ std::string TspHttpClient::post(const std::string &path, const std::string &data
 
 size_t TspHttpClient::write_callback(void *contents, size_t size, size_t nmemb, std::string *s) {
     size_t newLength = size * nmemb;
-    std::string data((char*)contents, newLength);
-    std::string chunk_buffer_;
-    chunk_buffer_ += data;
-    while (true) {
-        // 查找块长度行
-        size_t crlf_pos = chunk_buffer_.find("\r\n");
-        if (crlf_pos == std::string::npos) break;
-        // 解析块长度（十六进制转十进制）
-        std::string length_str = chunk_buffer_.substr(0, crlf_pos);
-        size_t chunk_length = std::stoul(length_str, nullptr, 16);
-        // 检查是否有完整的块数据
-        size_t data_start = crlf_pos + 2;  // 跳过 "\r\n"
-        if (chunk_buffer_.size() >= data_start + chunk_length + 2) {  // +2 是块结束的 "\r\n"
-            // 提取数据块
-            std::string chunk_data = chunk_buffer_.substr(data_start, chunk_length);
-            s->append(chunk_data);
-            // 移除已处理的数据（包括长度行、数据和结束符）
-            size_t next_pos = data_start + chunk_length + 2;
-            chunk_buffer_ = chunk_buffer_.substr(next_pos);
-            // 如果块长度为0，表示结束
-            if (chunk_length == 0) break;
-        } else {
-            // 数据不完整，等待下一次回调
-            break;
-        }
+    try {
+        s->append((char*)contents, newLength);
+    } catch (...) {
+        // 内存分配失败等异常
+        return 0;
     }
     return newLength;
 }
