@@ -1,6 +1,6 @@
 // src/ipc_server.cpp
 #include "ipc_server.h"
-#include <iostream>
+#include "log_adapter.h"
 #include <cstring>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -33,21 +33,24 @@ bool IpcServer::start(RequestHandler request_handler, ClientDisconnectHandler di
 
     // 创建 shutdown pipe
     if (pipe(shutdown_pipe_) < 0) {
-        std::cerr << "Failed to create shutdown pipe: " << strerror(errno) << std::endl;
+        tbox::tsp::LogAdapter::ipc_server().error("tsp.ipc.pipe_failed",
+            std::string("Failed to create shutdown pipe: ") + strerror(errno));
         return false;
     }
 
     // 创建 Unix Socket
     server_fd_ = socket(AF_UNIX, SOCK_STREAM, 0);
     if (server_fd_ < 0) {
-        std::cerr << "Failed to create socket: " << strerror(errno) << std::endl;
+        tbox::tsp::LogAdapter::ipc_server().error("tsp.ipc.socket_failed",
+            std::string("Failed to create socket: ") + strerror(errno));
         return false;
     }
 
     // 设置 socket 选项
     int opt = 1;
     if (setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        std::cerr << "Failed to set socket options: " << strerror(errno) << std::endl;
+        tbox::tsp::LogAdapter::ipc_server().error("tsp.ipc.setsockopt_failed",
+            std::string("Failed to set socket options: ") + strerror(errno));
         close(server_fd_);
         server_fd_ = -1;
         return false;
@@ -63,7 +66,8 @@ bool IpcServer::start(RequestHandler request_handler, ClientDisconnectHandler di
     unlink(socket_path_.c_str());
 
     if (bind(server_fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        std::cerr << "Failed to bind socket: " << strerror(errno) << std::endl;
+        tbox::tsp::LogAdapter::ipc_server().error("tsp.ipc.bind_failed",
+            std::string("Failed to bind socket: ") + strerror(errno));
         close(server_fd_);
         server_fd_ = -1;
         return false;
@@ -71,7 +75,8 @@ bool IpcServer::start(RequestHandler request_handler, ClientDisconnectHandler di
 
     // 监听连接
     if (listen(server_fd_, 5) < 0) {
-        std::cerr << "Failed to listen on socket: " << strerror(errno) << std::endl;
+        tbox::tsp::LogAdapter::ipc_server().error("tsp.ipc.listen_failed",
+            std::string("Failed to listen on socket: ") + strerror(errno));
         close(server_fd_);
         server_fd_ = -1;
         return false;
@@ -80,7 +85,8 @@ bool IpcServer::start(RequestHandler request_handler, ClientDisconnectHandler di
     running_ = true;
     accept_thread_ = std::thread(&IpcServer::accept_connections, this);
 
-    std::cout << "IPC server started on " << socket_path_ << std::endl;
+    tbox::tsp::LogAdapter::ipc_server().info("tsp.ipc.started",
+        std::string("IPC server started on ") + socket_path_);
     return true;
 }
 
@@ -89,7 +95,7 @@ void IpcServer::stop() {
         return;
     }
 
-    std::cout << "IpcServer::stop() called" << std::endl;
+    tbox::tsp::LogAdapter::ipc_server().info("tsp.ipc.stop", "IpcServer::stop() called");
     running_ = false;
 
     // 通过 shutdown pipe 唤醒阻塞在 select/accept 上的线程
@@ -124,11 +130,12 @@ void IpcServer::stop() {
         active_clients_.clear();
     }
 
-    std::cout << "IPC server stopped" << std::endl;
+    tbox::tsp::LogAdapter::ipc_server().info("tsp.ipc.stopped", "IPC server stopped");
 }
 
 void IpcServer::accept_connections() {
-    std::cout << "[accept] thread started, server_fd=" << server_fd_ << std::endl;
+    tbox::tsp::LogAdapter::ipc_server().info("tsp.ipc.accept_started",
+        std::string("[accept] thread started, server_fd=") + std::to_string(server_fd_));
 
     while (running_) {
         // 用 select 同时监听 server_fd 和 shutdown_pipe
@@ -141,13 +148,14 @@ void IpcServer::accept_connections() {
         int ret = select(maxfd + 1, &rfds, nullptr, nullptr, nullptr);
         if (ret < 0) {
             if (errno == EINTR) continue;
-            std::cerr << "[accept] select failed: " << strerror(errno) << std::endl;
+            tbox::tsp::LogAdapter::ipc_server().error("tsp.ipc.select_failed",
+                std::string("[accept] select failed: ") + strerror(errno));
             break;
         }
 
         // shutdown pipe 被唤醒，退出循环
         if (FD_ISSET(shutdown_pipe_[0], &rfds)) {
-            std::cout << "[accept] shutdown pipe signaled, exiting" << std::endl;
+            tbox::tsp::LogAdapter::ipc_server().info("tsp.ipc.shutdown_signal", "[accept] shutdown pipe signaled, exiting");
             break;
         }
 
@@ -158,12 +166,14 @@ void IpcServer::accept_connections() {
         int client_fd = accept(server_fd_, nullptr, nullptr);
         if (client_fd < 0) {
             if (running_) {
-                std::cerr << "[accept] accept failed: " << strerror(errno) << std::endl;
+                tbox::tsp::LogAdapter::ipc_server().error("tsp.ipc.accept_failed",
+                    std::string("[accept] accept failed: ") + strerror(errno));
             }
             continue;
         }
 
-        std::cout << "[accept] new connection, client_fd=" << client_fd << std::endl;
+        tbox::tsp::LogAdapter::ipc_server().info("tsp.ipc.new_connection",
+            std::string("[accept] new connection, client_fd=") + std::to_string(client_fd));
 
         // 记录活跃客户端
         {
@@ -176,11 +186,12 @@ void IpcServer::accept_connections() {
         client_thread.detach();
     }
 
-    std::cout << "[accept] thread exiting" << std::endl;
+    tbox::tsp::LogAdapter::ipc_server().info("tsp.ipc.accept_exiting", "[accept] thread exiting");
 }
 
 void IpcServer::handle_client(int client_fd) {
-    std::cout << "[client:" << client_fd << "] handler started" << std::endl;
+    tbox::tsp::LogAdapter::ipc_server().info("tsp.ipc.client_started",
+        std::string("[client:") + std::to_string(client_fd) + "] handler started");
     try {
         // 设置空闲超时（60秒无数据则断开）
         struct timeval tv;
@@ -188,7 +199,8 @@ void IpcServer::handle_client(int client_fd) {
         tv.tv_usec = 0;
         setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
 
-        std::cout << "[client:" << client_fd << "] long connection established" << std::endl;
+        tbox::tsp::LogAdapter::ipc_server().info("tsp.ipc.client_established",
+            std::string("[client:") + std::to_string(client_fd) + "] long connection established");
 
         // 长连接循环处理多个请求
         while (running_) {
@@ -200,11 +212,14 @@ void IpcServer::handle_client(int client_fd) {
                 ssize_t bytes_read = recv(client_fd, reinterpret_cast<uint8_t*>(&header) + header_received, sizeof(header) - header_received, 0);
                 if (bytes_read <= 0) {
                     if (bytes_read == 0) {
-                        std::cout << "[client:" << client_fd << "] connection closed by peer" << std::endl;
+                        tbox::tsp::LogAdapter::ipc_server().info("tsp.ipc.client_closed_by_peer",
+                            std::string("[client:") + std::to_string(client_fd) + "] connection closed by peer");
                     } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        std::cout << "[client:" << client_fd << "] idle timeout, closing" << std::endl;
+                        tbox::tsp::LogAdapter::ipc_server().info("tsp.ipc.client_idle_timeout",
+                            std::string("[client:") + std::to_string(client_fd) + "] idle timeout, closing");
                     } else {
-                        std::cerr << "[client:" << client_fd << "] recv header failed: " << strerror(errno) << std::endl;
+                        tbox::tsp::LogAdapter::ipc_server().error("tsp.ipc.recv_header_failed",
+                            std::string("[client:") + std::to_string(client_fd) + "] recv header failed: " + strerror(errno));
                     }
                     cleanup_client(client_fd);
                     return;
@@ -212,12 +227,14 @@ void IpcServer::handle_client(int client_fd) {
                 header_received += bytes_read;
             }
 
-            std::cout << "[client:" << client_fd << "] header received, method=" << header.method_id
-                      << " params_length=" << header.params_length << std::endl;
+            tbox::tsp::LogAdapter::ipc_server().info("tsp.ipc.header_received",
+                std::string("[client:") + std::to_string(client_fd) + "] header received, method=" +
+                std::to_string(header.method_id) + " params_length=" + std::to_string(header.params_length));
 
             // 合理性检查
             if (header.params_length > 10 * 1024 * 1024) {  // 最大 10MB
-                std::cerr << "[client:" << client_fd << "] request too large: " << header.params_length << std::endl;
+                tbox::tsp::LogAdapter::ipc_server().error("tsp.ipc.request_too_large",
+                    std::string("[client:") + std::to_string(client_fd) + "] request too large: " + std::to_string(header.params_length));
                 cleanup_client(client_fd);
                 return;
             }
@@ -230,20 +247,23 @@ void IpcServer::handle_client(int client_fd) {
             while (data_received < header.params_length) {
                 ssize_t bytes_read = recv(client_fd, request_data.data() + sizeof(header) + data_received, header.params_length - data_received, 0);
                 if (bytes_read <= 0) {
-                    std::cerr << "[client:" << client_fd << "] recv params failed" << std::endl;
+                    tbox::tsp::LogAdapter::ipc_server().error("tsp.ipc.recv_params_failed",
+                        std::string("[client:") + std::to_string(client_fd) + "] recv params failed");
                     cleanup_client(client_fd);
                     return;
                 }
                 data_received += bytes_read;
             }
 
-            std::cout << "[client:" << client_fd << "] request fully read, dispatching" << std::endl;
+            tbox::tsp::LogAdapter::ipc_server().info("tsp.ipc.request_dispatching",
+                std::string("[client:") + std::to_string(client_fd) + "] request fully read, dispatching");
 
             // 解析请求
             MethodId method;
             std::string params_json;
             if (!IpcSerializer::deserialize_request(request_data, method, params_json)) {
-                std::cerr << "[client:" << client_fd << "] deserialize request failed" << std::endl;
+                tbox::tsp::LogAdapter::ipc_server().error("tsp.ipc.deserialize_failed",
+                    std::string("[client:") + std::to_string(client_fd) + "] deserialize request failed");
                 cleanup_client(client_fd);
                 return;
             }
@@ -264,23 +284,29 @@ void IpcServer::handle_client(int client_fd) {
             while (total_sent < response_data.size()) {
                 ssize_t bytes_sent = send(client_fd, response_data.data() + total_sent, response_data.size() - total_sent, 0);
                 if (bytes_sent <= 0) {
-                    std::cerr << "[client:" << client_fd << "] send response failed" << std::endl;
+                    tbox::tsp::LogAdapter::ipc_server().error("tsp.ipc.send_response_failed",
+                        std::string("[client:") + std::to_string(client_fd) + "] send response failed");
                     cleanup_client(client_fd);
                     return;
                 }
                 total_sent += bytes_sent;
             }
 
-            std::cout << "[client:" << client_fd << "] response sent, waiting for next request" << std::endl;
+            tbox::tsp::LogAdapter::ipc_server().info("tsp.ipc.response_sent",
+                std::string("[client:") + std::to_string(client_fd) + "] response sent, waiting for next request");
         }
     } catch (const std::length_error& e) {
-        std::cerr << "[client:" << client_fd << "] std::length_error: " << e.what() << std::endl;
+        tbox::tsp::LogAdapter::ipc_server().error("tsp.ipc.length_error",
+            std::string("[client:") + std::to_string(client_fd) + "] std::length_error: " + e.what());
     } catch (const std::bad_alloc& e) {
-        std::cerr << "[client:" << client_fd << "] std::bad_alloc: " << e.what() << std::endl;
+        tbox::tsp::LogAdapter::ipc_server().error("tsp.ipc.bad_alloc",
+            std::string("[client:") + std::to_string(client_fd) + "] std::bad_alloc: " + e.what());
     } catch (const std::exception& e) {
-        std::cerr << "[client:" << client_fd << "] std::exception: " << e.what() << std::endl;
+        tbox::tsp::LogAdapter::ipc_server().error("tsp.ipc.exception",
+            std::string("[client:") + std::to_string(client_fd) + "] std::exception: " + e.what());
     } catch (...) {
-        std::cerr << "[client:" << client_fd << "] unknown exception type" << std::endl;
+        tbox::tsp::LogAdapter::ipc_server().error("tsp.ipc.unknown_exception",
+            std::string("[client:") + std::to_string(client_fd) + "] unknown exception type");
     }
 
     cleanup_client(client_fd);
@@ -299,7 +325,8 @@ void IpcServer::push_event(EventType type, const std::string& payload_json) {
             while (total_sent < event_data.size()) {
                 ssize_t bytes_sent = send(client_fd, event_data.data() + total_sent, event_data.size() - total_sent, 0);
                 if (bytes_sent <= 0) {
-                    std::cerr << "[push_event] send to client " << client_fd << " failed, removing" << std::endl;
+                    tbox::tsp::LogAdapter::ipc_server().error("tsp.ipc.push_event_failed",
+                        std::string("[push_event] send to client ") + std::to_string(client_fd) + " failed, removing");
                     // 发送失败，标记需要清理
                     // 注意：不能在遍历中直接修改 map，需要在外部清理
                     break;
@@ -313,7 +340,8 @@ void IpcServer::push_event(EventType type, const std::string& payload_json) {
 void IpcServer::add_subscription(int client_fd, EventType type) {
     std::lock_guard<std::mutex> lock(subs_mutex_);
     subscriptions_[client_fd].insert(static_cast<uint32_t>(type));
-    std::cout << "[subscription] client " << client_fd << " subscribed to event " << static_cast<uint32_t>(type) << std::endl;
+    tbox::tsp::LogAdapter::ipc_server().info("tsp.ipc.subscription_added",
+        std::string("[subscription] client ") + std::to_string(client_fd) + " subscribed to event " + std::to_string(static_cast<uint32_t>(type)));
 }
 
 void IpcServer::remove_subscription(int client_fd, EventType type) {
@@ -325,7 +353,8 @@ void IpcServer::remove_subscription(int client_fd, EventType type) {
             subscriptions_.erase(it);
         }
     }
-    std::cout << "[subscription] client " << client_fd << " unsubscribed from event " << static_cast<uint32_t>(type) << std::endl;
+    tbox::tsp::LogAdapter::ipc_server().info("tsp.ipc.subscription_removed",
+        std::string("[subscription] client ") + std::to_string(client_fd) + " unsubscribed from event " + std::to_string(static_cast<uint32_t>(type)));
 }
 
 void IpcServer::cleanup_client(int client_fd) {
@@ -348,7 +377,8 @@ void IpcServer::cleanup_client(int client_fd) {
 
     // 关闭连接
     close(client_fd);
-    std::cout << "[client:" << client_fd << "] connection cleaned up" << std::endl;
+    tbox::tsp::LogAdapter::ipc_server().info("tsp.ipc.client_cleanup",
+        std::string("[client:") + std::to_string(client_fd) + "] connection cleaned up");
 }
 
 } // namespace ipc

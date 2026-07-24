@@ -2,7 +2,7 @@
 #include "net_status_provider.h"
 #include <fstream>
 #include <sstream>
-#include <iostream>
+#include "log_adapter.h"
 
 namespace tbox {
 namespace tsp {
@@ -31,7 +31,8 @@ NetStatusProvider::NetStatus SystemNetStatusProvider::get_net_status() {
         status.network_type = read_network_type();
         status.operator_name = read_operator();
     } catch (const std::exception& e) {
-        std::cerr << "Failed to read system net status: " << e.what() << std::endl;
+        tbox::tsp::LogAdapter::ipc_server().error("tsp.ipc.net_status_read_failed",
+            std::string("Failed to read system net status: ") + e.what());
     }
 
     return status;
