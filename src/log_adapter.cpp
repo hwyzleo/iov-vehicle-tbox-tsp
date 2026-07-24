@@ -36,5 +36,21 @@ tbox::fw::log::Logger LogAdapter::relay() {
     return tbox::fw::log::Logger::get("relay");
 }
 
+tbox::fw::log::Logger LogAdapter::security() {
+    return tbox::fw::log::Logger::get("security");
+}
+
+tbox::fw::log::Logger LogAdapter::http_client() {
+    return tbox::fw::log::Logger::get("http_client");
+}
+
+tbox::fw::log::Logger LogAdapter::ipc_server() {
+    return tbox::fw::log::Logger::get("ipc_server");
+}
+
+tbox::fw::log::Logger LogAdapter::application() {
+    return tbox::fw::log::Logger::get("application");
+}
+
 } // namespace tsp
 } // namespace tbox
