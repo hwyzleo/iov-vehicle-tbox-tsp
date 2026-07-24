@@ -12,6 +12,7 @@ enum class ErrorCode : uint16_t {
     PUBLISH_FAILED = 1001,       // 上行发布失败（MQTT 不可用 / 超时）
     PAYLOAD_PARSE_FAILED = 1002, // 下行 payload 解析失败
     DEDUP_HIT = 1003,            // 去重命中，已丢弃重复上报
+    ROUTE_REGISTER_FAILED = 1004, // 业务路由注册失败（CR-002 新增）
 };
 
 // 错误码转字符串
@@ -21,6 +22,7 @@ inline const char* error_code_to_string(ErrorCode code) {
         case ErrorCode::PUBLISH_FAILED: return "TBOX-TSP-1001: 上行发布失败";
         case ErrorCode::PAYLOAD_PARSE_FAILED: return "TBOX-TSP-1002: 下行payload解析失败";
         case ErrorCode::DEDUP_HIT: return "TBOX-TSP-1003: 去重命中";
+        case ErrorCode::ROUTE_REGISTER_FAILED: return "TBOX-TSP-1004: 业务路由注册失败";
         default: return "UNKNOWN";
     }
 }
