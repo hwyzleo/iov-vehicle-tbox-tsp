@@ -4,7 +4,7 @@
 #include "utils.h"
 
 #include "mqtt_facade_stub.h"    // 后续替换为真正的 IPC 实现
-#include "someip_facade_stub.h"  // 后续替换为真正的 IPC 实现
+#include "someip_facade_impl.h"  // 真正的 IPC 实现
 #include "fota_handler.h"
 #include "security_manager.h"
 #include "tsp_http_client.h"
@@ -18,9 +18,9 @@ protected:
             return false;
         }
 
-        // 创建 Facade（Stub 模式，后续替换为 IPC 实现）
+        // 创建 Facade
         mqtt_facade_ = std::make_shared<tbox::tsp::MqttFacadeStub>();
-        someip_facade_ = std::make_shared<tbox::tsp::SomeipFacadeStub>();
+        someip_facade_ = std::make_shared<tbox::tsp::SomeipFacadeImpl>();
 
         // 初始化 Facade
         if (!mqtt_facade_->initialize()) {

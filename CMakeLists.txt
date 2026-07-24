@@ -35,6 +35,10 @@ link_libraries(yaml-cpp)
 # 添加可执行文件
 add_executable(TspService
         src/main.cpp
+        src/ipc_protocol.cpp
+        src/ipc_server.cpp
+        src/net_status_provider.cpp
+        src/someip_facade_impl.cpp
         src/mqtt_facade_stub.cpp
         src/someip_facade_stub.cpp
         src/fota_handler.cpp
