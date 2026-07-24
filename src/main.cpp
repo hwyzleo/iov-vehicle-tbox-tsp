@@ -1,6 +1,5 @@
 // src/main.cpp
 #include "application.h"
-#include "spdlog/spdlog.h"
 #include "utils.h"
 
 #include "mqtt_facade_stub.h"    // 后续替换为真正的 IPC 实现
@@ -8,11 +7,8 @@
 #include "fota_handler.h"
 #include "security_manager.h"
 #include "tsp_http_client.h"
-
-#ifdef HAS_FRAMEWORK_LOG
 #include "log_adapter.h"
 #include "log_types.h"
-#endif
 
 #ifdef HAS_TBOX_PROV
 #include "prov_client.h"
@@ -37,14 +33,14 @@ protected:
             auto logResult = tbox::tsp::LogAdapter::init("tsp", logConfig);
             if (logResult.error != tbox::fw::log::LogError::kOk) {
                 // 严格模式失败，非严格模式继续（降级到 console + INFO）
-                spdlog::warn("framework-log 初始化降级: {}", logResult.error_message);
+                tbox::tsp::LogAdapter::application().warn("tsp.main.init.degraded", std::string("framework-log 初始化降级: ") + logResult.error_message);
             }
         }
 #endif
 
         // SecurityManager 保留（证书/密钥管理属于 SEC 依赖）
         if (!SecurityManager::get_instance().load_config(getConfig())) {
-            spdlog::error("安全管理器配置加载失败");
+            tbox::tsp::LogAdapter::application().error("tsp.main.config.security_failed", "安全管理器配置加载失败");
             return false;
         }
 
@@ -54,11 +50,11 @@ protected:
 
         // 初始化 Facade
         if (!mqtt_facade_->initialize()) {
-            spdlog::error("MQTT Facade 初始化失败");
+            tbox::tsp::LogAdapter::application().error("tsp.main.init.mqtt_failed", "MQTT Facade 初始化失败");
             return false;
         }
         if (!someip_facade_->initialize()) {
-            spdlog::error("SOMEIP Facade 初始化失败");
+            tbox::tsp::LogAdapter::application().error("tsp.main.init.someip_failed", "SOMEIP Facade 初始化失败");
             return false;
         }
 
@@ -74,16 +70,16 @@ protected:
                 auto binding = prov_client.read_binding();
                 if (!binding.ecu_uid.empty()) {
                     device_sn = binding.ecu_uid;
-                    spdlog::info("从 TBOX-PROV 获取设备序列号: {}", device_sn);
+                    tbox::tsp::LogAdapter::application().info("tsp.main.prov.sn", std::string("从 TBOX-PROV 获取设备序列号: ") + device_sn);
                 } else {
-                    spdlog::warn("TBOX-PROV 返回空的 ECU UID");
+                    tbox::tsp::LogAdapter::application().warn("tsp.main.prov.empty_uid", "TBOX-PROV 返回空的 ECU UID");
                 }
                 prov_client.disconnect();
             } else {
-                spdlog::warn("无法连接到 TBOX-PROV 服务");
+                tbox::tsp::LogAdapter::application().warn("tsp.main.prov.connect_failed", "无法连接到 TBOX-PROV 服务");
             }
         } catch (const std::exception& e) {
-            spdlog::error("从 TBOX-PROV 获取设备序列号异常: {}", e.what());
+            tbox::tsp::LogAdapter::application().error("tsp.main.prov.exception", std::string("从 TBOX-PROV 获取设备序列号异常: ") + e.what());
         }
 #endif
         
@@ -98,20 +94,20 @@ protected:
         }
         
         if (device_sn.empty()) {
-            spdlog::error("device_sn 未配置");
+            tbox::tsp::LogAdapter::application().error("tsp.main.sn_missing", "device_sn 未配置");
             return false;
         }
 
         // 创建并初始化 FOTA 业务处理器
         fota_handler_ = std::make_unique<tbox::tsp::FotaHandler>(mqtt_facade_, someip_facade_);
         if (!fota_handler_->initialize(device_sn)) {
-            spdlog::error("FOTA 处理器初始化失败");
+            tbox::tsp::LogAdapter::application().error("tsp.main.init.fota_failed", "FOTA 处理器初始化失败");
             return false;
         }
 
         // TspHttpClient 保留用于 SEC（证书/密钥申请）
         if (!TspHttpClient::get_instance().load_config(getConfig())) {
-            spdlog::warn("TSP HTTP 客户端配置加载失败（非致命）");
+            tbox::tsp::LogAdapter::application().warn("tsp.main.http_config_failed", "TSP HTTP 客户端配置加载失败（非致命）");
         }
 
         return true;
@@ -126,31 +122,31 @@ protected:
     int execute() override {
         // 证书/密钥检查（SEC 依赖）
         if (!SecurityManager::get_instance().check_certification()) {
-            spdlog::error("证书检查失败");
+            tbox::tsp::LogAdapter::application().error("tsp.main.cert_check_failed", "证书检查失败");
             return -1;
         }
         if (!SecurityManager::get_instance().check_communication_secret_key()) {
-            spdlog::error("通讯密钥检查失败");
+            tbox::tsp::LogAdapter::application().error("tsp.main.sk_check_failed", "通讯密钥检查失败");
             return -1;
         }
 
         // 启动 Facade
         if (!mqtt_facade_->start()) {
-            spdlog::error("MQTT Facade 启动失败");
+            tbox::tsp::LogAdapter::application().error("tsp.main.start.mqtt_failed", "MQTT Facade 启动失败");
             return -1;
         }
         if (!someip_facade_->start()) {
-            spdlog::error("SOMEIP Facade 启动失败");
+            tbox::tsp::LogAdapter::application().error("tsp.main.start.someip_failed", "SOMEIP Facade 启动失败");
             return -1;
         }
 
         // 启动 FOTA 业务处理
         if (!fota_handler_->start()) {
-            spdlog::error("FOTA 处理器启动失败");
+            tbox::tsp::LogAdapter::application().error("tsp.main.start.fota_failed", "FOTA 处理器启动失败");
             return -1;
         }
 
-        spdlog::info("TBOX-TSP 服务启动完成");
+        tbox::tsp::LogAdapter::application().info("tsp.main.started", "TBOX-TSP 服务启动完成");
         return 0;
     }
 
