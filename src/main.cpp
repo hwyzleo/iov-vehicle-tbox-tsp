@@ -18,6 +18,9 @@
 #include "prov_client.h"
 #endif
 
+#include <csignal>
+#include <unistd.h>
+
 class MainApplication : public hwyz::Application {
 protected:
     bool initialize() override {
@@ -160,4 +163,45 @@ private:
     std::unique_ptr<tbox::tsp::FotaHandler> fota_handler_;
 };
 
-APPLICATION_ENTRY(MainApplication)
+// 自定义信号处理函数，避免死循环
+static void custom_signal_handler(int signal) {
+    // 只处理一次，避免递归
+    static std::atomic<bool> handling{false};
+    if (handling.exchange(true)) {
+        // 已经在处理中，直接退出
+        _exit(1);
+    }
+    
+    // 只处理 SIGSEGV，其他信号交给默认处理
+    if (signal == SIGSEGV) {
+        // 不打印任何日志，直接退出
+        _exit(1);
+    }
+    
+    // 其他信号，设置退出标志
+    // 注意：这里不能访问 Application 实例，因为是静态函数
+    // 所以直接退出
+    _exit(0);
+}
+
+extern "C" int main(int argc, char* argv[]) {
+    // 设置自定义信号处理函数，覆盖 Application 类的设置
+    struct sigaction sa{};
+    sa.sa_handler = custom_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    
+    // 只处理 SIGSEGV
+    sigaction(SIGSEGV, &sa, nullptr);
+    
+    try {
+        MainApplication app;
+        return app.run(argc, argv);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "Application terminated with exception: %s\n", e.what());
+        return -1;
+    } catch (...) {
+        fprintf(stderr, "Application terminated with unknown exception\n");
+        return -1;
+    }
+}
