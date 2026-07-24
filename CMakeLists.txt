@@ -77,7 +77,8 @@ add_executable(tbox_tsp
         src/someip_facade_stub.cpp
         src/fota_handler.cpp
         src/security_manager.cpp
-        src/tsp_http_client.cpp)
+        src/tsp_http_client.cpp
+        src/log_adapter.cpp)
 
 # 添加头文件目录
 target_include_directories(tbox_tsp PRIVATE ${PROJECT_SOURCE_DIR}/include)
