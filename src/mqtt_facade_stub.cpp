@@ -2,6 +2,11 @@
 #include "mqtt_facade_stub.h"
 #include "spdlog/spdlog.h"
 
+#ifdef HAS_FRAMEWORK_LOG
+#include "log_adapter.h"
+#include "log_types.h"
+#endif
+
 namespace tbox {
 namespace tsp {
 
@@ -36,9 +41,28 @@ bool MqttFacadeStub::registerRoute(const std::string& internal_addr,
                                     const std::string& direction,
                                     int qos) {
     std::lock_guard<std::mutex> lock(mutex_);
+
+#ifdef HAS_FRAMEWORK_LOG
+    auto start = std::chrono::steady_clock::now();
+#endif
+
     spdlog::info("[MqttFacadeStub] registerRoute: addr={}, topic={}, dir={}, qos={}",
                  internal_addr, topic, direction, qos);
     routes_[topic] = {internal_addr, direction, qos};
+
+#ifdef HAS_FRAMEWORK_LOG
+    auto end = std::chrono::steady_clock::now();
+    auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+    auto log = tbox::tsp::LogAdapter::route();
+    log.info("tsp.route.register.succeeded", "路由注册成功", {
+        {"topic", tbox::fw::log::FieldValue::makeString(topic)},
+        {"direction", tbox::fw::log::FieldValue::makeString(direction)},
+        {"qos", tbox::fw::log::FieldValue::makeInt(qos)},
+        {"duration_ms", tbox::fw::log::FieldValue::makeInt(duration_ms)}
+    });
+#endif
+
     return true;
 }
 
