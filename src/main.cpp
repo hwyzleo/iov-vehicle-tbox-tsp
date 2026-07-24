@@ -9,9 +9,39 @@
 #include "security_manager.h"
 #include "tsp_http_client.h"
 
+#ifdef HAS_FRAMEWORK_LOG
+#include "log_adapter.h"
+#include "log_types.h"
+#endif
+
+#ifdef HAS_TBOX_PROV
+#include "prov_client.h"
+#endif
+
 class MainApplication : public hwyz::Application {
 protected:
     bool initialize() override {
+        // framework-log 初始化（CR-002）
+#ifdef HAS_FRAMEWORK_LOG
+        {
+            tbox::fw::log::LogConfig logConfig;
+            logConfig.level = tbox::fw::log::LogLevel::kInfo;
+            logConfig.console_config.enabled = true;
+
+            // 尝试从配置读取日志级别
+            if (getConfig()["common"] && getConfig()["common"]["log"] && getConfig()["common"]["log"]["level"]) {
+                std::string levelStr = getConfig()["common"]["log"]["level"].as<std::string>("INFO");
+                logConfig.level = tbox::fw::log::logLevelFromString(levelStr);
+            }
+
+            auto logResult = tbox::tsp::LogAdapter::init("tsp", logConfig);
+            if (logResult.error != tbox::fw::log::LogError::kOk) {
+                // 严格模式失败，非严格模式继续（降级到 console + INFO）
+                spdlog::warn("framework-log 初始化降级: {}", logResult.error_message);
+            }
+        }
+#endif
+
         // SecurityManager 保留（证书/密钥管理属于 SEC 依赖）
         if (!SecurityManager::get_instance().load_config(getConfig())) {
             spdlog::error("安全管理器配置加载失败");
@@ -32,14 +62,41 @@ protected:
             return false;
         }
 
-        // 从配置获取 device_sn（或从全局状态读取）
+        // 获取设备序列号（device_sn）
+        // 优先级：TBOX-PROV 服务 > 配置文件 > 全局状态
         std::string device_sn;
-        if (getConfig()["device-sn"]) {
-            device_sn = getConfig()["device-sn"].as<std::string>();
+        
+#ifdef HAS_TBOX_PROV
+        // 尝试从 TBOX-PROV 服务获取设备序列号
+        try {
+            tbox::prov::ProvClient prov_client("/tmp/tbox-prov.sock");
+            if (prov_client.connect()) {
+                auto binding = prov_client.read_binding();
+                if (!binding.ecu_uid.empty()) {
+                    device_sn = binding.ecu_uid;
+                    spdlog::info("从 TBOX-PROV 获取设备序列号: {}", device_sn);
+                } else {
+                    spdlog::warn("TBOX-PROV 返回空的 ECU UID");
+                }
+                prov_client.disconnect();
+            } else {
+                spdlog::warn("无法连接到 TBOX-PROV 服务");
+            }
+        } catch (const std::exception& e) {
+            spdlog::error("从 TBOX-PROV 获取设备序列号异常: {}", e.what());
         }
+#endif
+        
+        // 如果从 TBOX-PROV 获取失败，尝试从配置文件读取
+        if (device_sn.empty() && getConfig()["tsp"]["device-sn"]) {
+            device_sn = getConfig()["tsp"]["device-sn"].as<std::string>();
+        }
+        
+        // 最后尝试从全局状态读取
         if (device_sn.empty()) {
             device_sn = hwyz::Utils::global_read_string(hwyz::global_key_t::TBOX_SN);
         }
+        
         if (device_sn.empty()) {
             spdlog::error("device_sn 未配置");
             return false;
