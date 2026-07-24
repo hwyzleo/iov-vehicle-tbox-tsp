@@ -55,7 +55,7 @@ std::string TspHttpClient::get(const std::string &path) {
         // 执行请求
         CURLcode res = curl_easy_perform(curl);
         if (res != CURLE_OK) {
-            spdlog::error("TSP HTTP GET请求失败：%s", curl_easy_strerror(res));
+            spdlog::error("TSP HTTP GET请求失败：{}", curl_easy_strerror(res));
         }
         // 清理资源
         curl_slist_free_all(headers);
