@@ -3,7 +3,7 @@
 //
 #include <string>
 
-#include "spdlog/spdlog.h"
+#include "log_adapter.h"
 #include <curl/curl.h>
 
 #include "tsp_http_client.h"
@@ -16,7 +16,7 @@ TspHttpClient &TspHttpClient::get_instance() {
 }
 
 bool TspHttpClient::load_config(const YAML::Node &config) {
-    spdlog::info("加载TSP HTTP配置信息");
+    tbox::tsp::LogAdapter::http_client().info("tsp.http.load_config", "加载TSP HTTP配置信息");
     std::string domain = config["tsp"]["http"]["domain"].as<std::string>();
     if (domain.empty()) {
         return false;
@@ -26,7 +26,7 @@ bool TspHttpClient::load_config(const YAML::Node &config) {
 }
 
 bool TspHttpClient::load_vehicle_info(const std::string vin, const std::string sn) {
-    spdlog::info("加载车辆信息");
+    tbox::tsp::LogAdapter::http_client().info("tsp.http.load_vehicle_info", "加载车辆信息");
     if (vin.empty() || sn.empty()) {
         return false;
     }
@@ -55,12 +55,16 @@ std::string TspHttpClient::get(const std::string &path) {
         // 执行请求
         CURLcode res = curl_easy_perform(curl);
         if (res != CURLE_OK) {
-            spdlog::error("TSP HTTP GET请求失败：%s", curl_easy_strerror(res));
+            tbox::tsp::LogAdapter::http_client().error("tsp.http.get_failed",
+                std::string("TSP HTTP GET请求失败：") + curl_easy_strerror(res));
         }
         // 清理资源
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
         return response;
+    } else {
+        tbox::tsp::LogAdapter::http_client().error("tsp.http.curl_init_failed", "无法初始化CURL句柄");
+        return "";
     }
 }
 
@@ -92,12 +96,16 @@ std::string TspHttpClient::post(const std::string &path, const std::string &data
         // 执行请求
         CURLcode res = curl_easy_perform(curl);
         if (res != CURLE_OK) {
-            spdlog::error("TSP HTTP POST请求[{}]失败：{}", url, curl_easy_strerror(res));
+            tbox::tsp::LogAdapter::http_client().error("tsp.http.post_failed",
+                std::string("TSP HTTP POST请求[") + url + "]失败：" + curl_easy_strerror(res));
         }
         // 清理资源
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
         return response;
+    } else {
+        tbox::tsp::LogAdapter::http_client().error("tsp.http.curl_init_failed", "无法初始化CURL句柄");
+        return "";
     }
 }
 
