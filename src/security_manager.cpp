@@ -1,14 +1,15 @@
 //
 // Created by hwyz_leo on 2025/5/21.
 //
-#include <iostream>
-
 #include "spdlog/spdlog.h"
 #include <nlohmann/json.hpp>
 #include "utils.h"
 
 #include "security_manager.h"
 #include "tsp_http_client.h"
+#include "log_adapter.h"
+
+using tbox::tsp::LogAdapter;
 
 using json = nlohmann::json;
 
@@ -18,7 +19,7 @@ SecurityManager &SecurityManager::get_instance() {
 }
 
 bool SecurityManager::load_config(const YAML::Node &config) {
-    spdlog::info("加载证书及密钥配置信息");
+    LogAdapter::security().info("tsp.security.config_loading", "加载证书及密钥配置信息");
     std::string sec_cert_path = config["sec"]["cert"]["path"].as<std::string>();
     std::string sec_sk_path = config["sec"]["sk"]["path"].as<std::string>();
     std::string default_sk_hex = config["sec"]["sk"]["default-hex"].as<std::string>();
@@ -61,25 +62,33 @@ bool SecurityManager::apply_certification() {
     json request;
     request["csr"] = "";
     std::string response = TspHttpClient::get_instance().post(http_cert_apply_path_, request.dump());
-    spdlog::info("从服务器下载证书: {}", response);
+    LogAdapter::security().info("tsp.security.cert_downloading", "从服务器下载证书", {
+        {"response_size", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(response.size()))}
+    });
     if (response.empty()) {
-        spdlog::error("从服务器下载证书失败：空响应");
+        LogAdapter::security().error("tsp.cert.download_failed", "从服务器下载证书失败：空响应");
         return false;
     }
     try {
         json response_json = json::parse(response);
         if (response_json["code"] == 0) {
-            spdlog::info("保存证书: {}", certification_path_);
+            LogAdapter::security().info("tsp.security.cert_saving", "保存证书", {
+                {"path", tbox::fw::log::FieldValue::makeString(certification_path_)}
+            });
             std::string cert_data;
             if (!response_json["data"]["p7b"].is_null()) {
                 cert_data = response_json["data"]["p7b"];
             }
             return hwyz::Utils::write_file(certification_path_, cert_data);
         }
-        spdlog::error("从服务器下载证书失败: {}", response_json["message"]);
+        LogAdapter::security().error("tsp.cert.download_failed", "从服务器下载证书失败", {
+            {"message", tbox::fw::log::FieldValue::makeString(response_json["message"].get<std::string>())}
+        });
         return false;
     } catch (const json::parse_error& e) {
-        spdlog::error("从服务器下载证书失败：JSON解析错误: {}", e.what());
+        LogAdapter::security().error("tsp.cert.download_failed", "从服务器下载证书失败：JSON解析错误", {
+            {"error", tbox::fw::log::FieldValue::makeString(e.what())}
+        });
         return false;
     }
 }
@@ -88,26 +97,35 @@ bool SecurityManager::renew_certification() {
     json request;
     request["csr"] = "";
     std::string response = TspHttpClient::get_instance().post(http_cert_renew_path_, request.dump());
-    spdlog::info("从服务器续期证书: {}", response);
+    LogAdapter::security().info("tsp.security.cert_renewing", "从服务器续期证书", {
+        {"response_size", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(response.size()))}
+    });
     if (response.empty()) {
-        spdlog::error("从服务器续期证书失败：空响应");
+        LogAdapter::security().error("tsp.cert.renew_failed", "从服务器续期证书失败：空响应");
         return false;
     }
     try {
         json response_json = json::parse(response);
         if (response_json["code"] == 0) {
-            spdlog::info("备份证书: {}", certification_path_ + hwyz::Utils::get_current_date());
-            hwyz::Utils::rename_file(certification_path_, certification_path_ + hwyz::Utils::get_current_date());
+            std::string backup_path = certification_path_ + hwyz::Utils::get_current_date();
+            LogAdapter::security().info("tsp.security.cert_backing_up", "备份证书", {
+                {"path", tbox::fw::log::FieldValue::makeString(backup_path)}
+            });
+            hwyz::Utils::rename_file(certification_path_, backup_path);
             std::string cert_data;
             if (!response_json["data"]["p7b"].is_null()) {
                 cert_data = response_json["data"]["p7b"];
             }
             return hwyz::Utils::write_file(certification_path_, cert_data);
         }
-        spdlog::error("从服务器续期证书失败: {}", response_json["message"]);
+        LogAdapter::security().error("tsp.cert.renew_failed", "从服务器续期证书失败", {
+            {"message", tbox::fw::log::FieldValue::makeString(response_json["message"].get<std::string>())}
+        });
         return false;
     } catch (const json::parse_error& e) {
-        spdlog::error("从服务器续期证书失败：JSON解析错误: {}", e.what());
+        LogAdapter::security().error("tsp.cert.renew_failed", "从服务器续期证书失败：JSON解析错误", {
+            {"error", tbox::fw::log::FieldValue::makeString(e.what())}
+        });
         return false;
     }
 }
@@ -139,16 +157,20 @@ bool SecurityManager::apply_communication_secret_key() {
     request["plaintext"] = "";
     request["signature"] = "";
     std::string response = TspHttpClient::get_instance().post(http_comm_sk_apply_path_, request.dump());
-    spdlog::info("从服务器申请通讯密钥: {}", response);
+    LogAdapter::security().info("tsp.security.comm_sk_applying", "从服务器申请通讯密钥", {
+        {"response_size", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(response.size()))}
+    });
     if (response.empty()) {
-        spdlog::error("从服务器申请通讯密钥失败：空响应");
+        LogAdapter::security().error("tsp.comm_sk.apply_failed", "从服务器申请通讯密钥失败：空响应");
         return false;
     }
     try {
         json response_json = json::parse(response);
         if (response_json["code"] == 0 && !response_json["data"]["encryptedSk"].is_null()) {
             std::string encrypted_comm_sk_with_iv = response_json["data"]["encryptedSk"];
-            spdlog::info("加密通讯密钥 + IV: {}", encrypted_comm_sk_with_iv);
+            LogAdapter::security().info("tsp.security.comm_sk_decrypting", "解密通讯密钥", {
+                {"encrypted_size", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(encrypted_comm_sk_with_iv.size()))}
+            });
             std::string comm_sk_iv = encrypted_comm_sk_with_iv.substr(0, 32);
             std::string encrypted_comm_sk = encrypted_comm_sk_with_iv.substr(32);
             std::vector<unsigned char> encrypted_bytes = hwyz::Utils::hex_to_bytes(encrypted_comm_sk);
@@ -157,14 +179,20 @@ bool SecurityManager::apply_communication_secret_key() {
             std::vector<unsigned char> comm_sk_bytes = hwyz::Utils::aes_decrypt(encrypted_bytes, default_sk_bytes,
                                                                                    comm_sk_iv_bytes);
             std::string comm_sk = std::string(reinterpret_cast<const char *>(comm_sk_bytes.data()), comm_sk_bytes.size());
-            spdlog::info("保存通讯密钥: {}", secret_key_path_);
+            LogAdapter::security().info("tsp.security.comm_sk_saving", "保存通讯密钥", {
+                {"path", tbox::fw::log::FieldValue::makeString(secret_key_path_)}
+            });
             // TODO 将通讯密钥写入安全芯片，这里先写本地文件
             return hwyz::Utils::write_file(secret_key_path_, comm_sk);
         }
-        spdlog::error("从服务器申请通讯密钥失败: {}", response_json["message"]);
+        LogAdapter::security().error("tsp.comm_sk.apply_failed", "从服务器申请通讯密钥失败", {
+            {"message", tbox::fw::log::FieldValue::makeString(response_json["message"].get<std::string>())}
+        });
         return false;
     } catch (const json::parse_error& e) {
-        spdlog::error("从服务器申请通讯密钥失败：JSON解析错误: {}", e.what());
+        LogAdapter::security().error("tsp.comm_sk.apply_failed", "从服务器申请通讯密钥失败：JSON解析错误", {
+            {"error", tbox::fw::log::FieldValue::makeString(e.what())}
+        });
         return false;
     }
 }

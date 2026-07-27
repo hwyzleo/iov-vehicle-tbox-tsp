@@ -35,3 +35,7 @@
 cmake-build-debug/
 .idea/
 build/
+
+docs/superpowers/
+.superpowers/
+third_party/

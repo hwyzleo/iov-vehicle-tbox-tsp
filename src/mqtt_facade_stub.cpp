@@ -1,11 +1,8 @@
 // src/mqtt_facade_stub.cpp
 #include "mqtt_facade_stub.h"
 #include "spdlog/spdlog.h"
-
-#ifdef HAS_FRAMEWORK_LOG
 #include "log_adapter.h"
 #include "log_types.h"
-#endif
 
 namespace tbox {
 namespace tsp {
@@ -14,7 +11,7 @@ MqttFacadeStub::MqttFacadeStub() = default;
 MqttFacadeStub::~MqttFacadeStub() = default;
 
 bool MqttFacadeStub::initialize() {
-    spdlog::info("[MqttFacadeStub] 初始化（Stub 模式）");
+    LogAdapter::mqtt_client().info("tsp.mqtt.initializing", "MqttFacadeStub 初始化（Stub 模式）");
     initialized_ = true;
     connected_ = true;  // Stub 假设始终连接
     return true;
@@ -22,16 +19,16 @@ bool MqttFacadeStub::initialize() {
 
 bool MqttFacadeStub::start() {
     if (!initialized_) {
-        spdlog::error("[MqttFacadeStub] 未初始化");
+        LogAdapter::mqtt_client().error("tsp.mqtt.not_initialized", "未初始化");
         return false;
     }
-    spdlog::info("[MqttFacadeStub] 启动（Stub 模式）");
+    LogAdapter::mqtt_client().info("tsp.mqtt.starting", "MqttFacadeStub 启动（Stub 模式）");
     started_ = true;
     return true;
 }
 
 void MqttFacadeStub::stop() {
-    spdlog::info("[MqttFacadeStub] 停止");
+    LogAdapter::mqtt_client().info("tsp.mqtt.stopping", "MqttFacadeStub 停止");
     started_ = false;
     connected_ = false;
 }
@@ -42,26 +39,25 @@ bool MqttFacadeStub::registerRoute(const std::string& internal_addr,
                                     int qos) {
     std::lock_guard<std::mutex> lock(mutex_);
 
-#ifdef HAS_FRAMEWORK_LOG
     auto start = std::chrono::steady_clock::now();
-#endif
 
-    spdlog::info("[MqttFacadeStub] registerRoute: addr={}, topic={}, dir={}, qos={}",
-                 internal_addr, topic, direction, qos);
+    LogAdapter::mqtt_client().info("tsp.mqtt.register_route", "注册路由", {
+        {"addr", tbox::fw::log::FieldValue::makeString(internal_addr)},
+        {"topic", tbox::fw::log::FieldValue::makeString(topic)},
+        {"direction", tbox::fw::log::FieldValue::makeString(direction)},
+        {"qos", tbox::fw::log::FieldValue::makeInt(qos)}
+    });
     routes_[topic] = {internal_addr, direction, qos};
 
-#ifdef HAS_FRAMEWORK_LOG
     auto end = std::chrono::steady_clock::now();
     auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 
-    auto log = tbox::tsp::LogAdapter::route();
-    log.info("tsp.route.register.succeeded", "路由注册成功", {
+    LogAdapter::route().info("tsp.route.register.succeeded", "路由注册成功", {
         {"topic", tbox::fw::log::FieldValue::makeString(topic)},
         {"direction", tbox::fw::log::FieldValue::makeString(direction)},
         {"qos", tbox::fw::log::FieldValue::makeInt(qos)},
         {"duration_ms", tbox::fw::log::FieldValue::makeInt(duration_ms)}
     });
-#endif
 
     return true;
 }
@@ -70,13 +66,20 @@ bool MqttFacadeStub::publish(const std::string& topic,
                               const std::vector<uint8_t>& payload,
                               int qos) {
     if (!connected_) {
-        spdlog::warn("[MqttFacadeStub] 未连接，发布失败: {}", topic);
+        LogAdapter::mqtt_client().warn("tsp.mqtt.not_connected", "未连接，发布失败", {
+            {"topic", tbox::fw::log::FieldValue::makeString(topic)}
+        });
         return false;
     }
     std::string payload_str(payload.begin(), payload.end());
-    spdlog::info("[MqttFacadeStub] publish: topic={}, qos={}, size={}",
-                 topic, qos, payload.size());
-    spdlog::debug("[MqttFacadeStub] payload: {}", payload_str);
+    LogAdapter::mqtt_client().info("tsp.mqtt.publish", "发布消息", {
+        {"topic", tbox::fw::log::FieldValue::makeString(topic)},
+        {"qos", tbox::fw::log::FieldValue::makeInt(qos)},
+        {"payload_size", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(payload.size()))}
+    });
+    LogAdapter::mqtt_client().debug("tsp.mqtt.publish_payload", "发布消息内容", {
+        {"payload", tbox::fw::log::FieldValue::makeString(payload_str)}
+    });
     return true;
 }
 
@@ -84,7 +87,10 @@ bool MqttFacadeStub::subscribe(const std::string& topic,
                                 int qos,
                                 MessageCallback callback) {
     std::lock_guard<std::mutex> lock(mutex_);
-    spdlog::info("[MqttFacadeStub] subscribe: topic={}, qos={}", topic, qos);
+    LogAdapter::mqtt_client().info("tsp.mqtt.subscribe", "订阅主题", {
+        {"topic", tbox::fw::log::FieldValue::makeString(topic)},
+        {"qos", tbox::fw::log::FieldValue::makeInt(qos)}
+    });
     subscriptions_[topic] = {qos, std::move(callback)};
     return true;
 }
@@ -98,10 +104,15 @@ void MqttFacadeStub::simulate_incoming(const std::string& topic,
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = subscriptions_.find(topic);
     if (it != subscriptions_.end() && it->second.callback) {
-        spdlog::info("[MqttFacadeStub] 模拟下行: topic={}, size={}", topic, payload.size());
+        LogAdapter::mqtt_client().info("tsp.mqtt.simulate_incoming", "模拟下行", {
+            {"topic", tbox::fw::log::FieldValue::makeString(topic)},
+            {"payload_size", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(payload.size()))}
+        });
         it->second.callback(topic, payload);
     } else {
-        spdlog::warn("[MqttFacadeStub] 无订阅者: topic={}", topic);
+        LogAdapter::mqtt_client().warn("tsp.mqtt.no_subscribers", "无订阅者", {
+            {"topic", tbox::fw::log::FieldValue::makeString(topic)}
+        });
     }
 }
 

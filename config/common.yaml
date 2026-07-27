@@ -1,0 +1,5 @@
+# TBOX 公共配置（所有服务共享）
+# 日志配置（注意：字段名为 "log"，与 ConfigManager 校验规则一致）
+log:
+  type: console
+  path: ./log.txt

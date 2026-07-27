@@ -31,23 +31,24 @@ endif ()
 # 添加库文件目录
 link_directories(${LIB_DIR}/yaml-cpp)
 
-# TBOX-Framework 项目路径（用于 framework-log）
+# TBOX-Framework 项目路径（提供 Application 基类、framework-log 等）
+# 注意：框架已从 hwyz 更名为 tbox-framework。这里直接链接本地构建产物，
+# 不再使用已废弃的 find_package(HWYZ) 及 /usr/local/lib/libhwyz.dylib。
 set(TBOX_FW_DIR "${PROJECT_SOURCE_DIR}/../iov-vehicle-tbox-framework" CACHE PATH "Path to TBOX-Framework project")
+
+find_library(TBOX_FRAMEWORK_LIB
+        NAMES tbox-framework
+        PATHS "${TBOX_FW_DIR}/build"
+        NO_DEFAULT_PATH)
+if(NOT TBOX_FRAMEWORK_LIB)
+    message(FATAL_ERROR "tbox-framework 库未找到，请先构建：cmake --build \"${TBOX_FW_DIR}/build\"")
+endif()
+message(STATUS "Using tbox-framework: ${TBOX_FRAMEWORK_LIB}")
+
+# framework-log 由同一个 tbox-framework 库提供
 set(HAS_FRAMEWORK_LOG FALSE)
 if(EXISTS "${TBOX_FW_DIR}/include/log.h")
-    message(STATUS "Found framework-log: ${TBOX_FW_DIR}")
-    # 链接 framework 的 hwyz 库（包含 framework-log）
-    if(EXISTS "${TBOX_FW_DIR}/build/libhwyz.dylib")
-        link_directories("${TBOX_FW_DIR}/build")
-        set(HAS_FRAMEWORK_LOG TRUE)
-    elseif(EXISTS "${TBOX_FW_DIR}/build/libhwyz.so")
-        link_directories("${TBOX_FW_DIR}/build")
-        set(HAS_FRAMEWORK_LOG TRUE)
-    else()
-        message(WARNING "framework-log library not built yet")
-    endif()
-else()
-    message(WARNING "framework-log not found at ${TBOX_FW_DIR}")
+    set(HAS_FRAMEWORK_LOG TRUE)
 endif()
 
 # TBOX-PROV 客户端库（用于获取设备序列号）
@@ -83,18 +84,17 @@ add_executable(tbox_tsp
 # 添加头文件目录
 target_include_directories(tbox_tsp PRIVATE ${PROJECT_SOURCE_DIR}/include)
 target_include_directories(tbox_tsp PRIVATE ${PROJECT_SOURCE_DIR}/third_party/include)
-find_package(HWYZ REQUIRED)
-target_include_directories(tbox_tsp PUBLIC ${HWYZ_INCLUDE_DIR})
-target_link_libraries(tbox_tsp PRIVATE ${HWYZ_LIBRARIES})
+# 框架头文件与库（替代已废弃的 HWYZ 包）
+target_include_directories(tbox_tsp PRIVATE "${TBOX_FW_DIR}/include")
+target_include_directories(tbox_tsp PRIVATE "${TBOX_FW_DIR}/third_party/include")
+target_link_libraries(tbox_tsp PRIVATE ${TBOX_FRAMEWORK_LIB})
 find_package(CURL REQUIRED)
 target_link_libraries(tbox_tsp PRIVATE ${CURL_LIBRARIES})
 target_link_libraries(tbox_tsp PRIVATE yaml-cpp)
 
-# framework-log 配置（在 add_executable 之后）
+# framework-log 配置（tbox-framework 已在上方统一链接）
 if(HAS_FRAMEWORK_LOG)
-    target_include_directories(tbox_tsp PRIVATE "${TBOX_FW_DIR}/include")
     target_compile_definitions(tbox_tsp PRIVATE HAS_FRAMEWORK_LOG=1)
-    target_link_libraries(tbox_tsp PRIVATE hwyz)
 endif()
 
 # 链接 TBOX-PROV 客户端库
