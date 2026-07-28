@@ -1,12 +1,23 @@
 // src/main.cpp
+//
+// TBOX-TSP daemon (CR-003: framework-ipc Server + tbox::mqtt_client)
+//
+// 生命周期 (CR-003 §3)：
+//   Config::load("tsp") -> Logger::init("tsp") -> 构造 mqtt_client ->
+//   注册 MQTT up/down routes 与下行订阅 -> 恢复去重/节流状态 ->
+//   构造 IpcConfig -> 注册 TspIpcDispatcher -> ipc::Server::start
+//   stop：拒绝新上行 -> 停 IPC -> 取消 MQTT 订阅 -> flush -> 线程退出
+
 #include "application.h"
 #include "spdlog/spdlog.h"
 #include "spdlog/sinks/stdout_color_sinks.h"
 #include "utils.h"
 
-#include "mqtt_facade_stub.h"    // 后续替换为真正的 IPC 实现
-#include "someip_facade_impl.h"  // 真正的 IPC 实现
-#include "fota_handler.h"
+#include "mqtt_client_adapter.h"   // tbox::mqtt::Client 适配 (CR-003 §1)
+#include "fota_handler.h"          // FotaRelay 业务 (CR-003 §2)
+#include "tsp_framework_server.h"  // framework-ipc Server 接线 (CR-003 §1)
+#include "tsp_ipc_protocol.h"      // DEFAULT_SOCKET_PATH
+#include "net_status_provider.h"
 #include "security_manager.h"
 #include "tsp_http_client.h"
 #include "log_adapter.h"
@@ -14,6 +25,9 @@
 
 #include <iostream>
 #include <fstream>
+
+#include "spdlog/spdlog.h"
+#include "spdlog/sinks/stdout_color_sinks.h"
 
 using tbox::tsp::LogAdapter;
 
@@ -42,19 +56,16 @@ protected:
             logConfig.level = tbox::fw::log::LogLevel::kInfo;
             logConfig.console_config.enabled = true;
 
-            // 尝试从配置读取日志级别
-            if (getConfig()["common"] && getConfig()["common"]["log"] && getConfig()["common"]["log"]["level"]) {
-                std::string levelStr = getConfig()["common"]["log"]["level"].as<std::string>("INFO");
+            auto snap = getConfigSnapshot();
+            if (snap) {
+                std::string levelStr = snap->getString("common.log.level", "INFO");
                 logConfig.level = tbox::fw::log::logLevelFromString(levelStr);
             }
 
             auto logResult = tbox::tsp::LogAdapter::init("tsp", logConfig);
             if (logResult.error != tbox::fw::log::LogError::kOk) {
-                // 严格模式失败，非严格模式继续（降级到 console + INFO）
                 spdlog::warn("framework-log 初始化降级: {}", logResult.error_message);
             } else {
-                // 覆盖 spdlog 默认 logger 为 "tsp"，使框架基类的 spdlog::info() 也使用 tsp logger
-                // 注意：framework-log 和 spdlog 是两套独立系统，这里需要同步两者
                 auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
                 console_sink->set_level(spdlog::level::debug);
                 auto tsp_logger = std::make_shared<spdlog::logger>("tsp", console_sink);
@@ -63,36 +74,43 @@ protected:
             }
         }
 
-        // 重定向 stdout/stderr 以捕获外部库（如 Application 基类、ProvClient）的输出
-        // 注意：这是一个临时方案，长期应由框架团队修复
         redirect_stdio_to_log();
 
         // SecurityManager 保留（证书/密钥管理属于 SEC 依赖）
-        if (!SecurityManager::get_instance().load_config(getConfig())) {
+        auto snap = getConfigSnapshot();
+        if (!snap || !SecurityManager::get_instance().load_config(getConfig())) {
             LogAdapter::security().error("tsp.security.config_failed", "安全管理器配置加载失败");
             return false;
         }
 
-        // 创建 Facade
-        mqtt_facade_ = std::make_shared<tbox::tsp::MqttFacadeStub>();
-        someip_facade_ = std::make_shared<tbox::tsp::SomeipFacadeImpl>();
+        // 读取 IPC 配置 (CR-003 §8: common.ipc.* + tsp.ipc.*)
+        ipc_config_.max_frame_bytes = static_cast<uint32_t>(
+            snap->getInt("common.ipc.max_frame_bytes", 10485760));
+        ipc_config_.receive_timeout_ms = static_cast<uint32_t>(
+            snap->getInt("common.ipc.receive_timeout_ms", 60000));
+        ipc_config_.connect_timeout_ms = static_cast<uint32_t>(
+            snap->getInt("common.ipc.connect_timeout_ms", 3000));
+        ipc_config_.listen_backlog = snap->getInt("common.ipc.listen_backlog", 5);
+        ipc_config_.reconnect.initial_backoff_ms = static_cast<uint32_t>(
+            snap->getInt("common.ipc.reconnect.initial_backoff_ms", 100));
+        ipc_config_.reconnect.max_backoff_ms = static_cast<uint32_t>(
+            snap->getInt("common.ipc.reconnect.max_backoff_ms", 5000));
+        ipc_config_.reconnect.multiplier =
+            snap->getDouble("common.ipc.reconnect.multiplier", 2.0);
 
-        // 初始化 Facade
-        if (!mqtt_facade_->initialize()) {
-            LogAdapter::mqtt_client().error("tsp.mqtt.init_failed", "MQTT Facade 初始化失败");
-            return false;
-        }
-        if (!someip_facade_->initialize()) {
-            LogAdapter::someip_bridge().error("tsp.someip.init_failed", "SOMEIP Facade 初始化失败");
-            return false;
-        }
+        tsp_socket_path_ = snap->getString("tsp.ipc.socket_path",
+            tbox::tsp::ipc::DEFAULT_SOCKET_PATH);
+        downlink_queue_size_ = static_cast<uint32_t>(
+            snap->getInt("tsp.ipc.downlink_queue_size", 256));
+        slow_subscriber_policy_ = tbox::tsp::parse_slow_subscriber_policy(
+            snap->getString("tsp.ipc.slow_subscriber_policy", "disconnect"));
+
+        std::string mqtt_socket_path = snap->getString("tsp.mqtt.socket_path",
+            "/tmp/tbox-mqtt.sock");
 
         // 获取设备序列号（device_sn）
-        // 优先级：TBOX-PROV 服务 > 配置文件 > 全局状态
         std::string device_sn;
-        
 #ifdef HAS_TBOX_PROV
-        // 尝试从 TBOX-PROV 服务获取设备序列号
         try {
             tbox::prov::ProvClient prov_client("/tmp/tbox-prov.sock");
             if (prov_client.connect()) {
@@ -116,28 +134,42 @@ protected:
             });
         }
 #endif
-        
-        // 如果从 TBOX-PROV 获取失败，尝试从配置文件读取
-        if (device_sn.empty() && getConfig()["tsp"]["device-sn"]) {
-            device_sn = getConfig()["tsp"]["device-sn"].as<std::string>();
+        if (device_sn.empty()) {
+            device_sn = snap->getString("tsp.device-sn", "");
         }
-        
-        // 最后尝试从全局状态读取
         if (device_sn.empty()) {
             device_sn = hwyz::Utils::global_read_string(hwyz::global_key_t::TBOX_SN);
         }
-        
         if (device_sn.empty()) {
             LogAdapter::application().error("tsp.device_sn.missing", "device_sn 未配置");
             return false;
         }
 
-        // 创建并初始化 FOTA 业务处理器
-        fota_handler_ = std::make_unique<tbox::tsp::FotaHandler>(mqtt_facade_, someip_facade_);
+        // 1. 构造 mqtt_client（CR-003 §1: TSP 对 MQTT 只使用 tbox::mqtt_client）
+        mqtt_adapter_ = std::make_shared<tbox::tsp::MqttClientAdapter>(mqtt_socket_path);
+        if (!mqtt_adapter_->initialize()) {
+            LogAdapter::mqtt_client().error("tsp.mqtt.init_failed", "MQTT 客户端初始化失败");
+            return false;
+        }
+
+        // 2. 构造 FotaRelay（业务中继）
+        fota_handler_ = std::make_unique<tbox::tsp::FotaHandler>(mqtt_adapter_);
         if (!fota_handler_->initialize(device_sn)) {
             LogAdapter::fota().error("tsp.fota.init_failed", "FOTA 处理器初始化失败");
             return false;
         }
+
+        // 3. 构造 framework-ipc Server（CR-003 §1, §3）
+        net_status_provider_ = tbox::tsp::NetStatusProviderFactory::create(
+            tbox::tsp::NetStatusProviderFactory::ProviderType::MOCK);
+        framework_server_ = std::make_unique<tbox::tsp::TspFrameworkServer>(
+            tsp_socket_path_, ipc_config_,
+            fota_handler_.get(),          // FotaRelayInterface
+            net_status_provider_.get(),
+            downlink_queue_size_, slow_subscriber_policy_);
+
+        // 4. 接线：FotaRelay 下行经 EventPublisher 推送
+        fota_handler_->set_event_publisher(framework_server_->event_publisher());
 
         // TspHttpClient 保留用于 SEC（证书/密钥申请）
         if (!TspHttpClient::get_instance().load_config(getConfig())) {
@@ -148,9 +180,10 @@ protected:
     }
 
     void cleanup() override {
+        // stop 顺序：停 IPC（拒绝新上行）-> 停 FOTA -> 停 MQTT (CR-003 §3)
+        if (framework_server_) framework_server_->stop();
         if (fota_handler_) fota_handler_->stop();
-        if (mqtt_facade_) mqtt_facade_->stop();
-        if (someip_facade_) someip_facade_->stop();
+        if (mqtt_adapter_) mqtt_adapter_->stop();
     }
 
     int execute() override {
@@ -164,19 +197,21 @@ protected:
             return -1;
         }
 
-        // 启动 Facade
-        if (!mqtt_facade_->start()) {
-            LogAdapter::mqtt_client().error("tsp.mqtt.start_failed", "MQTT Facade 启动失败");
-            return -1;
-        }
-        if (!someip_facade_->start()) {
-            LogAdapter::someip_bridge().error("tsp.someip.start_failed", "SOMEIP Facade 启动失败");
+        // 启动 MQTT 客户端
+        if (!mqtt_adapter_->start()) {
+            LogAdapter::mqtt_client().error("tsp.mqtt.start_failed", "MQTT 客户端启动失败");
             return -1;
         }
 
-        // 启动 FOTA 业务处理
+        // 启动 FOTA 业务（注册路由、订阅下行）
         if (!fota_handler_->start()) {
             LogAdapter::fota().error("tsp.fota.start_failed", "FOTA 处理器启动失败");
+            return -1;
+        }
+
+        // 启动 framework-ipc Server
+        if (!framework_server_->start()) {
+            LogAdapter::ipc_server().error("tsp.ipc.start_failed", "IPC Server 启动失败");
             return -1;
         }
 
@@ -185,17 +220,21 @@ protected:
     }
 
 private:
-    std::shared_ptr<tbox::tsp::MqttFacade> mqtt_facade_;
-    std::shared_ptr<tbox::tsp::SomeipFacade> someip_facade_;
+    std::shared_ptr<tbox::tsp::MqttClientAdapter> mqtt_adapter_;
     std::unique_ptr<tbox::tsp::FotaHandler> fota_handler_;
+    std::unique_ptr<tbox::tsp::TspFrameworkServer> framework_server_;
+    std::unique_ptr<tbox::tsp::NetStatusProvider> net_status_provider_;
+
+    ::tbox::fw::ipc::IpcConfig ipc_config_{};
+    std::string tsp_socket_path_;
+    uint32_t downlink_queue_size_ = 256;
+    tbox::tsp::SlowSubscriberPolicy slow_subscriber_policy_ = tbox::tsp::SlowSubscriberPolicy::kDisconnect;
 
     // 重定向 stdout/stderr 到日志系统
     void redirect_stdio_to_log() {
-        // 保存原始的 cout/cerr 缓冲区
         static std::streambuf* orig_cout = std::cout.rdbuf();
         static std::streambuf* orig_cerr = std::cerr.rdbuf();
 
-        // 创建自定义缓冲区，将输出重定向到日志
         class LogBuf : public std::streambuf {
         public:
             LogBuf(std::streambuf* orig, bool is_err) : orig_(orig), is_err_(is_err) {}
@@ -242,35 +281,23 @@ private:
 
 // 自定义信号处理函数，避免死循环
 static void custom_signal_handler(int signal) {
-    // 只处理一次，避免递归
     static std::atomic<bool> handling{false};
     if (handling.exchange(true)) {
-        // 已经在处理中，直接退出
         _exit(1);
     }
-    
-    // 只处理 SIGSEGV，其他信号交给默认处理
     if (signal == SIGSEGV) {
-        // 不打印任何日志，直接退出
         _exit(1);
     }
-    
-    // 其他信号，设置退出标志
-    // 注意：这里不能访问 Application 实例，因为是静态函数
-    // 所以直接退出
     _exit(0);
 }
 
 extern "C" int main(int argc, char* argv[]) {
-    // 设置自定义信号处理函数，覆盖 Application 类的设置
     struct sigaction sa{};
     sa.sa_handler = custom_signal_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
-    
-    // 只处理 SIGSEGV
     sigaction(SIGSEGV, &sa, nullptr);
-    
+
     try {
         MainApplication app;
         return app.run(argc, argv);

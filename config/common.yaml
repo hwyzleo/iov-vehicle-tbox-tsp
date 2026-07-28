@@ -3,3 +3,15 @@
 log:
   type: console
   path: ./log.txt
+  level: INFO
+
+# framework-ipc 公共配置 (CR-003 §8)
+ipc:
+  max_frame_bytes: 10485760       # 单帧上限 10 MiB
+  receive_timeout_ms: 60000
+  connect_timeout_ms: 3000
+  listen_backlog: 5
+  reconnect:
+    initial_backoff_ms: 100
+    max_backoff_ms: 5000
+    multiplier: 2.0

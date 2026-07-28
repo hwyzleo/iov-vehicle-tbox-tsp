@@ -5,17 +5,24 @@
 #include <vector>
 #include <functional>
 #include <cstdint>
+#include "tbox/tsp/types.h"
 
 namespace tbox {
 namespace tsp {
 
-// 消息回调：topic + payload
+// 消息回调：topic + payload（原始二进制）
 using MessageCallback = std::function<void(const std::string& topic,
                                             const std::vector<uint8_t>& payload)>;
 
-// MQTT Facade —— 对 TBOX-MQTT 服务的 IPC 客户端接口
-// SPEC §5.1: registerRoute(internalAddr, topic, direction, qos)
-//           publish(topic, payload, qos) / onMessage(topic, handler)
+// MQTT 发布结果（CR-003 §4: accepted ≠ Broker PUBACK）
+struct MqttPublishResult {
+    bool accepted = false;                          // MQTT daemon 已接管
+    PublishOutcome outcome = PublishOutcome::ACCEPTED;
+};
+
+// MQTT Facade -- 对 TBOX-MQTT 服务的客户端接口
+// SPEC §5.1 / CR-003: TSP 对 MQTT 只使用 tbox::mqtt_client 的
+// registerRoute/publish/subscribe，不操作其 socket/method/JSON，也不持有 MQTT 连接。
 class MqttFacade {
 public:
     virtual ~MqttFacade() = default;
@@ -31,20 +38,23 @@ public:
 
     // 注册路由（SPEC §5.1）
     // direction: "up" 或 "down"
-    // 启动时调用，注册 fota 上下行路由
     virtual bool registerRoute(const std::string& internal_addr,
                                const std::string& topic,
                                const std::string& direction,
                                int qos) = 0;
 
-    // 发布消息到云端（SPEC §5.1）
-    // 经 TBOX-MQTT publish 到指定 topic
-    virtual bool publish(const std::string& topic,
-                         const std::vector<uint8_t>& payload,
-                         int qos) = 0;
+    // 发布消息到云端（SPEC §5.1, CR-003 §4）
+    // msg_id 为幂等关联键；accepted 仅表示 MQTT daemon 接管，不等于 Broker PUBACK。
+    // outcome=UNKNOWN 表示响应丢失，需用相同 msg_id 查询/重试。
+    virtual MqttPublishResult publish(const std::string& msg_id,
+                                      const std::string& topic,
+                                      const std::vector<uint8_t>& payload,
+                                      int qos,
+                                      const std::string& content_type = "application/x-protobuf",
+                                      const std::string& trace_id = "",
+                                      const std::string& request_id = "") = 0;
 
     // 订阅下行消息（SPEC §5.1）
-    // 收到下行时通过 callback 通知
     virtual bool subscribe(const std::string& topic,
                            int qos,
                            MessageCallback callback) = 0;

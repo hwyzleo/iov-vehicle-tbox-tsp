@@ -1,6 +1,8 @@
 // src/fota_handler.cpp
 #include "fota_handler.h"
 #include "constants.h"
+#include "tsp_ipc_protocol.h"
+#include "tbox/tsp/errors.h"
 #include "spdlog/spdlog.h"
 #include "nlohmann/json.hpp"
 #include "log_adapter.h"
@@ -11,21 +13,23 @@
 #include <functional>
 #include <cstring>
 
-#ifdef __APPLE__
-#include <CommonCrypto/CommonDigest.h>
-#define TSP_USE_CC_SHA256
-#elif __linux__
-#include <openssl/sha.h>
-#define TSP_USE_OSSL_SHA256
-#endif
+#include "utils.h"
 
 namespace tbox {
 namespace tsp {
 
+namespace {
+
+std::string b64_decode(const std::string& encoded) {
+    return ::hwyz::Utils::base64_decode(encoded);
+}
+
+} // anonymous namespace
+
 FotaHandler::FotaHandler(std::shared_ptr<MqttFacade> mqtt,
-                         std::shared_ptr<SomeipFacade> someip)
+                         TspEventPublisher* event_publisher)
     : mqtt_(std::move(mqtt))
-    , someip_(std::move(someip)) {}
+    , event_publisher_(event_publisher) {}
 
 FotaHandler::~FotaHandler() {
     stop();
@@ -42,19 +46,11 @@ bool FotaHandler::initialize(const std::string& device_sn) {
         {"device_sn", tbox::fw::log::FieldValue::makeString(device_sn_),
                       tbox::fw::log::Sensitivity::Identifier}
     });
-
-    // 注册上行回调：当 TBOX-SOMEIP 收到 reportSoftwareInventory 时
-    someip_->on_report_software_inventory(
-        [this](const std::vector<uint8_t>& snapshot) {
-            ErrorCode result = handle_upstream(snapshot);
-            if (result != ErrorCode::SUCCESS) {
-                LogAdapter::fota().warn("tsp.fota.uplink.failed", "上行处理失败", {
-                    {"error_code", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(result))}
-                });
-            }
-        });
-
     return true;
+}
+
+void FotaHandler::set_event_publisher(TspEventPublisher* publisher) {
+    event_publisher_ = publisher;
 }
 
 bool FotaHandler::start() {
@@ -63,24 +59,23 @@ bool FotaHandler::start() {
         return false;
     }
 
-    // 注册路由（SPEC §5.1）
+    // 注册路由（SPEC §5.1, CR-003 §3）
     std::string up_topic = topics::fota_up(device_sn_);
     std::string down_topic = topics::fota_down(device_sn_);
 
-    mqtt_->registerRoute("tsp_fota_up", up_topic, "up", FOTA_QOS);
-    mqtt_->registerRoute("tsp_fota_down", down_topic, "down", FOTA_QOS);
-
-    // 路由注册成功日志（由 MqttFacadeStub 内部记录）
+    if (!mqtt_->registerRoute("tsp_fota_up", up_topic, "up", FOTA_QOS)) {
+        LogAdapter::fota().error("tsp.fota.route.up_failed", "上行路由注册失败");
+        return false;
+    }
+    if (!mqtt_->registerRoute("tsp_fota_down", down_topic, "down", FOTA_QOS)) {
+        LogAdapter::fota().error("tsp.fota.route.down_failed", "下行路由注册失败");
+        return false;
+    }
 
     // 订阅下行（SPEC §4.2）
     mqtt_->subscribe(down_topic, FOTA_QOS,
         [this](const std::string& topic, const std::vector<uint8_t>& payload) {
-            ErrorCode result = handle_downstream(topic, payload);
-            if (result != ErrorCode::SUCCESS) {
-                LogAdapter::fota().warn("tsp.fota.downlink.failed", "下行处理失败", {
-                    {"error_code", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(result))}
-                });
-            }
+            handle_downstream(topic, payload);
         });
 
     started_ = true;
@@ -93,69 +88,93 @@ void FotaHandler::stop() {
     LogAdapter::fota().info("tsp.fota.stopped", "FOTA 处理器停止");
 }
 
-ErrorCode FotaHandler::handle_upstream(const std::vector<uint8_t>& snapshot) {
-    // 生成 request_id 用于上下文传播
-    std::string request_id = "req-" + std::to_string(
-        std::chrono::steady_clock::now().time_since_epoch().count());
-
-    // 创建上下文作用域
+ReportResult FotaHandler::handle_uplink(const FotaSnapshot& snapshot) {
+    // 上下文传播 (SPEC §6.2)
     tbox::fw::log::LogContext ctx;
-    ctx.request_id = request_id;
+    ctx.request_id = snapshot.request_id.empty()
+        ? ("req-" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()))
+        : snapshot.request_id;
+    if (!snapshot.trace_id.empty()) ctx.trace_id = snapshot.trace_id;
     tbox::fw::log::ContextScope scope(ctx);
 
     auto log = LogAdapter::fota();
     log.debug("tsp.fota.uplink.received", "收到软件版本快照", {
-        {"payload_size", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(snapshot.size()))}
+        {"snapshot_seq", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(snapshot.snapshot_seq))},
+        {"payload_size", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(snapshot.payload.size()))}
     });
 
-    // 去重检查（TBOX-TSP-1003）
-    std::string hash = compute_hash(snapshot);
-    if (is_duplicate(hash)) {
-        log.info("tsp.fota.snapshot.duplicate", "去重命中，丢弃重复上报", {
-            {"dedup_key", tbox::fw::log::FieldValue::makeString(hash),
-                          tbox::fw::log::Sensitivity::Identifier}
-        });
-        return ErrorCode::DEDUP_HIT;
+    ReportResult result;
+    result.msg_id = snapshot.msg_id;
+
+    // 幂等去重：相同 msg_id 已有状态则返回已有状态，不重复上云 (CR-003 §4)
+    {
+        std::lock_guard<std::mutex> lock(relay_mutex_);
+        auto it = relay_status_map_.find(snapshot.msg_id);
+        if (it != relay_status_map_.end() &&
+            it->second.state != RelayState::UNKNOWN) {
+            log.info("tsp.fota.snapshot.duplicate", "去重命中，返回已有状态", {
+                {"snapshot_seq", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(snapshot.snapshot_seq))}
+            });
+            result.accepted = (it->second.state != RelayState::FAILED);
+            result.outcome = PublishOutcome::ACCEPTED;
+            result.error_code = static_cast<int32_t>(TspErrorCode::DEDUP_HIT);
+            return result;
+        }
     }
 
     // 节流检查
     if (is_throttled()) {
         log.info("tsp.fota.uplink.throttled", "节流中，跳过本次上报");
-        return ErrorCode::SUCCESS;
+        result.accepted = true;  // 已接收，速率限制跳过
+        result.outcome = PublishOutcome::ACCEPTED;
+        result.error_code = static_cast<int32_t>(TspErrorCode::SUCCESS);
+        return result;
     }
 
-    // 发布到 up/fota（SPEC §4.1）
+    // 发布到 up/fota（SPEC §4.1, CR-003 §4）
     auto publish_start = std::chrono::steady_clock::now();
     std::string up_topic = topics::fota_up(device_sn_);
-    bool ok = mqtt_->publish(up_topic, snapshot, FOTA_QOS);
+    MqttPublishResult pr = mqtt_->publish(
+        snapshot.msg_id, up_topic, snapshot.payload, FOTA_QOS,
+        snapshot.content_type, snapshot.trace_id, snapshot.request_id);
     auto publish_end = std::chrono::steady_clock::now();
-    auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(publish_end - publish_start).count();
+    auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        publish_end - publish_start).count();
 
-    if (!ok) {
+    result.accepted = pr.accepted;
+    result.outcome = pr.outcome;
+
+    // 记录中继状态（同时作为去重表）
+    RelayStatus status;
+    status.msg_id = snapshot.msg_id;
+    status.snapshot_seq = snapshot.snapshot_seq;
+    if (pr.accepted) {
+        status.state = RelayState::ACCEPTED;
+        result.error_code = static_cast<int32_t>(TspErrorCode::SUCCESS);
+        log.info("tsp.fota.uplink.published", "快照已提交 MQTT daemon（accepted≠PUBACK）", {
+            {"topic", tbox::fw::log::FieldValue::makeString(up_topic)},
+            {"qos", tbox::fw::log::FieldValue::makeInt(FOTA_QOS)},
+            {"duration_ms", tbox::fw::log::FieldValue::makeInt(duration_ms)}
+        });
+    } else {
+        status.state = RelayState::FAILED;
+        status.last_error = "mqtt publish failed";
+        result.error_code = static_cast<int32_t>(TspErrorCode::PUBLISH_FAILED);
         log.error("tsp.fota.uplink.publish_failed", "MQTT 发布失败或超时", {
             {"topic", tbox::fw::log::FieldValue::makeString(up_topic)},
             {"qos", tbox::fw::log::FieldValue::makeInt(FOTA_QOS)},
             {"duration_ms", tbox::fw::log::FieldValue::makeInt(duration_ms)}
         });
-        return ErrorCode::PUBLISH_FAILED;
     }
 
-    // 更新去重和节流状态
+    // outcome=UNKNOWN 时不覆盖已有状态语义：记录为 ACCEPTED（已接管）但告知客户端未知
     {
-        std::lock_guard<std::mutex> lock(dedup_mutex_);
-        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
-        dedup_map_[hash] = static_cast<uint64_t>(now);
-
-        // 清理过期条目
-        for (auto it = dedup_map_.begin(); it != dedup_map_.end(); ) {
-            if (static_cast<uint64_t>(now) - it->second > DEDUP_WINDOW_MS) {
-                it = dedup_map_.erase(it);
-            } else {
-                ++it;
-            }
-        }
+        std::lock_guard<std::mutex> lock(relay_mutex_);
+        relay_status_map_[snapshot.msg_id] = status;
     }
+
+    // 更新节流时间
     {
         std::lock_guard<std::mutex> lock(throttle_mutex_);
         last_publish_time_ms_ = static_cast<uint64_t>(
@@ -163,22 +182,26 @@ ErrorCode FotaHandler::handle_upstream(const std::vector<uint8_t>& snapshot) {
                 std::chrono::steady_clock::now().time_since_epoch()).count());
     }
 
-    log.info("tsp.fota.uplink.published", "快照发布成功", {
-        {"topic", tbox::fw::log::FieldValue::makeString(up_topic)},
-        {"qos", tbox::fw::log::FieldValue::makeInt(FOTA_QOS)},
-        {"duration_ms", tbox::fw::log::FieldValue::makeInt(duration_ms)}
-    });
-    return ErrorCode::SUCCESS;
+    return result;
 }
 
-ErrorCode FotaHandler::handle_downstream(const std::string& topic,
-                                          const std::vector<uint8_t>& payload) {
-    // 生成 request_id
-    std::string request_id = "req-" + std::to_string(
-        std::chrono::steady_clock::now().time_since_epoch().count());
+RelayStatus FotaHandler::get_relay_status(const std::string& msg_id) {
+    std::lock_guard<std::mutex> lock(relay_mutex_);
+    auto it = relay_status_map_.find(msg_id);
+    if (it != relay_status_map_.end()) {
+        return it->second;
+    }
+    RelayStatus s;
+    s.msg_id = msg_id;
+    s.state = RelayState::UNKNOWN;
+    return s;
+}
 
+void FotaHandler::handle_downstream(const std::string& topic,
+                                    const std::vector<uint8_t>& payload) {
     tbox::fw::log::LogContext ctx;
-    ctx.request_id = request_id;
+    ctx.request_id = "req-" + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count());
     tbox::fw::log::ContextScope scope(ctx);
 
     auto log = LogAdapter::fota();
@@ -187,50 +210,46 @@ ErrorCode FotaHandler::handle_downstream(const std::string& topic,
         {"payload_size", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(payload.size()))}
     });
 
-    // 解析 payload（TBOX-TSP-1002）
+    // 解析下行 payload（TBOX-TSP-1002）
+    FotaCommand cmd;
     try {
         std::string payload_str(payload.begin(), payload.end());
-        auto json = nlohmann::json::parse(payload_str);
-        log.debug("tsp.fota.downlink.parsed", "下行 JSON 解析成功");
+        auto j = nlohmann::json::parse(payload_str);
+        cmd.command_id     = j.value(ipc::field::COMMAND_ID, "");
+        cmd.delivery_id    = j.value(ipc::field::DELIVERY_ID, "");
+        cmd.schema_version = j.value(ipc::field::SCHEMA_VERSION, "");
+        cmd.content_type   = j.value(ipc::field::CONTENT_TYPE, "application/x-protobuf");
+        cmd.trace_id       = j.value(ipc::field::TRACE_ID, "");
+        cmd.request_id     = j.value(ipc::field::REQUEST_ID, "");
+        std::string b64 = j.value(ipc::field::PAYLOAD_B64, "");
+        if (!b64.empty()) {
+            std::string decoded = b64_decode(b64);
+            cmd.payload.assign(decoded.begin(), decoded.end());
+        }
     } catch (const std::exception& e) {
         log.warn("tsp.fota.downlink.parse_failed", "下行 payload 解析失败", {
             {"topic", tbox::fw::log::FieldValue::makeString(topic)},
-            {"payload_size", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(payload.size()))},
-            {"error_code", tbox::fw::log::FieldValue::makeInt(1002)}
+            {"payload_size", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(payload.size()))}
         });
-        return ErrorCode::PAYLOAD_PARSE_FAILED;
+        return;
     }
 
-    // 经 IPC 交 TBOX-SOMEIP（SPEC §4.2）
-    auto forward_start = std::chrono::steady_clock::now();
-    bool ok = someip_->push_fota_command(payload);
-    auto forward_end = std::chrono::steady_clock::now();
-    auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(forward_end - forward_start).count();
-
-    if (!ok) {
-        log.error("tsp.fota.downlink.forward_failed", "推送下行到 SOMEIP 失败", {
-            {"topic", tbox::fw::log::FieldValue::makeString(topic)},
-            {"duration_ms", tbox::fw::log::FieldValue::makeInt(duration_ms)}
-        });
-        return ErrorCode::PUBLISH_FAILED;
+    // 经 TspEventPublisher 推送已订阅的 tsp_client（SPEC §4.2, CR-003 §5）
+    if (!event_publisher_) {
+        log.warn("tsp.fota.downlink.no_publisher", "下行事件推送器未设置");
+        return;
     }
 
-    log.info("tsp.fota.downlink.forwarded", "下行成功转交 SOME/IP 门面", {
-        {"topic", tbox::fw::log::FieldValue::makeString(topic)},
-        {"duration_ms", tbox::fw::log::FieldValue::makeInt(duration_ms)}
+    if (!event_publisher_->publish_fota_command(cmd)) {
+        log.warn("tsp.fota.downlink.rejected", "下行命令被拒（队列满）", {
+            {"command_id", tbox::fw::log::FieldValue::makeString(cmd.command_id)}
+        });
+        return;
+    }
+
+    log.info("tsp.fota.downlink.forwarded", "下行命令已投递事件推送器", {
+        {"topic", tbox::fw::log::FieldValue::makeString(topic)}
     });
-    return ErrorCode::SUCCESS;
-}
-
-bool FotaHandler::is_duplicate(const std::string& snapshot_hash) {
-    std::lock_guard<std::mutex> lock(dedup_mutex_);
-    auto it = dedup_map_.find(snapshot_hash);
-    if (it == dedup_map_.end()) {
-        return false;
-    }
-    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-    return (static_cast<uint64_t>(now) - it->second) < DEDUP_WINDOW_MS;
 }
 
 bool FotaHandler::is_throttled() {
@@ -238,29 +257,6 @@ bool FotaHandler::is_throttled() {
     auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     return (static_cast<uint64_t>(now) - last_publish_time_ms_) < THROTTLE_INTERVAL_MS;
-}
-
-std::string FotaHandler::compute_hash(const std::vector<uint8_t>& data) {
-    unsigned char hash[32];
-
-#if defined(TSP_USE_CC_SHA256)
-    CC_SHA256(data.data(), static_cast<CC_LONG>(data.size()), hash);
-#elif defined(TSP_USE_OSSL_SHA256)
-    SHA256(data.data(), data.size(), hash);
-#else
-    // Fallback: 简单哈希（开发用）
-    size_t h = 0;
-    for (auto byte : data) {
-        h = h * 31 + byte;
-    }
-    return std::to_string(h);
-#endif
-
-    std::stringstream ss;
-    for (int i = 0; i < 32; i++) {
-        ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(hash[i]);
-    }
-    return ss.str();
 }
 
 } // namespace tsp
