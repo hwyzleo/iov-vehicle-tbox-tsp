@@ -1,17 +1,19 @@
 # TBOX 公共配置（所有服务共享）
-# 日志配置（注意：字段名为 "log"，与 ConfigManager 校验规则一致）
-log:
-  type: console
-  path: ./log.txt
-  level: INFO
+# 公共配置统一收敛到 common 命名空间（代码读取 common.log.* / common.ipc.*）
+common:
+  # 日志配置（framework-config 校验 common.log 必须存在）
+  log:
+    type: console
+    path: ./log.txt
+    level: INFO
 
-# framework-ipc 公共配置 (CR-003 §8)
-ipc:
-  max_frame_bytes: 10485760       # 单帧上限 10 MiB
-  receive_timeout_ms: 60000
-  connect_timeout_ms: 3000
-  listen_backlog: 5
-  reconnect:
-    initial_backoff_ms: 100
-    max_backoff_ms: 5000
-    multiplier: 2.0
+  # framework-ipc 公共配置 (CR-003 §8)
+  ipc:
+    max_frame_bytes: 10485760       # 单帧上限 10 MiB
+    receive_timeout_ms: 60000
+    connect_timeout_ms: 3000
+    listen_backlog: 5
+    reconnect:
+      initial_backoff_ms: 100
+      max_backoff_ms: 5000
+      multiplier: 2.0

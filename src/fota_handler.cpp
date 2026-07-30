@@ -53,26 +53,41 @@ void FotaHandler::set_event_publisher(TspEventPublisher* publisher) {
     event_publisher_ = publisher;
 }
 
+void FotaHandler::set_catalog(std::shared_ptr<SubscriptionCatalog> catalog) {
+    catalog_ = std::move(catalog);
+}
+
+std::string FotaHandler::resolve_up_topic() const {
+    if (catalog_) {
+        for (const auto& it : catalog_->items()) {
+            if (it.target == "tsp.fota" && it.direction == Direction::UP) {
+                return expand_topic_template(it.topic_template, device_sn_);
+            }
+        }
+    }
+    return topics::fota_up(device_sn_);
+}
+
+std::string FotaHandler::resolve_down_topic() const {
+    if (catalog_) {
+        for (const auto& it : catalog_->items()) {
+            if (it.target == "tsp.fota" && it.direction == Direction::DOWN) {
+                return expand_topic_template(it.topic_template, device_sn_);
+            }
+        }
+    }
+    return topics::fota_down(device_sn_);
+}
+
 bool FotaHandler::start() {
     if (device_sn_.empty()) {
         LogAdapter::fota().error("tsp.fota.start.failed", "未初始化");
         return false;
     }
 
-    // 注册路由（SPEC §5.1, CR-003 §3）
-    std::string up_topic = topics::fota_up(device_sn_);
-    std::string down_topic = topics::fota_down(device_sn_);
-
-    if (!mqtt_->registerRoute("tsp_fota_up", up_topic, "up", FOTA_QOS)) {
-        LogAdapter::fota().error("tsp.fota.route.up_failed", "上行路由注册失败");
-        return false;
-    }
-    if (!mqtt_->registerRoute("tsp_fota_down", down_topic, "down", FOTA_QOS)) {
-        LogAdapter::fota().error("tsp.fota.route.down_failed", "下行路由注册失败");
-        return false;
-    }
-
-    // 订阅下行（SPEC §4.2）
+    // 路由映射由订阅快照注册器统一提交（CR-004 §11.5），
+    // FotaHandler 不再逐条 registerRoute；仅订阅下行投递（迁移期保留 subscribe）。
+    std::string down_topic = resolve_down_topic();
     mqtt_->subscribe(down_topic, FOTA_QOS,
         [this](const std::string& topic, const std::vector<uint8_t>& payload) {
             handle_downstream(topic, payload);
@@ -134,7 +149,7 @@ ReportResult FotaHandler::handle_uplink(const FotaSnapshot& snapshot) {
 
     // 发布到 up/fota（SPEC §4.1, CR-003 §4）
     auto publish_start = std::chrono::steady_clock::now();
-    std::string up_topic = topics::fota_up(device_sn_);
+    std::string up_topic = resolve_up_topic();
     MqttPublishResult pr = mqtt_->publish(
         snapshot.msg_id, up_topic, snapshot.payload, FOTA_QOS,
         snapshot.content_type, snapshot.trace_id, snapshot.request_id);

@@ -25,6 +25,17 @@ NC='\033[0m' # No Color
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${PROJECT_ROOT}/build"
 
+# 构建环境单一来源：由 framework 仓库提供 TBOX_PREFIX / TBoxFramework_DIR
+# 切换本地开发与生产环境只需覆盖环境变量，例如：
+#   TBOX_PREFIX=/opt/tbox ./scripts/build.sh
+TBOX_ENV_FILE="${PROJECT_ROOT}/../iov-vehicle-tbox-framework/scripts/tbox-env.sh"
+if [ ! -f "${TBOX_ENV_FILE}" ]; then
+    echo "[ERROR] 未找到 ${TBOX_ENV_FILE}" >&2
+    echo "        请确认 iov-vehicle-tbox-framework 与本项目位于同级目录" >&2
+    exit 1
+fi
+source "${TBOX_ENV_FILE}"
+
 # 默认选项
 CLEAN_BUILD=false
 RUN_TESTS=true
@@ -194,6 +205,7 @@ configure_project() {
 
     cmake .. \
         -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
+        -DTBoxFramework_DIR="${TBoxFramework_DIR}" \
         -DBUILD_TESTS=$([ "$RUN_TESTS" = true ] && echo "ON" || echo "OFF")
 
     if [ $? -ne 0 ]; then

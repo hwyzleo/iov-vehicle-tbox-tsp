@@ -3,6 +3,7 @@
 
 #include "mqtt_facade.h"
 #include "fota_relay_interface.h"
+#include "subscription_catalog.h"
 #include "tsp_event_publisher.h"
 #include "tbox/tsp/types.h"
 #include "tbox/tsp/errors.h"
@@ -47,6 +48,10 @@ public:
     // 设置下行事件推送器（main 接线后调用）
     void set_event_publisher(TspEventPublisher* publisher);
 
+    // 设置业务订阅目录（CR-004 §11.5：路由映射由快照注册器负责，
+    // FotaHandler 仅从目录解析下行投递 Topic）
+    void set_catalog(std::shared_ptr<SubscriptionCatalog> catalog);
+
     // ---- FotaRelayInterface ----
     // 上行：校验 envelope、去重/节流后经 mqtt_client publish (CR-003 §4)
     ReportResult handle_uplink(const FotaSnapshot& snapshot) override;
@@ -62,7 +67,12 @@ private:
     // 节流检查
     bool is_throttled();
 
+    // 从目录解析 FOTA 上下行 Topic（目录未设置时回退到 constants, CR-004 §11.5）
+    std::string resolve_up_topic() const;
+    std::string resolve_down_topic() const;
+
     std::shared_ptr<MqttFacade> mqtt_;
+    std::shared_ptr<SubscriptionCatalog> catalog_;
     TspEventPublisher* event_publisher_ = nullptr;
     std::string device_sn_;
 

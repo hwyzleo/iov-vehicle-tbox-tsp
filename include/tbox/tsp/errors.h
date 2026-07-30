@@ -22,6 +22,8 @@ enum class TspErrorCode : int32_t {
     PAYLOAD_PARSE_FAILED = 1002,  // 下行 payload 解析失败
     DEDUP_HIT = 1003,             // 去重命中，已丢弃重复上报
     ROUTE_REGISTER_FAILED = 1004, // 业务路由注册失败
+    SUBSCRIPTION_INVALID = 1005,         // 业务订阅目录/快照无效 (CR-004 §10)
+    SUBSCRIPTION_REGISTER_FAILED = 1006, // 订阅快照注册失败或持续无法恢复 (CR-004 §10)
 
     // client 暴露错误（FW-03xx 传输失败映射，不泄露 framework 异常类型）
     INVALID_PARAMETER = 2001,

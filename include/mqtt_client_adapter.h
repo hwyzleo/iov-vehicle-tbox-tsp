@@ -2,6 +2,7 @@
 #pragma once
 
 #include "mqtt_facade.h"
+#include "subscription_types.h"
 #include "tbox/mqtt/client.h"
 #include "ipc.h"
 
@@ -44,6 +45,17 @@ public:
 
     bool is_connected() const override;
 
+    // ---- 业务订阅快照 (CR-004 §5, §11.5 迁移实现) ----
+    // 迁移期 MQTT 尚未提供批量原子接口，adapter 展开模板后逐条调用 registerRoute，
+    // 不宣称真正原子替换；真正原子契约由配套 MQTT DSN-CR 提供。
+    ReplaceSnapshotResult replaceSubscriptionSnapshot(
+        const SubscriptionSnapshot& snapshot) override;
+    SnapshotStatusResult getSubscriptionSnapshotStatus(
+        const std::string& owner, uint64_t generation) override;
+
+    // 设置当前设备身份（ecu_uid），用于 Topic 模板展开 (CR-004 §4)
+    void set_device_identity(const std::string& ecu_uid);
+
 private:
     std::string socket_path_;
     std::unique_ptr<::tbox::mqtt::Client> client_;
@@ -52,6 +64,10 @@ private:
 
     // 持有下行订阅句柄（RAII），析构自动取消
     ::tbox::fw::ipc::Subscription downlink_sub_;
+    std::string device_identity_;
+    // 迁移期缓存最近一次快照与结果，用于 getSubscriptionSnapshotStatus 查询
+    SubscriptionSnapshot last_snapshot_;
+    ReplaceSnapshotResult last_result_;
     mutable std::mutex mutex_;
 };
 

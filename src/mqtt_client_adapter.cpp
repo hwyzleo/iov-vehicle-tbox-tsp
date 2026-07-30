@@ -123,5 +123,99 @@ bool MqttClientAdapter::is_connected() const {
     return client_->getConnectionState() == ::tbox::mqtt::ConnectionState::CONNECTED;
 }
 
+void MqttClientAdapter::set_device_identity(const std::string& ecu_uid) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    device_identity_ = ecu_uid;
+}
+
+ReplaceSnapshotResult MqttClientAdapter::replaceSubscriptionSnapshot(
+        const SubscriptionSnapshot& snapshot) {
+    ReplaceSnapshotResult result;
+
+    std::string ecu_uid;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ecu_uid = device_identity_;
+    }
+    if (ecu_uid.empty()) {
+        result.status = SnapshotStatus::REJECTED;
+        result.reason_code = "device_identity_missing";
+        LogAdapter::mqtt_client().error(
+            "tsp.subscription.snapshot.rejected",
+            "订阅快照提交失败：设备身份缺失", {
+                {"generation",
+                 tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(snapshot.generation))},
+                {"reason_code",
+                 tbox::fw::log::FieldValue::makeString("device_identity_missing")}
+            });
+        return result;
+    }
+
+    // MQTT IPC 不可用时结果未知，使用相同 generation 查询/重试 (CR-004 §11.3)
+    if (!is_connected()) {
+        result.status = SnapshotStatus::UNKNOWN;
+        result.reason_code = "mqtt_not_connected";
+        return result;
+    }
+
+    // 迁移路径：逐条 registerRoute（CR-004 §11.5）。
+    // 注意：非真正原子替换，部分失败时已注册路由不回滚。
+    std::vector<std::string> rejected;
+    bool all_ok = true;
+    for (const auto& item : snapshot.items) {
+        std::string topic = expand_topic_template(item.topic_template, ecu_uid);
+        bool ok = false;
+        if (item.direction == Direction::UP) {
+            ok = registerRoute(item.route_id, topic, "up", item.qos);
+        } else if (item.direction == Direction::DOWN) {
+            ok = registerRoute(item.route_id, topic, "down", item.qos);
+        } else {  // BIDIRECTIONAL：注册 up + down 两条映射
+            bool up = registerRoute(item.route_id, topic, "up", item.qos);
+            bool down = registerRoute(item.route_id, topic, "down", item.qos);
+            ok = up && down;
+        }
+        if (!ok) {
+            rejected.push_back(item.route_id);
+            all_ok = false;
+        }
+    }
+
+    if (all_ok) {
+        result.status = SnapshotStatus::ACCEPTED;
+        result.accepted_generation = snapshot.generation;
+        std::lock_guard<std::mutex> lock(mutex_);
+        last_snapshot_ = snapshot;
+        last_result_ = result;
+    } else {
+        result.status = SnapshotStatus::REJECTED;
+        result.rejected_route_ids = std::move(rejected);
+        result.reason_code = "route_register_failed";
+        LogAdapter::route().warn(
+            "tsp.subscription.snapshot.partial_failed",
+            "迁移路径部分路由注册失败（非原子，已注册项不回滚）", {
+                {"generation",
+                 tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(snapshot.generation))},
+                {"rejected_count",
+                 tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(result.rejected_route_ids.size()))}
+            });
+    }
+    return result;
+}
+
+SnapshotStatusResult MqttClientAdapter::getSubscriptionSnapshotStatus(
+        const std::string& owner, uint64_t generation) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    SnapshotStatusResult r;
+    r.generation = generation;
+    if (owner == last_snapshot_.owner && generation == last_snapshot_.generation) {
+        r.status = last_result_.status;
+        r.content_digest = last_snapshot_.content_digest;
+        r.registration_complete = last_snapshot_.registration_complete;
+    } else {
+        r.status = SnapshotStatus::UNKNOWN;
+    }
+    return r;
+}
+
 } // namespace tsp
 } // namespace tbox

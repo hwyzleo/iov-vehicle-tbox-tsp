@@ -6,6 +6,7 @@
 #include <functional>
 #include <cstdint>
 #include "tbox/tsp/types.h"
+#include "subscription_types.h"
 
 namespace tbox {
 namespace tsp {
@@ -58,6 +59,24 @@ public:
     virtual bool subscribe(const std::string& topic,
                            int qos,
                            MessageCallback callback) = 0;
+
+    // ---- 业务订阅快照 (CR-004 §5, §11) ----
+    // TSP 以完整、版本化快照向 MQTT 提交当前订阅集合。
+    // 最终 wire schema 由配套 MQTT DSN-CR 固化；本接口为 TSP 侧契约。
+    // accepted 仅表示 MQTT daemon 接受本地投影，不等于 Broker SUBACK。
+    virtual ReplaceSnapshotResult replaceSubscriptionSnapshot(
+        const SubscriptionSnapshot& snapshot) {
+        ReplaceSnapshotResult r;
+        r.status = SnapshotStatus::REJECTED;
+        r.reason_code = "not_supported";
+        return r;
+    }
+
+    // 查询指定 owner/generation 的接受状态，用于响应丢失后的幂等收敛。
+    virtual SnapshotStatusResult getSubscriptionSnapshotStatus(
+        const std::string& /*owner*/, uint64_t /*generation*/) {
+        return SnapshotStatusResult{};
+    }
 
     // 检查 TBOX-MQTT 连接状态
     virtual bool is_connected() const = 0;

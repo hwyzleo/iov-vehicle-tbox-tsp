@@ -31,6 +31,10 @@ public:
 
     // 配置 publish 返回结果
     MqttPublishResult publish_result{true, PublishOutcome::ACCEPTED};
+    // 配置 replaceSubscriptionSnapshot 返回结果 (CR-004)
+    ReplaceSnapshotResult snapshot_result;
+    // 连接状态（可由测试切换以模拟断/连, CR-004 §7）
+    mutable bool connected = true;
 
     bool initialize() override { return true; }
     bool start() override { return true; }
@@ -58,7 +62,34 @@ public:
         return true;
     }
 
-    bool is_connected() const override { return true; }
+    ReplaceSnapshotResult replaceSubscriptionSnapshot(
+            const SubscriptionSnapshot& snapshot) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        snapshot_calls_.push_back(snapshot);
+        ++snapshot_call_count_;
+        // 模拟真实 adapter：MQTT 未连接时结果未知 (CR-004 §11.3)
+        if (!connected) {
+            ReplaceSnapshotResult r;
+            r.status = SnapshotStatus::UNKNOWN;
+            r.reason_code = "mqtt_not_connected";
+            return r;
+        }
+        ReplaceSnapshotResult r = snapshot_result;
+        if (r.status == SnapshotStatus::ACCEPTED) {
+            r.accepted_generation = snapshot.generation;
+        }
+        return r;
+    }
+
+    SnapshotStatusResult getSubscriptionSnapshotStatus(
+            const std::string& /*owner*/, uint64_t generation) override {
+        SnapshotStatusResult r;
+        r.generation = generation;
+        r.status = snapshot_result.status;
+        return r;
+    }
+
+    bool is_connected() const override { return connected; }
 
     // 测试辅助：模拟收到下行消息
     void deliver_downlink(const std::string& topic, const std::vector<uint8_t>& payload) {
@@ -75,9 +106,21 @@ public:
         return publish_calls_;
     }
 
+    std::vector<SubscriptionSnapshot> snapshot_calls() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return snapshot_calls_;
+    }
+
+    uint64_t snapshot_call_count() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return snapshot_call_count_;
+    }
+
     mutable std::mutex mutex_;
     std::vector<PublishCall> publish_calls_;
     MessageCallback sub_callback_;
+    std::vector<SubscriptionSnapshot> snapshot_calls_;
+    uint64_t snapshot_call_count_ = 0;
 };
 
 // ============================================================

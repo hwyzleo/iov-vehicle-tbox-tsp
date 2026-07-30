@@ -52,5 +52,9 @@ tbox::fw::log::Logger LogAdapter::application() {
     return tbox::fw::log::Logger::get("application");
 }
 
+tbox::fw::log::Logger LogAdapter::subscription() {
+    return tbox::fw::log::Logger::get("subscription");
+}
+
 } // namespace tsp
 } // namespace tbox

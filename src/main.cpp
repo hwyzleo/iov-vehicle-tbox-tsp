@@ -15,6 +15,9 @@
 
 #include "mqtt_client_adapter.h"   // tbox::mqtt::Client 适配 (CR-003 §1)
 #include "fota_handler.h"          // FotaRelay 业务 (CR-003 §2)
+#include "subscription_catalog.h"   // 业务订阅目录 (CR-004 §11.1)
+#include "subscription_store.h"     // generation 持久化 (CR-004 §11.2)
+#include "subscription_registrar.h" // 订阅快照注册器 (CR-004 §11.3)
 #include "tsp_framework_server.h"  // framework-ipc Server 接线 (CR-003 §1)
 #include "tsp_ipc_protocol.h"      // DEFAULT_SOCKET_PATH
 #include "net_status_provider.h"
@@ -151,6 +154,23 @@ protected:
             LogAdapter::mqtt_client().error("tsp.mqtt.init_failed", "MQTT 客户端初始化失败");
             return false;
         }
+        mqtt_adapter_->set_device_identity(device_sn);
+
+        // CR-004 §6, §11.1: 加载业务订阅目录（SSOT）
+        catalog_ = std::make_shared<tbox::tsp::SubscriptionCatalog>();
+        std::string catalog_error;
+        if (!catalog_->load_from_yaml(getConfig()["tsp"]["subscriptions"], catalog_error)) {
+            LogAdapter::subscription().error(
+                "tsp.subscription.catalog.invalid",
+                "业务订阅目录加载失败: " + catalog_error);
+            return false;
+        }
+        // CR-004 §3.1, §11.2: generation 持久化
+        std::string store_root = snap->getString("tsp.store.root", "/var/lib/tbox");
+        subscription_store_ = std::make_shared<tbox::tsp::SubscriptionStore>(store_root);
+        // CR-004 §11.3: 订阅快照注册器
+        registrar_ = std::make_unique<tbox::tsp::MqttSubscriptionRegistrar>(
+            mqtt_adapter_, catalog_, subscription_store_);
 
         // 2. 构造 FotaRelay（业务中继）
         fota_handler_ = std::make_unique<tbox::tsp::FotaHandler>(mqtt_adapter_);
@@ -158,6 +178,7 @@ protected:
             LogAdapter::fota().error("tsp.fota.init_failed", "FOTA 处理器初始化失败");
             return false;
         }
+        fota_handler_->set_catalog(catalog_);
 
         // 3. 构造 framework-ipc Server（CR-003 §1, §3）
         net_status_provider_ = tbox::tsp::NetStatusProviderFactory::create(
@@ -180,9 +201,10 @@ protected:
     }
 
     void cleanup() override {
-        // stop 顺序：停 IPC（拒绝新上行）-> 停 FOTA -> 停 MQTT (CR-003 §3)
+        // stop 顺序：停 IPC -> 停 FOTA -> 停订阅注册器 -> 停 MQTT (CR-003 §3, CR-004 §7)
         if (framework_server_) framework_server_->stop();
         if (fota_handler_) fota_handler_->stop();
+        if (registrar_) registrar_->stop();
         if (mqtt_adapter_) mqtt_adapter_->stop();
     }
 
@@ -203,7 +225,17 @@ protected:
             return -1;
         }
 
-        // 启动 FOTA 业务（注册路由、订阅下行）
+        // CR-004 §6: 提交业务订阅快照（Mandatory 完成本地提交前不宣告云路由 ready）
+        if (!registrar_->start()) {
+            LogAdapter::subscription().error("tsp.subscription.start_failed", "订阅注册器启动失败");
+            return -1;
+        }
+        if (!registrar_->is_registration_ready()) {
+            LogAdapter::subscription().warn("tsp.subscription.not_ready",
+                "Mandatory 快照未完成本地提交");
+        }
+
+        // 启动 FOTA 业务（订阅下行）
         if (!fota_handler_->start()) {
             LogAdapter::fota().error("tsp.fota.start_failed", "FOTA 处理器启动失败");
             return -1;
@@ -221,6 +253,9 @@ protected:
 
 private:
     std::shared_ptr<tbox::tsp::MqttClientAdapter> mqtt_adapter_;
+    std::shared_ptr<tbox::tsp::SubscriptionCatalog> catalog_;
+    std::shared_ptr<tbox::tsp::SubscriptionStore> subscription_store_;
+    std::unique_ptr<tbox::tsp::MqttSubscriptionRegistrar> registrar_;
     std::unique_ptr<tbox::tsp::FotaHandler> fota_handler_;
     std::unique_ptr<tbox::tsp::TspFrameworkServer> framework_server_;
     std::unique_ptr<tbox::tsp::NetStatusProvider> net_status_provider_;

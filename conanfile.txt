@@ -1,6 +1,5 @@
 [requires]
 mosquitto/2.0.18
-spdlog/1.14.1
 
 [generators]
 CMakeDeps

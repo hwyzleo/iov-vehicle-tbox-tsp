@@ -61,6 +61,7 @@ tsp_add_test(TspEventPublisherTest
 tsp_add_test(FotaHandlerTest
     test_fota_handler.cpp
     ${PROJECT_SOURCE_DIR}/src/fota_handler.cpp
+    ${PROJECT_SOURCE_DIR}/src/subscription_catalog.cpp
     ${PROJECT_SOURCE_DIR}/src/tsp_event_publisher.cpp
     ${PROJECT_SOURCE_DIR}/src/tsp_error_codes.cpp
     ${PROJECT_SOURCE_DIR}/src/log_adapter.cpp)
@@ -84,6 +85,7 @@ target_link_libraries(TspClientServerTest PRIVATE tbox_tsp_client)
 tsp_add_test(TspIntegrationTest
     test_tsp_integration.cpp
     ${PROJECT_SOURCE_DIR}/src/fota_handler.cpp
+    ${PROJECT_SOURCE_DIR}/src/subscription_catalog.cpp
     ${PROJECT_SOURCE_DIR}/src/tsp_framework_server.cpp
     ${PROJECT_SOURCE_DIR}/src/tsp_ipc_dispatcher.cpp
     ${PROJECT_SOURCE_DIR}/src/tsp_event_publisher.cpp
@@ -97,4 +99,52 @@ target_link_libraries(TspIntegrationTest PRIVATE tbox_tsp_client)
 # ============================================================
 tsp_add_test(LogAdapterTest
     test_log_adapter.cpp
+    ${PROJECT_SOURCE_DIR}/src/log_adapter.cpp)
+
+# ============================================================
+# CR-004: 业务订阅快照单元测试
+# ============================================================
+# 8. SubscriptionCatalog 单元测试（目录校验）
+tsp_add_test(SubscriptionCatalogTest
+    test_subscription_catalog.cpp
+    ${PROJECT_SOURCE_DIR}/src/subscription_catalog.cpp
+    ${PROJECT_SOURCE_DIR}/src/log_adapter.cpp)
+
+# 9. SnapshotBuilder 单元测试（稳定排序/摘要/generation）
+tsp_add_test(SnapshotBuilderTest
+    test_snapshot_builder.cpp
+    ${PROJECT_SOURCE_DIR}/src/snapshot_builder.cpp)
+
+# 10. SubscriptionStore 单元测试（generation 持久化）
+tsp_add_test(SubscriptionStoreTest
+    test_subscription_store.cpp
+    ${PROJECT_SOURCE_DIR}/src/subscription_store.cpp
+    ${PROJECT_SOURCE_DIR}/src/log_adapter.cpp)
+
+# 11. RegistrationState 单元测试（状态机）
+tsp_add_test(RegistrationStateTest
+    test_registration_state.cpp
+    ${PROJECT_SOURCE_DIR}/src/registration_state.cpp)
+
+# 12. MqttSubscriptionRegistrar 单元测试（提交/幂等/断连恢复/原子替换）
+tsp_add_test(SubscriptionRegistrarTest
+    test_subscription_registrar.cpp
+    ${PROJECT_SOURCE_DIR}/src/subscription_registrar.cpp
+    ${PROJECT_SOURCE_DIR}/src/subscription_catalog.cpp
+    ${PROJECT_SOURCE_DIR}/src/snapshot_builder.cpp
+    ${PROJECT_SOURCE_DIR}/src/subscription_store.cpp
+    ${PROJECT_SOURCE_DIR}/src/registration_state.cpp
+    ${PROJECT_SOURCE_DIR}/src/log_adapter.cpp)
+
+# 13. 业务订阅快照端到端集成测试 (CR-004 §12)
+tsp_add_test(SubscriptionIntegrationTest
+    test_subscription_integration.cpp
+    ${PROJECT_SOURCE_DIR}/src/subscription_registrar.cpp
+    ${PROJECT_SOURCE_DIR}/src/subscription_catalog.cpp
+    ${PROJECT_SOURCE_DIR}/src/snapshot_builder.cpp
+    ${PROJECT_SOURCE_DIR}/src/subscription_store.cpp
+    ${PROJECT_SOURCE_DIR}/src/registration_state.cpp
+    ${PROJECT_SOURCE_DIR}/src/fota_handler.cpp
+    ${PROJECT_SOURCE_DIR}/src/tsp_event_publisher.cpp
+    ${PROJECT_SOURCE_DIR}/src/tsp_error_codes.cpp
     ${PROJECT_SOURCE_DIR}/src/log_adapter.cpp)

@@ -28,6 +28,22 @@ tsp:
   mqtt:
     socket_path: /tmp/tbox-mqtt.sock
 
+  # 业务订阅目录 (CR-004 §4, §11.1) -- TSP 业务 Topic 唯一事实来源
+  # MQTT 配置不得复制这些业务条目；Topic 保存模板，不固化设备实例值。
+  subscriptions:
+    - route_id: fota.uplink
+      topic_template: vehicle/{ecu_uid}/up/fota
+      direction: UP
+      qos: 1
+      target: tsp.fota
+      mandatory: false
+    - route_id: fota.downlink
+      topic_template: vehicle/{ecu_uid}/down/fota
+      direction: DOWN
+      qos: 1
+      target: tsp.fota
+      mandatory: true
+
 # SEC 配置（证书/密钥管理）
 sec:
   cert:

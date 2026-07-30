@@ -30,25 +30,22 @@ elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
     endif ()
 endif ()
 
-# 添加库文件目录
-link_directories(${LIB_DIR}/yaml-cpp)
+# 不再 link_directories(${LIB_DIR}/yaml-cpp)：
+# yaml-cpp 的符号已随 libtbox-framework 一起导出，头文件也随 framework 安装。
 
 # ============================================================
 # TBOX-Framework（提供 Application 基类、framework-log、framework-ipc）
 # ============================================================
-set(TBOX_FW_DIR "${PROJECT_SOURCE_DIR}/../iov-vehicle-tbox-framework" CACHE PATH "Path to TBOX-Framework project")
-
-find_library(TBOX_FRAMEWORK_LIB
-        NAMES tbox-framework
-        PATHS "${TBOX_FW_DIR}/build"
-        NO_DEFAULT_PATH)
-if(NOT TBOX_FRAMEWORK_LIB)
-    message(FATAL_ERROR "tbox-framework 库未找到，请先构建：cmake --build \"${TBOX_FW_DIR}/build\"")
+# 统一通过 find_package 消费：framework 自包含 yaml-cpp / spdlog，
+# 查找前缀来自 iov-vehicle-tbox-framework/scripts/tbox-env.sh 的 TBOX_PREFIX
+# （见 scripts/build.sh），切换本地/生产环境无需改动本文件。
+if(NOT TARGET TBoxFramework::tbox-framework)
+    find_package(TBoxFramework REQUIRED)
 endif()
-message(STATUS "Using tbox-framework: ${TBOX_FRAMEWORK_LIB}")
-
-set(FRAMEWORK_INCLUDE_DIR "${TBOX_FW_DIR}/include")
+set(TBOX_FRAMEWORK_LIB TBoxFramework::tbox-framework)
+set(FRAMEWORK_INCLUDE_DIR ${TBoxFramework_INCLUDE_DIRS})
 set(HAS_FRAMEWORK_LOG TRUE)
+message(STATUS "Using TBoxFramework headers: ${FRAMEWORK_INCLUDE_DIR}")
 
 # ============================================================
 # TBOX-MQTT 客户端库（CR-003 §1: TSP 对 MQTT 只使用 tbox::mqtt_client）
@@ -143,6 +140,11 @@ add_executable(tbox_tsp
         src/main.cpp
         src/fota_handler.cpp
         src/mqtt_client_adapter.cpp
+        src/subscription_catalog.cpp
+        src/snapshot_builder.cpp
+        src/subscription_store.cpp
+        src/registration_state.cpp
+        src/subscription_registrar.cpp
         src/tsp_ipc_dispatcher.cpp
         src/tsp_event_publisher.cpp
         src/tsp_framework_server.cpp
@@ -160,7 +162,6 @@ target_link_libraries(tbox_tsp PRIVATE ${TBOX_FRAMEWORK_LIB})
 target_link_libraries(tbox_tsp PRIVATE ${TBOX_MQTT_CLIENT_LIB})
 find_package(CURL REQUIRED)
 target_link_libraries(tbox_tsp PRIVATE ${CURL_LIBRARIES})
-target_link_libraries(tbox_tsp PRIVATE yaml-cpp)
 
 target_compile_definitions(tbox_tsp PRIVATE HAS_FRAMEWORK_LOG=1)
 
