@@ -45,9 +45,10 @@ public:
 
     bool is_connected() const override;
 
-    // ---- 业务订阅快照 (CR-004 §5, §11.5 迁移实现) ----
-    // 迁移期 MQTT 尚未提供批量原子接口，adapter 展开模板后逐条调用 registerRoute，
-    // 不宣称真正原子替换；真正原子契约由配套 MQTT DSN-CR 提供。
+    // ---- 业务订阅快照 (CR-007 §4) ----
+    // 将完整版本化快照转换为 tbox::mqtt::OwnerSubscriptionSnapshot，经
+    // client_->replaceSubscriptionSnapshot 原子提交给 MQTT daemon。
+    // Topic 模板 {ecu_uid} 由 MQTT 侧按 PROV 身份展开并驱动 Broker 订阅收敛。
     ReplaceSnapshotResult replaceSubscriptionSnapshot(
         const SubscriptionSnapshot& snapshot) override;
     SnapshotStatusResult getSubscriptionSnapshotStatus(
@@ -65,9 +66,6 @@ private:
     // 持有下行订阅句柄（RAII），析构自动取消
     ::tbox::fw::ipc::Subscription downlink_sub_;
     std::string device_identity_;
-    // 迁移期缓存最近一次快照与结果，用于 getSubscriptionSnapshotStatus 查询
-    SubscriptionSnapshot last_snapshot_;
-    ReplaceSnapshotResult last_result_;
     mutable std::mutex mutex_;
 };
 

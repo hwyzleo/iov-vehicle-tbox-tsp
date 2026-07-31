@@ -25,8 +25,6 @@ public:
     static tbox::fw::log::Logger relay();
 
     // 新增模块日志
-    static tbox::fw::log::Logger security();
-    static tbox::fw::log::Logger http_client();
     static tbox::fw::log::Logger ipc_server();
     static tbox::fw::log::Logger application();
     static tbox::fw::log::Logger subscription();  // CR-004: 业务订阅快照

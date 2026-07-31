@@ -65,12 +65,25 @@ set(TBOX_MQTT_INCLUDE_DIR "${TBOX_MQTT_DIR}/include")
 # TBOX-PROV 客户端库（用于获取设备序列号）
 # ============================================================
 set(TBOX_PROV_DIR "${PROJECT_SOURCE_DIR}/../iov-vehicle-tbox-prov" CACHE PATH "Path to TBOX-PROV project")
-if(EXISTS "${TBOX_PROV_DIR}/build/libProvClient.a")
-    message(STATUS "Found TBOX-PROV client library: ${TBOX_PROV_DIR}/build/libProvClient.a")
-    link_directories("${TBOX_PROV_DIR}/build")
+# CR-006: TSP 设备身份（ecu_uid）应从 TBOX-PROV 获取，本地 tsp.device-sn 仅作兜底。
+# PROV 构建产物：libtbox_prov_client.a（客户端 SDK）与 libTboxProvLib.a（提供 prov_client
+# 依赖的 ProvLogAdapter），命名与 MQTT 侧一致。
+find_library(TBOX_PROV_CLIENT_LIB
+        NAMES tbox_prov_client
+        PATHS "${TBOX_PROV_DIR}/build"
+        NO_DEFAULT_PATH)
+find_library(TBOX_PROV_DAEMON_LIB
+        NAMES TboxProvLib
+        PATHS "${TBOX_PROV_DIR}/build"
+        NO_DEFAULT_PATH)
+if(TBOX_PROV_CLIENT_LIB)
+    message(STATUS "Using tbox_prov_client: ${TBOX_PROV_CLIENT_LIB}")
     set(HAS_TBOX_PROV TRUE)
 else()
-    message(WARNING "TBOX-PROV client library not found. Device SN must be configured manually.")
+    message(WARNING "TBOX-PROV client library (tbox_prov_client) not found in "
+                    "${TBOX_PROV_DIR}/build. Build PROV first: "
+                    "cmake --build \"${TBOX_PROV_DIR}/build\". "
+                    "Falling back to configured tsp.device-sn.")
     set(HAS_TBOX_PROV FALSE)
 endif()
 
@@ -134,10 +147,10 @@ install(FILES
 )
 
 # ============================================================
-# Main daemon 可执行文件 (CR-003: framework-ipc Server + tbox::mqtt_client)
+# TBOX-TSP daemon 库（CR-005 §9.1: 供 daemon 可执行文件与 Application 单测共享）
+# 包含全部业务/传输源（不含 main 入口），以便 TspApplication 单测链接。
 # ============================================================
-add_executable(tbox_tsp
-        src/main.cpp
+set(TBOX_TSP_DAEMON_SOURCES
         src/fota_handler.cpp
         src/mqtt_client_adapter.cpp
         src/subscription_catalog.cpp
@@ -150,27 +163,45 @@ add_executable(tbox_tsp
         src/tsp_framework_server.cpp
         src/tsp_error_codes.cpp
         src/net_status_provider.cpp
-        src/security_manager.cpp
-        src/tsp_http_client.cpp
-        src/log_adapter.cpp)
+        src/log_adapter.cpp
+        src/tsp_relay_service.cpp        # CR-005 §3: 业务聚合
+        src/tsp_application.cpp)         # CR-005 §3: 进程级组合根
 
-target_include_directories(tbox_tsp PRIVATE ${PROJECT_SOURCE_DIR}/include)
-target_include_directories(tbox_tsp PRIVATE ${PROJECT_SOURCE_DIR}/third_party/include)
-target_include_directories(tbox_tsp PRIVATE ${FRAMEWORK_INCLUDE_DIR})
-target_include_directories(tbox_tsp PRIVATE ${TBOX_MQTT_INCLUDE_DIR})
-target_link_libraries(tbox_tsp PRIVATE ${TBOX_FRAMEWORK_LIB})
-target_link_libraries(tbox_tsp PRIVATE ${TBOX_MQTT_CLIENT_LIB})
-find_package(CURL REQUIRED)
-target_link_libraries(tbox_tsp PRIVATE ${CURL_LIBRARIES})
-
-target_compile_definitions(tbox_tsp PRIVATE HAS_FRAMEWORK_LOG=1)
+add_library(tbox_tsp_lib STATIC ${TBOX_TSP_DAEMON_SOURCES})
+target_include_directories(tbox_tsp_lib
+        PUBLIC ${PROJECT_SOURCE_DIR}/include
+               ${PROJECT_SOURCE_DIR}/third_party/include
+               ${FRAMEWORK_INCLUDE_DIR}
+               ${TBOX_MQTT_INCLUDE_DIR})
+target_link_libraries(tbox_tsp_lib
+        PUBLIC ${TBOX_FRAMEWORK_LIB}
+               ${TBOX_MQTT_CLIENT_LIB})
+target_compile_definitions(tbox_tsp_lib PUBLIC HAS_FRAMEWORK_LOG=1)
 
 # 链接 TBOX-PROV 客户端库
 if(HAS_TBOX_PROV)
-    target_link_libraries(tbox_tsp PRIVATE ProvClient)
-    target_compile_definitions(tbox_tsp PRIVATE HAS_TBOX_PROV=1)
-    target_include_directories(tbox_tsp PRIVATE "${TBOX_PROV_DIR}/include")
+    target_link_libraries(tbox_tsp_lib PUBLIC ${TBOX_PROV_CLIENT_LIB})
+    if(TBOX_PROV_DAEMON_LIB)
+        # prov_client 依赖 ProvLogAdapter（定义于 daemon lib），需一并链接
+        target_link_libraries(tbox_tsp_lib PUBLIC ${TBOX_PROV_DAEMON_LIB})
+    endif()
+    target_compile_definitions(tbox_tsp_lib PUBLIC HAS_TBOX_PROV=1)
+    target_include_directories(tbox_tsp_lib PUBLIC "${TBOX_PROV_DIR}/include")
 endif()
+
+# ============================================================
+# Main daemon 可执行文件 (CR-003 + CR-005: framework Application 生命周期)
+# CR-005 §9.1: 构建期切换 Application 生命周期。
+#   ON  -> TspApplication（hwyz::Application 编排）
+#   OFF -> 旧式手写生命周期（回滚验证用，验收后删除）
+# ============================================================
+option(TSP_USE_FRAMEWORK_APPLICATION "Use hwyz::Application lifecycle" ON)
+if(TSP_USE_FRAMEWORK_APPLICATION)
+    add_executable(tbox_tsp src/main.cpp)
+else()
+    add_executable(tbox_tsp src/main_legacy.cpp)
+endif()
+target_link_libraries(tbox_tsp PRIVATE tbox_tsp_lib)
 
 # ============================================================
 # 测试（可选）

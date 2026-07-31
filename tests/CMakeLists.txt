@@ -148,3 +148,12 @@ tsp_add_test(SubscriptionIntegrationTest
     ${PROJECT_SOURCE_DIR}/src/tsp_event_publisher.cpp
     ${PROJECT_SOURCE_DIR}/src/tsp_error_codes.cpp
     ${PROJECT_SOURCE_DIR}/src/log_adapter.cpp)
+
+# ============================================================
+# CR-005 §10.2: TspApplication 组合根单元测试
+# 链接 tbox_tsp_lib（含 TspApplication + TspRelayService + 全部业务/传输源），
+# 覆盖信号集合、initialize 各阶段成功/失败与逆序 rollback、execute 退出、cleanup 幂等。
+# ============================================================
+tsp_add_test(TspApplicationTest
+    test_tsp_application.cpp)
+target_link_libraries(TspApplicationTest PRIVATE tbox_tsp_lib)

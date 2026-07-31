@@ -1,11 +1,13 @@
 # TBOX 公共配置（所有服务共享）
 # 公共配置统一收敛到 common 命名空间（代码读取 common.log.* / common.ipc.*）
 common:
+  store:
+    root: "/var/tbox"
   # 日志配置（framework-config 校验 common.log 必须存在）
   log:
-    type: console
-    path: ./log.txt
-    level: INFO
+    level: "info"
+    max_size_mb: 10
+    max_files: 5
 
   # framework-ipc 公共配置 (CR-003 §8)
   ipc:

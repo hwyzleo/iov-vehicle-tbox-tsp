@@ -128,92 +128,76 @@ void MqttClientAdapter::set_device_identity(const std::string& ecu_uid) {
     device_identity_ = ecu_uid;
 }
 
+namespace {
+
+// TSP Direction -> wire SnapshotDirection（枚举语义一致，显式映射避免依赖数值巧合）
+::tbox::mqtt::SnapshotDirection to_wire_direction(Direction d) {
+    switch (d) {
+        case Direction::UP:            return ::tbox::mqtt::SnapshotDirection::UP;
+        case Direction::DOWN:          return ::tbox::mqtt::SnapshotDirection::DOWN;
+        case Direction::BIDIRECTIONAL: return ::tbox::mqtt::SnapshotDirection::BIDIRECTIONAL;
+    }
+    return ::tbox::mqtt::SnapshotDirection::UP;
+}
+
+// wire SnapshotAcceptStatus -> TSP SnapshotStatus
+SnapshotStatus from_wire_status(::tbox::mqtt::SnapshotAcceptStatus s) {
+    switch (s) {
+        case ::tbox::mqtt::SnapshotAcceptStatus::ACCEPTED: return SnapshotStatus::ACCEPTED;
+        case ::tbox::mqtt::SnapshotAcceptStatus::REJECTED: return SnapshotStatus::REJECTED;
+        case ::tbox::mqtt::SnapshotAcceptStatus::UNKNOWN:  return SnapshotStatus::UNKNOWN;
+    }
+    return SnapshotStatus::UNKNOWN;
+}
+
+} // anonymous namespace
+
 ReplaceSnapshotResult MqttClientAdapter::replaceSubscriptionSnapshot(
         const SubscriptionSnapshot& snapshot) {
-    ReplaceSnapshotResult result;
-
-    std::string ecu_uid;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        ecu_uid = device_identity_;
-    }
-    if (ecu_uid.empty()) {
-        result.status = SnapshotStatus::REJECTED;
-        result.reason_code = "device_identity_missing";
-        LogAdapter::mqtt_client().error(
-            "tsp.subscription.snapshot.rejected",
-            "订阅快照提交失败：设备身份缺失", {
-                {"generation",
-                 tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(snapshot.generation))},
-                {"reason_code",
-                 tbox::fw::log::FieldValue::makeString("device_identity_missing")}
-            });
-        return result;
-    }
-
-    // MQTT IPC 不可用时结果未知，使用相同 generation 查询/重试 (CR-004 §11.3)
-    if (!is_connected()) {
-        result.status = SnapshotStatus::UNKNOWN;
-        result.reason_code = "mqtt_not_connected";
-        return result;
-    }
-
-    // 迁移路径：逐条 registerRoute（CR-004 §11.5）。
-    // 注意：非真正原子替换，部分失败时已注册路由不回滚。
-    std::vector<std::string> rejected;
-    bool all_ok = true;
+    // CR-007 §4: 以完整版本化 owner 快照原子提交给 MQTT daemon
+    // （REPLACE_SUBSCRIPTION_SNAPSHOT）。Topic 保存 {ecu_uid} 模板，由 MQTT 侧按
+    // PROV 身份展开并驱动 Broker 订阅收敛；TSP 不再展开模板、不逐条 registerRoute。
+    // ACCEPTED 仅表示 daemon 接受本地投影，≠ Broker SUBACK / Cloud Ready。
+    // 传输失败由 client SDK 返回 UNKNOWN（同 generation 幂等重试，交由注册器调度）。
+    ::tbox::mqtt::OwnerSubscriptionSnapshot wire;
+    wire.owner = snapshot.owner;
+    wire.generation = snapshot.generation;
+    wire.content_digest = snapshot.content_digest;
+    wire.registration_complete = snapshot.registration_complete;
+    wire.items.reserve(snapshot.items.size());
     for (const auto& item : snapshot.items) {
-        std::string topic = expand_topic_template(item.topic_template, ecu_uid);
-        bool ok = false;
-        if (item.direction == Direction::UP) {
-            ok = registerRoute(item.route_id, topic, "up", item.qos);
-        } else if (item.direction == Direction::DOWN) {
-            ok = registerRoute(item.route_id, topic, "down", item.qos);
-        } else {  // BIDIRECTIONAL：注册 up + down 两条映射
-            bool up = registerRoute(item.route_id, topic, "up", item.qos);
-            bool down = registerRoute(item.route_id, topic, "down", item.qos);
-            ok = up && down;
-        }
-        if (!ok) {
-            rejected.push_back(item.route_id);
-            all_ok = false;
-        }
+        ::tbox::mqtt::SubscriptionItem wi;
+        wi.route_id = item.route_id;
+        wi.topic_template = item.topic_template;  // 原样传模板，MQTT 侧展开 {ecu_uid}
+        wi.direction = to_wire_direction(item.direction);
+        wi.qos = item.qos;
+        wi.target = item.target;
+        wi.mandatory = item.mandatory;
+        wire.items.push_back(std::move(wi));
     }
 
-    if (all_ok) {
-        result.status = SnapshotStatus::ACCEPTED;
-        result.accepted_generation = snapshot.generation;
-        std::lock_guard<std::mutex> lock(mutex_);
-        last_snapshot_ = snapshot;
-        last_result_ = result;
-    } else {
-        result.status = SnapshotStatus::REJECTED;
-        result.rejected_route_ids = std::move(rejected);
-        result.reason_code = "route_register_failed";
-        LogAdapter::route().warn(
-            "tsp.subscription.snapshot.partial_failed",
-            "迁移路径部分路由注册失败（非原子，已注册项不回滚）", {
-                {"generation",
-                 tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(snapshot.generation))},
-                {"rejected_count",
-                 tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(result.rejected_route_ids.size()))}
-            });
-    }
+    ::tbox::mqtt::ReplaceSnapshotResult wr =
+        client_->replaceSubscriptionSnapshot(wire);
+
+    ReplaceSnapshotResult result;
+    result.status = from_wire_status(wr.status);
+    result.accepted_generation = wr.accepted_generation;
+    result.rejected_route_ids = wr.rejected_route_ids;
+    result.reason_code = wr.reason_code;
+    // 结果日志由注册器（MqttSubscriptionRegistrar）统一记录，避免重复。
     return result;
 }
 
 SnapshotStatusResult MqttClientAdapter::getSubscriptionSnapshotStatus(
         const std::string& owner, uint64_t generation) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    // 响应丢失后的幂等收敛：直接向 MQTT daemon 查询该 owner/generation 的接受状态。
+    ::tbox::mqtt::SnapshotStatusResult wr =
+        client_->getSubscriptionSnapshotStatus(owner, generation);
     SnapshotStatusResult r;
-    r.generation = generation;
-    if (owner == last_snapshot_.owner && generation == last_snapshot_.generation) {
-        r.status = last_result_.status;
-        r.content_digest = last_snapshot_.content_digest;
-        r.registration_complete = last_snapshot_.registration_complete;
-    } else {
-        r.status = SnapshotStatus::UNKNOWN;
-    }
+    r.status = from_wire_status(wr.status);
+    r.generation = wr.generation;
+    r.content_digest = wr.content_digest;
+    r.registration_complete = wr.registration_complete;
     return r;
 }
 
