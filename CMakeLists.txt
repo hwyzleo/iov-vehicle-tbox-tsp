@@ -62,28 +62,39 @@ message(STATUS "Using tbox_mqtt_client: ${TBOX_MQTT_CLIENT_LIB}")
 set(TBOX_MQTT_INCLUDE_DIR "${TBOX_MQTT_DIR}/include")
 
 # ============================================================
-# TBOX-PROV 客户端库（用于获取设备序列号）
+# CR-006 构建开关：MQTT Route API 迁移
+# ============================================================
+# TSP_USE_MQTT_ROUTE_API=ON (默认, CR-006 §10.2): route 模式，TSP 不构造 prov_client、
+#   不缓存 ecu_uid、不拼装完整 Topic；上行 publishRoute，下行 subscribeRoutedDownlink。
+# OFF (deprecated): legacy 完整 Topic 路径，经 PROV readBinding 获取 ecu_uid。
+option(TSP_USE_MQTT_ROUTE_API "Use MQTT route-based API (CR-006); legacy full-topic path is deprecated" ON)
+
+# ============================================================
+# TBOX-PROV 客户端库（legacy 模式用于获取设备序列号；route 模式不依赖 PROV）
 # ============================================================
 set(TBOX_PROV_DIR "${PROJECT_SOURCE_DIR}/../iov-vehicle-tbox-prov" CACHE PATH "Path to TBOX-PROV project")
-# CR-006: TSP 设备身份（ecu_uid）应从 TBOX-PROV 获取，本地 tsp.device-sn 仅作兜底。
-# PROV 构建产物：libtbox_prov_client.a（客户端 SDK）与 libTboxProvLib.a（提供 prov_client
-# 依赖的 ProvLogAdapter），命名与 MQTT 侧一致。
-find_library(TBOX_PROV_CLIENT_LIB
-        NAMES tbox_prov_client
-        PATHS "${TBOX_PROV_DIR}/build"
-        NO_DEFAULT_PATH)
-find_library(TBOX_PROV_DAEMON_LIB
-        NAMES TboxProvLib
-        PATHS "${TBOX_PROV_DIR}/build"
-        NO_DEFAULT_PATH)
-if(TBOX_PROV_CLIENT_LIB)
-    message(STATUS "Using tbox_prov_client: ${TBOX_PROV_CLIENT_LIB}")
-    set(HAS_TBOX_PROV TRUE)
+if(NOT TSP_USE_MQTT_ROUTE_API)
+    # legacy 模式: 查找并链接 PROV 客户端库
+    find_library(TBOX_PROV_CLIENT_LIB
+            NAMES tbox_prov_client
+            PATHS "${TBOX_PROV_DIR}/build"
+            NO_DEFAULT_PATH)
+    find_library(TBOX_PROV_DAEMON_LIB
+            NAMES TboxProvLib
+            PATHS "${TBOX_PROV_DIR}/build"
+            NO_DEFAULT_PATH)
+    if(TBOX_PROV_CLIENT_LIB)
+        message(STATUS "Using tbox_prov_client: ${TBOX_PROV_CLIENT_LIB}")
+        set(HAS_TBOX_PROV TRUE)
+    else()
+        message(WARNING "TBOX-PROV client library (tbox_prov_client) not found in "
+                        "${TBOX_PROV_DIR}/build. Build PROV first: "
+                        "cmake --build \"${TBOX_PROV_DIR}/build\". "
+                        "Falling back to configured tsp.device-sn.")
+        set(HAS_TBOX_PROV FALSE)
+    endif()
 else()
-    message(WARNING "TBOX-PROV client library (tbox_prov_client) not found in "
-                    "${TBOX_PROV_DIR}/build. Build PROV first: "
-                    "cmake --build \"${TBOX_PROV_DIR}/build\". "
-                    "Falling back to configured tsp.device-sn.")
+    # route 模式: 不链接 PROV (CR-006 §8, §10.2)
     set(HAS_TBOX_PROV FALSE)
 endif()
 
@@ -153,6 +164,7 @@ install(FILES
 set(TBOX_TSP_DAEMON_SOURCES
         src/fota_handler.cpp
         src/mqtt_client_adapter.cpp
+        src/downlink_route_dispatcher.cpp
         src/subscription_catalog.cpp
         src/snapshot_builder.cpp
         src/subscription_store.cpp
@@ -177,6 +189,11 @@ target_link_libraries(tbox_tsp_lib
         PUBLIC ${TBOX_FRAMEWORK_LIB}
                ${TBOX_MQTT_CLIENT_LIB})
 target_compile_definitions(tbox_tsp_lib PUBLIC HAS_FRAMEWORK_LOG=1)
+if(TSP_USE_MQTT_ROUTE_API)
+    target_compile_definitions(tbox_tsp_lib PUBLIC TSP_USE_MQTT_ROUTE_API=1)
+else()
+    target_compile_definitions(tbox_tsp_lib PUBLIC TSP_USE_MQTT_ROUTE_API=0)
+endif()
 
 # 链接 TBOX-PROV 客户端库
 if(HAS_TBOX_PROV)
@@ -196,6 +213,12 @@ endif()
 #   OFF -> 旧式手写生命周期（回滚验证用，验收后删除）
 # ============================================================
 option(TSP_USE_FRAMEWORK_APPLICATION "Use hwyz::Application lifecycle" ON)
+# CR-006: main_legacy.cpp 不支持 route API（它是 deprecated legacy 入口）。
+if(NOT TSP_USE_FRAMEWORK_APPLICATION AND TSP_USE_MQTT_ROUTE_API)
+    message(FATAL_ERROR "main_legacy.cpp (TSP_USE_FRAMEWORK_APPLICATION=OFF) does not "
+                        "support TSP_USE_MQTT_ROUTE_API=ON; set TSP_USE_MQTT_ROUTE_API=OFF "
+                        "or TSP_USE_FRAMEWORK_APPLICATION=ON")
+endif()
 if(TSP_USE_FRAMEWORK_APPLICATION)
     add_executable(tbox_tsp src/main.cpp)
 else()

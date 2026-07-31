@@ -35,11 +35,15 @@ bool TspRelayService::initializeLocal(const std::string& device_sn,
             "tsp.relay.init_failed", "MqttFacade 未注入");
         return false;
     }
+#if !TSP_MQTT_ROUTE_API
+    // legacy 模式: device_sn 必填（Topic 拼装需要）。
+    // route 模式 (CR-006): 不缓存 UID，device_sn 可为空。
     if (device_sn.empty()) {
         LogAdapter::application().error(
             "tsp.relay.init_failed", "device_sn 为空");
         return false;
     }
+#endif
 
     // CR-004 §11.1: 加载业务订阅目录（SSOT）
     catalog_ = std::make_shared<SubscriptionCatalog>();

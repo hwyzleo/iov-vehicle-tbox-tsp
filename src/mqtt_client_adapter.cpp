@@ -32,7 +32,8 @@ bool MqttClientAdapter::start() {
 
 void MqttClientAdapter::stop() {
     LogAdapter::mqtt_client().info("tsp.mqtt.stopping", "MqttClientAdapter 停止");
-    // 取消下行订阅（RAII 析构）
+    // 取消下行订阅（RAII 析构）：route 模式 routed_sub_，legacy downlink_sub_
+    routed_sub_.cancel();
     downlink_sub_.cancel();
     started_ = false;
     if (client_) {
@@ -123,9 +124,52 @@ bool MqttClientAdapter::is_connected() const {
     return client_->getConnectionState() == ::tbox::mqtt::ConnectionState::CONNECTED;
 }
 
-void MqttClientAdapter::set_device_identity(const std::string& ecu_uid) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    device_identity_ = ecu_uid;
+MqttPublishResult MqttClientAdapter::publishRoute(const std::string& owner,
+                                                   const std::string& route_id,
+                                                   const std::string& msg_id,
+                                                   const std::vector<uint8_t>& payload,
+                                                   int qos,
+                                                   const std::string& content_type,
+                                                   const std::string& trace_id,
+                                                   const std::string& request_id) {
+    // CR-006 §5: 按 owner + route_id 发布，不传完整 Topic/UID。
+    // accepted 仅表示 MQTT daemon 接管，不等于 Broker PUBACK。
+    auto pr = client_->publishRoute(owner, route_id, msg_id, payload,
+        static_cast<::tbox::mqtt::QoS>(qos),
+        ::tbox::mqtt::Priority::NORMAL,
+        content_type, trace_id, request_id);
+
+    MqttPublishResult out;
+    out.accepted = pr.accepted;
+    out.outcome = (pr.outcome == ::tbox::mqtt::PublishOutcome::UNKNOWN)
+        ? PublishOutcome::UNKNOWN : PublishOutcome::ACCEPTED;
+    return out;
+}
+
+bool MqttClientAdapter::subscribeRoutedDownlink(const std::string& owner,
+                                                 RoutedDownlinkCallback callback) {
+    // CR-006 §6: 仅建立 IPC 事件通道，不触发 Broker SUBSCRIBE。
+    LogAdapter::mqtt_client().info("tsp.mqtt.subscribe_routed", "订阅 routed downlink", {
+        {"owner", tbox::fw::log::FieldValue::makeString(owner)}
+    });
+
+    // 包装回调：tbox::mqtt::RoutedDownlinkEvent -> tbox::tsp::RoutedDownlinkEvent
+    ::tbox::mqtt::RoutedDownlinkCallback wrapped =
+        [cb = std::move(callback)](const ::tbox::mqtt::RoutedDownlinkEvent& ev) {
+            if (!cb) return;
+            RoutedDownlinkEvent out;
+            out.owner = ev.owner;
+            out.route_id = ev.route_id;
+            out.target = ev.target;
+            out.qos = ev.qos;
+            out.payload = ev.payload;
+            out.request_id = ev.request_id;
+            out.trace_id = ev.trace_id;
+            cb(out);
+        };
+
+    routed_sub_ = client_->subscribeRoutedDownlink(owner, wrapped);
+    return routed_sub_.isActive();
 }
 
 namespace {

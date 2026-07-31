@@ -29,8 +29,21 @@ public:
         std::string request_id;
     };
 
+    struct PublishRouteCall {
+        std::string owner;
+        std::string route_id;
+        std::string msg_id;
+        std::vector<uint8_t> payload;
+        int qos = 0;
+        std::string content_type;
+        std::string trace_id;
+        std::string request_id;
+    };
+
     // 配置 publish 返回结果
     MqttPublishResult publish_result{true, PublishOutcome::ACCEPTED};
+    // 配置 publishRoute 返回结果 (CR-006)
+    MqttPublishResult publish_route_result{true, PublishOutcome::ACCEPTED};
     // 配置 replaceSubscriptionSnapshot 返回结果 (CR-004)
     ReplaceSnapshotResult snapshot_result;
     // 连接状态（可由测试切换以模拟断/连, CR-004 §7）
@@ -56,9 +69,32 @@ public:
         return publish_result;
     }
 
+    // CR-006 §5: route-based 上行发布
+    MqttPublishResult publishRoute(const std::string& owner,
+                                   const std::string& route_id,
+                                   const std::string& msg_id,
+                                   const std::vector<uint8_t>& payload,
+                                   int qos,
+                                   const std::string& content_type = "application/x-protobuf",
+                                   const std::string& trace_id = "",
+                                   const std::string& request_id = "") override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        publish_route_calls_.push_back({owner, route_id, msg_id, payload, qos, content_type, trace_id, request_id});
+        return publish_route_result;
+    }
+
     bool subscribe(const std::string& topic, int /*qos*/, MessageCallback callback) override {
         std::lock_guard<std::mutex> lock(mutex_);
         sub_callback_ = std::move(callback);
+        return true;
+    }
+
+    // CR-006 §6: route-based 下行订阅
+    bool subscribeRoutedDownlink(const std::string& owner,
+                                 RoutedDownlinkCallback callback) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        routed_owner_ = owner;
+        routed_callback_ = std::move(callback);
         return true;
     }
 
@@ -91,7 +127,7 @@ public:
 
     bool is_connected() const override { return connected; }
 
-    // 测试辅助：模拟收到下行消息
+    // 测试辅助：模拟收到下行消息（legacy full-topic）
     void deliver_downlink(const std::string& topic, const std::vector<uint8_t>& payload) {
         MessageCallback cb;
         {
@@ -101,9 +137,24 @@ public:
         if (cb) cb(topic, payload);
     }
 
+    // 测试辅助：模拟收到 routed downlink 事件 (CR-006 §6)
+    void deliver_routed_downlink(const RoutedDownlinkEvent& event) {
+        RoutedDownlinkCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            cb = routed_callback_;
+        }
+        if (cb) cb(event);
+    }
+
     std::vector<PublishCall> publish_calls() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return publish_calls_;
+    }
+
+    std::vector<PublishRouteCall> publish_route_calls() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return publish_route_calls_;
     }
 
     std::vector<SubscriptionSnapshot> snapshot_calls() const {
@@ -118,7 +169,10 @@ public:
 
     mutable std::mutex mutex_;
     std::vector<PublishCall> publish_calls_;
+    std::vector<PublishRouteCall> publish_route_calls_;
     MessageCallback sub_callback_;
+    std::string routed_owner_;
+    RoutedDownlinkCallback routed_callback_;
     std::vector<SubscriptionSnapshot> snapshot_calls_;
     uint64_t snapshot_call_count_ = 0;
 };

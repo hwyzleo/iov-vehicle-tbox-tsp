@@ -149,8 +149,6 @@ protected:
             LogAdapter::mqtt_client().error("tsp.mqtt.init_failed", "MQTT 客户端初始化失败");
             return false;
         }
-        mqtt_adapter_->set_device_identity(device_sn);
-
         // CR-004 §6, §11.1: 加载业务订阅目录（SSOT）
         catalog_ = std::make_shared<tbox::tsp::SubscriptionCatalog>();
         std::string catalog_error;

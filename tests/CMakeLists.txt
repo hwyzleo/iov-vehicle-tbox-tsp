@@ -26,6 +26,11 @@ function(tsp_add_test name)
     add_executable(${name} ${ARGN})
     target_include_directories(${name} PRIVATE ${TEST_COMMON_INCLUDES})
     target_compile_definitions(${name} PRIVATE ${TEST_COMPILE_DEFS})
+    if(TSP_USE_MQTT_ROUTE_API)
+        target_compile_definitions(${name} PRIVATE TSP_USE_MQTT_ROUTE_API=1)
+    else()
+        target_compile_definitions(${name} PRIVATE TSP_USE_MQTT_ROUTE_API=0)
+    endif()
     target_link_libraries(${name} PRIVATE ${TEST_COMMON_LIBS})
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
@@ -61,9 +66,18 @@ tsp_add_test(TspEventPublisherTest
 tsp_add_test(FotaHandlerTest
     test_fota_handler.cpp
     ${PROJECT_SOURCE_DIR}/src/fota_handler.cpp
+    ${PROJECT_SOURCE_DIR}/src/downlink_route_dispatcher.cpp
     ${PROJECT_SOURCE_DIR}/src/subscription_catalog.cpp
     ${PROJECT_SOURCE_DIR}/src/tsp_event_publisher.cpp
     ${PROJECT_SOURCE_DIR}/src/tsp_error_codes.cpp
+    ${PROJECT_SOURCE_DIR}/src/log_adapter.cpp)
+
+# ============================================================
+# 4b. DownlinkRouteDispatcher 单元测试 (CR-006 §6.2)
+# ============================================================
+tsp_add_test(DownlinkRouteDispatcherTest
+    test_downlink_route_dispatcher.cpp
+    ${PROJECT_SOURCE_DIR}/src/downlink_route_dispatcher.cpp
     ${PROJECT_SOURCE_DIR}/src/log_adapter.cpp)
 
 # ============================================================
@@ -81,10 +95,13 @@ target_link_libraries(TspClientServerTest PRIVATE tbox_tsp_client)
 
 # ============================================================
 # 6. 端到端集成测试（client -> server -> FotaRelay -> mock mqtt / 反向）
+#    legacy full-topic 路径；route 模式由 TspApplicationTest 覆盖 (CR-006)
 # ============================================================
+if(NOT TSP_USE_MQTT_ROUTE_API)
 tsp_add_test(TspIntegrationTest
     test_tsp_integration.cpp
     ${PROJECT_SOURCE_DIR}/src/fota_handler.cpp
+    ${PROJECT_SOURCE_DIR}/src/downlink_route_dispatcher.cpp
     ${PROJECT_SOURCE_DIR}/src/subscription_catalog.cpp
     ${PROJECT_SOURCE_DIR}/src/tsp_framework_server.cpp
     ${PROJECT_SOURCE_DIR}/src/tsp_ipc_dispatcher.cpp
@@ -93,6 +110,7 @@ tsp_add_test(TspIntegrationTest
     ${PROJECT_SOURCE_DIR}/src/net_status_provider.cpp
     ${PROJECT_SOURCE_DIR}/src/log_adapter.cpp)
 target_link_libraries(TspIntegrationTest PRIVATE tbox_tsp_client)
+endif()
 
 # ============================================================
 # 7. LogAdapter 单元测试（保留）
@@ -137,6 +155,8 @@ tsp_add_test(SubscriptionRegistrarTest
     ${PROJECT_SOURCE_DIR}/src/log_adapter.cpp)
 
 # 13. 业务订阅快照端到端集成测试 (CR-004 §12)
+#     legacy full-topic 路径；route 模式由 TspApplicationTest 覆盖 (CR-006)
+if(NOT TSP_USE_MQTT_ROUTE_API)
 tsp_add_test(SubscriptionIntegrationTest
     test_subscription_integration.cpp
     ${PROJECT_SOURCE_DIR}/src/subscription_registrar.cpp
@@ -145,9 +165,11 @@ tsp_add_test(SubscriptionIntegrationTest
     ${PROJECT_SOURCE_DIR}/src/subscription_store.cpp
     ${PROJECT_SOURCE_DIR}/src/registration_state.cpp
     ${PROJECT_SOURCE_DIR}/src/fota_handler.cpp
+    ${PROJECT_SOURCE_DIR}/src/downlink_route_dispatcher.cpp
     ${PROJECT_SOURCE_DIR}/src/tsp_event_publisher.cpp
     ${PROJECT_SOURCE_DIR}/src/tsp_error_codes.cpp
     ${PROJECT_SOURCE_DIR}/src/log_adapter.cpp)
+endif()
 
 # ============================================================
 # CR-005 §10.2: TspApplication 组合根单元测试

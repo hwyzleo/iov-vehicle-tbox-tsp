@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 #include "tsp_application.h"
 #include "tsp_relay_service.h"
+#include "tsp_build_config.h"
 #include "mocks.h"
 #include "application.h"
 #include "config.h"
@@ -173,8 +174,9 @@ TEST_F(TspApplicationTest, CleanupIsIdempotent) {
     EXPECT_FALSE(std::filesystem::exists(cf.socket_path));
 }
 
+#if !TSP_MQTT_ROUTE_API
 TEST_F(TspApplicationTest, InitializeDeviceSnMissingReturnsFalse) {
-    // 无 device-sn（且无 PROV/全局 SN）-> initialize 在 MqttClientReady 前失败
+    // legacy: 无 device-sn（且无 PROV/全局 SN）-> initialize 在 MqttClientReady 前失败
     auto cf = makeConfig("no_device");
     cleanup_paths_.push_back(cf.dir);
     TestableTspApplication app;
@@ -184,6 +186,19 @@ TEST_F(TspApplicationTest, InitializeDeviceSnMissingReturnsFalse) {
     EXPECT_NO_THROW(app.doCleanup());
     EXPECT_FALSE(std::filesystem::exists(cf.socket_path));
 }
+#else
+TEST_F(TspApplicationTest, InitializeSuccessWithoutDeviceSn) {
+    // route 模式 (CR-006): 不构造 prov_client、不要求 device_sn，
+    //   即使无 device-sn 也能完成本地初始化（MQTT/快照 DEGRADED 不阻塞）。
+    auto cf = makeConfig("no_device");
+    cleanup_paths_.push_back(cf.dir);
+    TestableTspApplication app;
+    ASSERT_TRUE(app.doLoadConfig(cf.dir));
+    EXPECT_TRUE(app.doInitialize());
+    EXPECT_NO_THROW(app.doCleanup());
+    EXPECT_FALSE(std::filesystem::exists(cf.socket_path));
+}
+#endif
 
 // ============================================================
 // TspRelayService::initializeLocal 失败回滚（CR-005 §3 业务聚合独立可测）
@@ -206,6 +221,7 @@ TEST(TspRelayServiceTest, InitializeLocalRejectsDuplicateRouteId) {
                                        "/tmp/tsp_relay_test_store", catalog));
 }
 
+#if !TSP_MQTT_ROUTE_API
 TEST(TspRelayServiceTest, InitializeLocalRejectsEmptyDeviceSn) {
     auto mqtt = std::make_shared<tbox::tsp::test::MockMqttFacade>();
     TspRelayService relay(mqtt);
@@ -215,6 +231,18 @@ TEST(TspRelayServiceTest, InitializeLocalRejectsEmptyDeviceSn) {
         "  direction: UP\n  qos: 1\n  target: tsp.fota\n  mandatory: false\n");
     EXPECT_FALSE(relay.initializeLocal("", "/tmp/tsp_relay_test_store", catalog));
 }
+#else
+TEST(TspRelayServiceTest, InitializeLocalAcceptsEmptyDeviceSn) {
+    // route 模式 (CR-006): 不缓存 UID，device_sn 可为空
+    auto mqtt = std::make_shared<tbox::tsp::test::MockMqttFacade>();
+    TspRelayService relay(mqtt);
+    YAML::Node catalog = YAML::Load(
+        "- route_id: fota.uplink\n"
+        "  topic_template: vehicle/{ecu_uid}/up/fota\n"
+        "  direction: UP\n  qos: 1\n  target: tsp.fota\n  mandatory: false\n");
+    EXPECT_TRUE(relay.initializeLocal("", "/tmp/tsp_relay_test_store", catalog));
+}
+#endif
 
 TEST_F(TspApplicationTest, InitializeIpcBindFailureRollsBack) {
     // socket 路径位于 /dev/null 之下，bind 必然失败（ENOTDIR）；

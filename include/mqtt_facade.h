@@ -7,6 +7,7 @@
 #include <cstdint>
 #include "tbox/tsp/types.h"
 #include "subscription_types.h"
+#include "tsp_build_config.h"
 
 namespace tbox {
 namespace tsp {
@@ -20,6 +21,23 @@ struct MqttPublishResult {
     bool accepted = false;                          // MQTT daemon 已接管
     PublishOutcome outcome = PublishOutcome::ACCEPTED;
 };
+
+// Routed downlink 事件 (CR-006 §6.1)
+// MQTT daemon 将 Broker 下行完整 Topic 映射为 owner/route_id/target 事件，
+// TSP 按稳定业务路由分发，不解析完整 Topic。完整 Topic 默认不进入本契约。
+struct RoutedDownlinkEvent {
+    std::string owner;            // 订阅 owner，如 "tsp"
+    std::string route_id;         // owner 内稳定路由标识，如 "fota.downlink"
+    std::string target;           // 目标处理器，如 "tsp.fota"
+    uint8_t qos = 0;              // 0/1/2
+    std::vector<uint8_t> payload; // 业务二进制 payload
+    std::string request_id;       // 关联标识
+    std::string trace_id;         // 可选关联标识
+};
+
+// Routed downlink 业务回调 (CR-006 §6.1)
+using RoutedDownlinkCallback =
+    std::function<void(const RoutedDownlinkEvent&)>;
 
 // MQTT Facade -- 对 TBOX-MQTT 服务的客户端接口
 // SPEC §5.1 / CR-003: TSP 对 MQTT 只使用 tbox::mqtt_client 的
@@ -56,9 +74,33 @@ public:
                                       const std::string& request_id = "") = 0;
 
     // 订阅下行消息（SPEC §5.1）
+    // @deprecated CR-006 §10.2: route 模式改用 subscribeRoutedDownlink。
     virtual bool subscribe(const std::string& topic,
                            int qos,
                            MessageCallback callback) = 0;
+
+    // ---- Route-based 发布与下行 (CR-006 §5, §6) ----
+    // 上行：按 owner + route_id 发布，不传完整 Topic/UID (CR-006 §5)。
+    // accepted 仅表示 MQTT daemon 接管，不等于 Broker PUBACK；outcome=UNKNOWN
+    // 表示响应丢失，需用相同 msg_id 查询/重试。
+    virtual MqttPublishResult publishRoute(const std::string& /*owner*/,
+                                           const std::string& /*route_id*/,
+                                           const std::string& /*msg_id*/,
+                                           const std::vector<uint8_t>& /*payload*/,
+                                           int /*qos*/,
+                                           const std::string& /*content_type*/ = "application/x-protobuf",
+                                           const std::string& /*trace_id*/ = "",
+                                           const std::string& /*request_id*/ = "") {
+        return MqttPublishResult{};
+    }
+
+    // 下行：订阅 routed downlink 事件，仅建立 IPC 事件通道，不触发 Broker SUBSCRIBE
+    // (CR-006 §6)。Broker 订阅由 replaceSubscriptionSnapshot 的 route 投影驱动。
+    // 返回 bool；句柄由实现内部持有（RAII），stop/析构时取消。
+    virtual bool subscribeRoutedDownlink(const std::string& /*owner*/,
+                                         RoutedDownlinkCallback /*callback*/) {
+        return false;
+    }
 
     // ---- 业务订阅快照 (CR-004 §5, §11) ----
     // TSP 以完整、版本化快照向 MQTT 提交当前订阅集合。

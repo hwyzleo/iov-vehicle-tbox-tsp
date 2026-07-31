@@ -12,6 +12,7 @@ const char* error_code_to_string(TspErrorCode code) {
         case TspErrorCode::ROUTE_REGISTER_FAILED: return "TBOX-TSP-1004: 路由注册失败";
         case TspErrorCode::SUBSCRIPTION_INVALID:         return "TBOX-TSP-1005: 业务订阅目录/快照无效";
         case TspErrorCode::SUBSCRIPTION_REGISTER_FAILED: return "TBOX-TSP-1006: 订阅快照注册失败";
+        case TspErrorCode::ROUTE_API_INCOMPATIBLE:       return "TBOX-TSP-1007: MQTT route能力不兼容/route未实例化/route调用失败";
         case TspErrorCode::INVALID_PARAMETER:     return "INVALID_PARAMETER";
         case TspErrorCode::FRAME_TOO_LARGE:       return "FRAME_TOO_LARGE";
         case TspErrorCode::NOT_INITIALIZED:       return "NOT_INITIALIZED";

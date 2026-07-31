@@ -1,13 +1,16 @@
 // TBOX-TSP-DSN-CR-005 §3, §12.1: TspApplication 实现。
 //
 // 组合根装配顺序（CR-005 §4, §12.2）：
-//   Config snapshot -> device_sn -> mqtt_client(init+start) ->
+//   Config snapshot -> mqtt_client(init+start) ->
 //   TspRelayService(initializeLocal) -> NetStatusProvider ->
 //   TspFrameworkServer(construct) -> relay.set_event_publisher ->
 //   relay.startMqttIntegration -> framework_server.start
+// route 模式 (CR-006): 不获取 device_sn/不构造 prov_client；
+// legacy 模式: Config snapshot -> device_sn(PROV/配置) -> mqtt_client。
 // 清理顺序（§7.1, §12.4）：见头文件不变量注释。
 
 #include "tsp_application.h"
+#include "tsp_build_config.h"
 
 #include "tsp_relay_service.h"
 #include "mqtt_client_adapter.h"
@@ -22,8 +25,10 @@
 
 #include <chrono>
 
+#if !TSP_MQTT_ROUTE_API
 #ifdef HAS_TBOX_PROV
 #include "prov_client.h"
+#endif
 #endif
 
 namespace tbox {
@@ -90,8 +95,12 @@ bool TspApplication::initialize() {
     YAML::Node catalog_node =
         hwyz::config::ConfigManager::instance().toYaml()["tsp"]["subscriptions"];
 
-    // ---- 获取设备序列号（device_sn）----
+    // ---- device_sn ----
+    // route 模式 (CR-006): 不构造 prov_client、不缓存 ecu_uid、不拼装完整 Topic，
+    //   device_sn 留空，TspRelayService/FotaHandler 在 route 模式忽略它。
+    // legacy 模式 (deprecated): 从 PROV/配置获取 device_sn 用于 Topic 拼装。
     std::string device_sn;
+#if !TSP_MQTT_ROUTE_API
 #ifdef HAS_TBOX_PROV
     try {
         tbox::prov::ProvClient prov_client("/tmp/tbox-prov.sock");
@@ -132,6 +141,7 @@ bool TspApplication::initialize() {
             "tsp.device_sn.missing", "device_sn 未配置");
         return false;
     }
+#endif  // !TSP_MQTT_ROUTE_API
 
     // ---- a. mqtt_client（CR-003 §1: TSP 对 MQTT 只使用 tbox::mqtt_client）----
     mqtt_client_ = std::make_shared<MqttClientAdapter>(mqtt_socket_path);
@@ -141,7 +151,6 @@ bool TspApplication::initialize() {
         mqtt_client_.reset();
         return false;
     }
-    mqtt_client_->set_device_identity(device_sn);
     // transport 启动（当前实现仅置位，不阻塞；MQTT 不可用由注册器 DEGRADED 处理）
     if (!mqtt_client_->start()) {
         LogAdapter::mqtt_client().error(

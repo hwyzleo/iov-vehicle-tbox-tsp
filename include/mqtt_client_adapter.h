@@ -43,6 +43,19 @@ public:
                    int qos,
                    MessageCallback callback) override;
 
+    // ---- Route-based 发布与下行 (CR-006 §5, §6) ----
+    MqttPublishResult publishRoute(const std::string& owner,
+                                   const std::string& route_id,
+                                   const std::string& msg_id,
+                                   const std::vector<uint8_t>& payload,
+                                   int qos,
+                                   const std::string& content_type = "application/x-protobuf",
+                                   const std::string& trace_id = "",
+                                   const std::string& request_id = "") override;
+
+    bool subscribeRoutedDownlink(const std::string& owner,
+                                 RoutedDownlinkCallback callback) override;
+
     bool is_connected() const override;
 
     // ---- 业务订阅快照 (CR-007 §4) ----
@@ -54,9 +67,6 @@ public:
     SnapshotStatusResult getSubscriptionSnapshotStatus(
         const std::string& owner, uint64_t generation) override;
 
-    // 设置当前设备身份（ecu_uid），用于 Topic 模板展开 (CR-004 §4)
-    void set_device_identity(const std::string& ecu_uid);
-
 private:
     std::string socket_path_;
     std::unique_ptr<::tbox::mqtt::Client> client_;
@@ -64,8 +74,9 @@ private:
     bool started_ = false;
 
     // 持有下行订阅句柄（RAII），析构自动取消
+    // legacy: downlink_sub_ (full-topic subscribe)；route: routed_sub_ (CR-006 §6)
     ::tbox::fw::ipc::Subscription downlink_sub_;
-    std::string device_identity_;
+    ::tbox::mqtt::RoutedSubscription routed_sub_;
     mutable std::mutex mutex_;
 };
 

@@ -129,12 +129,15 @@ TEST(SubscriptionCatalogTest, ShadowValidateAndReplace) {
     EXPECT_EQ(cat.items().size(), 1u);
 }
 
+#if !TSP_MQTT_ROUTE_API
+// expand_topic_template 仅 legacy 模式可用 (CR-006: route 模式 TSP 不展开模板)
 TEST(SubscriptionCatalogTest, ExpandTopicTemplate) {
     EXPECT_EQ(expand_topic_template("vehicle/{ecu_uid}/up/fota", "ECU123"),
               "vehicle/ECU123/up/fota");
     // 无占位符原样返回
     EXPECT_EQ(expand_topic_template("static/topic", "ECU123"), "static/topic");
 }
+#endif
 
 int main(int argc, char** argv) {
     testing::InitGoogleTest(&argc, argv);
