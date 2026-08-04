@@ -203,9 +203,18 @@ configure_project() {
     mkdir -p "$BUILD_DIR"
     cd "$BUILD_DIR"
 
+    # CR-007: 依赖经 SDK staging / 安装前缀消费（framework、MQTT SDK 装入 TBOX_PREFIX），
+    # nlohmann_json 等直接 TARGET 依赖由系统/Homebrew 提供（BUILD 由 TBOX_DEP_STAGING 注入）。
+    CMAKE_PREFIX_PATH="${TBOX_PREFIX}"
+    HOMEBREW_PREFIX="$(command -v brew >/dev/null 2>&1 && brew --prefix 2>/dev/null || true)"
+    if [ -n "${HOMEBREW_PREFIX}" ]; then
+        CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH};${HOMEBREW_PREFIX}"
+    fi
+
     cmake .. \
         -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
         -DTBoxFramework_DIR="${TBoxFramework_DIR}" \
+        -DCMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH}" \
         -DBUILD_TESTS=$([ "$RUN_TESTS" = true ] && echo "ON" || echo "OFF")
 
     if [ $? -ne 0 ]; then

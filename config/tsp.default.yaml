@@ -1,0 +1,49 @@
+# TBOX-TSP 默认非秘密配置（安装到 /etc/tbox/conf.d/tsp.yaml）
+#
+# TBOX-TSP-DSN-CR-007 §11: 只包含未展开 Topic 模板、route_id、QoS、target 与
+# 非秘密默认值；不含 VIN/SN/ECU UID 实例值、完整设备 Topic、Token/证书/私钥、
+# 凭据或生产业务数据。device-sn 由 TBOX-PROV/全局状态提供（route 模式不读取）。
+
+common:
+  store:
+    root: "/var/tbox"
+  log:
+    level: "info"
+    file:
+      enabled: true
+      root: "/var/log/tbox"
+      max_file_size_mb: 10
+      max_files: 5
+
+tsp:
+  # FOTA 业务配置
+  fota:
+    dedup-window-ms: 60000      # 去重窗口
+    throttle-interval-ms: 5000  # 节流间隔
+
+  # framework-ipc 配置 (CR-003 §8)
+  ipc:
+    socket_path: /tmp/tbox-tsp.sock
+    downlink_queue_size: 256     # 下行有界队列
+    subscriber_queue_size: 64    # 订阅者积压上限
+    slow_subscriber_policy: disconnect  # disconnect / drop / reject
+
+  # MQTT daemon IPC socket (CR-003 §1: TSP 使用 tbox::mqtt_client)
+  mqtt:
+    socket_path: /tmp/tbox-mqtt.sock
+
+  # 业务订阅目录 (CR-004 §4, §11.1) -- TSP 业务 Topic 唯一事实来源
+  # MQTT 配置不得复制这些业务条目；Topic 保存模板，不固化设备实例值。
+  subscriptions:
+    - route_id: fota.uplink
+      topic_template: vehicle/{ecu_uid}/up/fota
+      direction: UP
+      qos: 1
+      target: tsp.fota
+      mandatory: false
+    - route_id: fota.downlink
+      topic_template: vehicle/{ecu_uid}/down/fota
+      direction: DOWN
+      qos: 1
+      target: tsp.fota
+      mandatory: true

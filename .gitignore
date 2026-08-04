@@ -39,3 +39,5 @@ build/
 docs/superpowers/
 .superpowers/
 third_party/
+# 构建产物
+build-consumer/

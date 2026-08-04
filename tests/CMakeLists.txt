@@ -8,16 +8,16 @@ if(NOT GTEST_INCLUDE_DIRS OR NOT EXISTS "${GTEST_INCLUDE_DIRS}/gtest/gtest.h")
     link_directories(/Users/hwyz_leo/miniconda3/lib)
 endif()
 
+# CR-007: framework 组件 target 传递公共头（config/log/ipc/store/application）与
+# yaml-cpp（framework-config PUBLIC）；nlohmann_json 为 TSP 直接 TARGET 依赖。
 set(TEST_COMMON_INCLUDES
     ${PROJECT_SOURCE_DIR}/include
-    ${PROJECT_SOURCE_DIR}/third_party/include
-    ${FRAMEWORK_INCLUDE_DIR}
     ${GTEST_INCLUDE_DIRS}
 )
 set(TEST_COMMON_LIBS
-    ${TBOX_FRAMEWORK_LIB}
+    ${TSP_FRAMEWORK_LIBS}
+    nlohmann_json::nlohmann_json
     gtest gtest_main
-    yaml-cpp
 )
 set(TEST_COMPILE_DEFS HAS_FRAMEWORK_LOG=1)
 

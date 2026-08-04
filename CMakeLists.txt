@@ -1,65 +1,20 @@
-cmake_minimum_required(VERSION 3.10)
-project(tbox_tsp)
+# TBOX-TSP-DSN-CR-007: 接入 TBOX-BUILD 统一 Orin aarch64 构建。
+#   - 不设置 CMAKE_C_COMPILER / CMAKE_CXX_COMPILER / CMAKE_SYSROOT（由 BUILD
+#     toolchain/preset 注入）
+#   - framework / MQTT 通过已安装 package 消费（find_package CONFIG），
+#     禁止 add_subdirectory、源码私有头文件、build-tree library 或绝对库路径
+#   - GNUInstallDirs + 两个显式 install component: tsp-sdk / tsp-runtime
+#   - 无硬编码 RPATH / 宿主路径 / build-tree library
 
-# 设置macOS最低版本
-if(APPLE)
-    set(CMAKE_OSX_DEPLOYMENT_TARGET "15.2" CACHE STRING "Minimum OS X deployment version")
-endif()
+cmake_minimum_required(VERSION 3.16)
+project(tbox_tsp VERSION 1.0.0 LANGUAGES CXX)
 
-# 设置C++标准
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-add_definitions("-Wall -g")
 
 include(GNUInstallDirs)
-
-# 根据不同的环境设置不同的库文件目录
-if (CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
-    if (APPLE)
-        set(LIB_DIR ${PROJECT_SOURCE_DIR}/third_party/lib/arm64-apple-darwin)
-    elseif (UNIX AND NOT APPLE)
-        set(LIB_DIR ${PROJECT_SOURCE_DIR}/third_party/lib/aarch64-linux-gnu)
-    endif ()
-elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
-    if (APPLE)
-        set(LIB_DIR ${PROJECT_SOURCE_DIR}/third_party/lib/x86_64-apple-darwin)
-    elseif (UNIX AND NOT APPLE)
-        set(LIB_DIR ${PROJECT_SOURCE_DIR}/third_party/lib/x86_64-linux-gnu)
-    endif ()
-endif ()
-
-# 不再 link_directories(${LIB_DIR}/yaml-cpp)：
-# yaml-cpp 的符号已随 libtbox-framework 一起导出，头文件也随 framework 安装。
-
-# ============================================================
-# TBOX-Framework（提供 Application 基类、framework-log、framework-ipc）
-# ============================================================
-# 统一通过 find_package 消费：framework 自包含 yaml-cpp / spdlog，
-# 查找前缀来自 iov-vehicle-tbox-framework/scripts/tbox-env.sh 的 TBOX_PREFIX
-# （见 scripts/build.sh），切换本地/生产环境无需改动本文件。
-if(NOT TARGET TBoxFramework::tbox-framework)
-    find_package(TBoxFramework REQUIRED)
-endif()
-set(TBOX_FRAMEWORK_LIB TBoxFramework::tbox-framework)
-set(FRAMEWORK_INCLUDE_DIR ${TBoxFramework_INCLUDE_DIRS})
-set(HAS_FRAMEWORK_LOG TRUE)
-message(STATUS "Using TBoxFramework headers: ${FRAMEWORK_INCLUDE_DIR}")
-
-# ============================================================
-# TBOX-MQTT 客户端库（CR-003 §1: TSP 对 MQTT 只使用 tbox::mqtt_client）
-# ============================================================
-set(TBOX_MQTT_DIR "${PROJECT_SOURCE_DIR}/../iov-vehicle-tbox-mqtt" CACHE PATH "Path to TBOX-MQTT project")
-find_library(TBOX_MQTT_CLIENT_LIB
-        NAMES tbox_mqtt_client
-        PATHS "${TBOX_MQTT_DIR}/build"
-        NO_DEFAULT_PATH)
-if(NOT TBOX_MQTT_CLIENT_LIB)
-    message(FATAL_ERROR "tbox_mqtt_client 库未找到，请先构建：cmake --build \"${TBOX_MQTT_DIR}/build\"")
-endif()
-message(STATUS "Using tbox_mqtt_client: ${TBOX_MQTT_CLIENT_LIB}")
-set(TBOX_MQTT_INCLUDE_DIR "${TBOX_MQTT_DIR}/include")
+include(CMakePackageConfigHelpers)
 
 # ============================================================
 # CR-006 构建开关：MQTT Route API 迁移
@@ -70,32 +25,41 @@ set(TBOX_MQTT_INCLUDE_DIR "${TBOX_MQTT_DIR}/include")
 option(TSP_USE_MQTT_ROUTE_API "Use MQTT route-based API (CR-006); legacy full-topic path is deprecated" ON)
 
 # ============================================================
-# TBOX-PROV 客户端库（legacy 模式用于获取设备序列号；route 模式不依赖 PROV）
+# 依赖（BUILD: 受控 staging/sysroot 注入；HOST: tbox-env.sh + CMAKE_PREFIX_PATH）
 # ============================================================
-set(TBOX_PROV_DIR "${PROJECT_SOURCE_DIR}/../iov-vehicle-tbox-prov" CACHE PATH "Path to TBOX-PROV project")
+
+# --- TBox Framework（CR-007 §6.2: find_package CONFIG + 组件 target 消费） ---
+# TSP 使用 framework-config / -log / -ipc / -store / -application 组件；
+# yaml-cpp / spdlog 由 framework 组件传递（framework-config PUBLIC yaml-cpp）。
+if(NOT TARGET TBoxFramework::config)
+    find_package(TboxFramework CONFIG REQUIRED)
+endif()
+set(TSP_FRAMEWORK_LIBS
+    TBoxFramework::config
+    TBoxFramework::log
+    TBoxFramework::ipc
+    TBoxFramework::store
+    TBoxFramework::hash
+    TBoxFramework::application
+)
+
+# --- TBox MQTT client SDK（CR-003 §1 / CR-007 §6.2: 只通过 tbox::mqtt_client） ---
+if(NOT TARGET tbox::mqtt_client)
+    find_package(TboxMqttClient CONFIG REQUIRED)
+endif()
+
+# --- nlohmann_json（TSP 源码直接使用；CR-007 §7: 直接 TARGET dependency） ---
+find_package(nlohmann_json REQUIRED)
+
+# --- TBox PROV client SDK（仅 legacy 模式用于设备序列号；route 模式不链接） ---
+# CR-007 §6.2: 目标态不为 Topic 构造 tbox::prov_client；PROV/SEC 只由 MQTT
+# 构建闭包带入。legacy 分支为 deprecated 回滚验证入口，HOST 开发使用。
+set(HAS_TBOX_PROV FALSE)
 if(NOT TSP_USE_MQTT_ROUTE_API)
-    # legacy 模式: 查找并链接 PROV 客户端库
-    find_library(TBOX_PROV_CLIENT_LIB
-            NAMES tbox_prov_client
-            PATHS "${TBOX_PROV_DIR}/build"
-            NO_DEFAULT_PATH)
-    find_library(TBOX_PROV_DAEMON_LIB
-            NAMES TboxProvLib
-            PATHS "${TBOX_PROV_DIR}/build"
-            NO_DEFAULT_PATH)
-    if(TBOX_PROV_CLIENT_LIB)
-        message(STATUS "Using tbox_prov_client: ${TBOX_PROV_CLIENT_LIB}")
-        set(HAS_TBOX_PROV TRUE)
-    else()
-        message(WARNING "TBOX-PROV client library (tbox_prov_client) not found in "
-                        "${TBOX_PROV_DIR}/build. Build PROV first: "
-                        "cmake --build \"${TBOX_PROV_DIR}/build\". "
-                        "Falling back to configured tsp.device-sn.")
-        set(HAS_TBOX_PROV FALSE)
+    if(NOT TARGET tbox::prov_client)
+        find_package(TboxProvClient CONFIG REQUIRED)
     endif()
-else()
-    # route 模式: 不链接 PROV (CR-006 §8, §10.2)
-    set(HAS_TBOX_PROV FALSE)
+    set(HAS_TBOX_PROV TRUE)
 endif()
 
 # ============================================================
@@ -110,56 +74,26 @@ set(TSP_CLIENT_SOURCES
 
 add_library(tbox_tsp_client STATIC ${TSP_CLIENT_SOURCES})
 add_library(tbox::tsp_client ALIAS tbox_tsp_client)
+set_target_properties(tbox_tsp_client PROPERTIES EXPORT_NAME tsp_client)
 
-# PUBLIC: 业务 facade/DTO 头文件（framework-ipc 头由调用方提供，与 SEC/MQTT SDK 一致）
+# PUBLIC: 业务 facade/DTO 头文件（framework-ipc 头由消费方经 TboxTspClientConfig
+# find_dependency(TboxFramework) 解析，与 SEC/MQTT SDK 一致）
 target_include_directories(tbox_tsp_client
     PUBLIC
         $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
-# PRIVATE: framework-ipc 链接与内部头
+# PRIVATE: framework 组件与 nlohmann_json（client.h 公开头引用 framework-ipc
+# Subscription RAII 句柄；静态库 PRIVATE 依赖由 Config find_dependency 声明）
 target_link_libraries(tbox_tsp_client
-    PRIVATE ${TBOX_FRAMEWORK_LIB}
-)
-target_include_directories(tbox_tsp_client PRIVATE
-    ${FRAMEWORK_INCLUDE_DIR}
-    ${PROJECT_SOURCE_DIR}/third_party/include
-)
-
-# 安装公共 SDK 头文件
-install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/tbox/tsp/
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/tbox/tsp
-    FILES_MATCHING PATTERN "*.h"
-)
-
-# 安装 client 库
-install(TARGETS tbox_tsp_client
-    EXPORT TboxTspClientTargets
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-)
-
-# 导出 CMake config
-install(EXPORT TboxTspClientTargets
-    FILE TboxTspClientTargets.cmake
-    NAMESPACE tbox::
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/TboxTspClient
-)
-
-include(CMakePackageConfigHelpers)
-configure_package_config_file(
-    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/TboxTspClientConfig.cmake.in"
-    "${CMAKE_CURRENT_BINARY_DIR}/TboxTspClientConfig.cmake"
-    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/TboxTspClient
-)
-install(FILES
-    "${CMAKE_CURRENT_BINARY_DIR}/TboxTspClientConfig.cmake"
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/TboxTspClient
+    PRIVATE
+        ${TSP_FRAMEWORK_LIBS}
+        nlohmann_json::nlohmann_json
 )
 
 # ============================================================
-# TBOX-TSP daemon 库（CR-005 §9.1: 供 daemon 可执行文件与 Application 单测共享）
-# 包含全部业务/传输源（不含 main 入口），以便 TspApplication 单测链接。
+# TBOX-TSP daemon 库（CR-005 §9.1 / CR-007 §6.3: 供 daemon 可执行文件与
+# Application 单测共享；包含全部业务/传输源，不含 main 入口）
 # ============================================================
 set(TBOX_TSP_DAEMON_SOURCES
         src/fota_handler.cpp
@@ -181,29 +115,20 @@ set(TBOX_TSP_DAEMON_SOURCES
 
 add_library(tbox_tsp_lib STATIC ${TBOX_TSP_DAEMON_SOURCES})
 target_include_directories(tbox_tsp_lib
-        PUBLIC ${PROJECT_SOURCE_DIR}/include
-               ${PROJECT_SOURCE_DIR}/third_party/include
-               ${FRAMEWORK_INCLUDE_DIR}
-               ${TBOX_MQTT_INCLUDE_DIR})
+        PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(tbox_tsp_lib
-        PUBLIC ${TBOX_FRAMEWORK_LIB}
-               ${TBOX_MQTT_CLIENT_LIB})
+        PUBLIC ${TSP_FRAMEWORK_LIBS}
+               tbox::mqtt_client
+               nlohmann_json::nlohmann_json)
 target_compile_definitions(tbox_tsp_lib PUBLIC HAS_FRAMEWORK_LOG=1)
 if(TSP_USE_MQTT_ROUTE_API)
     target_compile_definitions(tbox_tsp_lib PUBLIC TSP_USE_MQTT_ROUTE_API=1)
 else()
     target_compile_definitions(tbox_tsp_lib PUBLIC TSP_USE_MQTT_ROUTE_API=0)
-endif()
-
-# 链接 TBOX-PROV 客户端库
-if(HAS_TBOX_PROV)
-    target_link_libraries(tbox_tsp_lib PUBLIC ${TBOX_PROV_CLIENT_LIB})
-    if(TBOX_PROV_DAEMON_LIB)
-        # prov_client 依赖 ProvLogAdapter（定义于 daemon lib），需一并链接
-        target_link_libraries(tbox_tsp_lib PUBLIC ${TBOX_PROV_DAEMON_LIB})
+    if(HAS_TBOX_PROV)
+        target_link_libraries(tbox_tsp_lib PUBLIC tbox::prov_client)
+        target_compile_definitions(tbox_tsp_lib PUBLIC HAS_TBOX_PROV=1)
     endif()
-    target_compile_definitions(tbox_tsp_lib PUBLIC HAS_TBOX_PROV=1)
-    target_include_directories(tbox_tsp_lib PUBLIC "${TBOX_PROV_DIR}/include")
 endif()
 
 # ============================================================
@@ -227,7 +152,75 @@ endif()
 target_link_libraries(tbox_tsp PRIVATE tbox_tsp_lib)
 
 # ============================================================
-# 测试（可选）
+# Install rules — 两个显式 component (CR-007 §9)
+#
+#   tsp-sdk     -> staging: sdk      (公开头文件 / 静态库 / CMake package)
+#   tsp-runtime -> staging: rootfs   (daemon / systemd unit / 默认非秘密配置)
+# ============================================================
+
+# --- tsp-runtime: daemon binary ---
+install(TARGETS tbox_tsp
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    COMPONENT tsp-runtime
+)
+
+# --- tsp-runtime: systemd unit ---
+install(FILES packaging/systemd/tbox-tsp.service
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/systemd/system
+    COMPONENT tsp-runtime
+)
+
+# --- tsp-runtime: default config（生产安全：无 VIN/SN/ECU UID 实例值、
+#      完整设备 Topic、凭据或生产业务数据；只含未展开模板/route_id/QoS/target） ---
+install(FILES config/tsp.default.yaml
+    DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}/tbox/conf.d
+    RENAME tsp.yaml
+    COMPONENT tsp-runtime
+)
+
+# --- tsp-sdk: public headers ---
+install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/tbox/tsp/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/tbox/tsp
+    COMPONENT tsp-sdk
+    FILES_MATCHING PATTERN "*.h"
+)
+
+# --- tsp-sdk: client static library + export ---
+install(TARGETS tbox_tsp_client
+    EXPORT TboxTspClientTargets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    COMPONENT tsp-sdk
+)
+
+install(EXPORT TboxTspClientTargets
+    FILE TboxTspClientTargets.cmake
+    NAMESPACE tbox::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/TboxTspClient
+    COMPONENT tsp-sdk
+)
+
+# --- tsp-sdk: CMake package config（可重定位）+ version ---
+configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/TboxTspClientConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/TboxTspClientConfig.cmake"
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/TboxTspClient
+)
+
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/TboxTspClientConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
+
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/TboxTspClientConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/TboxTspClientConfigVersion.cmake"
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/TboxTspClient
+    COMPONENT tsp-sdk
+)
+
+# ============================================================
+# 测试（可选；HOST/隔离 test profile 使用，不进入量产 package）
 # ============================================================
 option(BUILD_TESTS "Build tests" OFF)
 if (BUILD_TESTS)

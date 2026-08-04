@@ -1,6 +1,5 @@
-[requires]
-mosquitto/2.0.18
-
-[generators]
-CMakeDeps
-CMakeToolchain
+# TSP 无直接 conan 依赖：
+#   - framework / MQTT 经已安装 SDK package 消费（find_package CONFIG）
+#   - nlohmann_json 由系统/Homebrew 或 BUILD TBOX_DEP_STAGING 提供
+#   - 历史遗留的 mosquitto 直接依赖已移除（CR-003 §1: TSP 只通过 tbox::mqtt_client
+#     消费 MQTT，不直接链接 mosquitto）

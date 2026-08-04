@@ -1,0 +1,28 @@
+[Unit]
+Description=TBOX TSP Service
+Documentation=https://app.notion.com/TBOX-TSP-SPEC
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/tbox_tsp
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+# 不启用 PrivateTmp（代码事实，TBOX-TSP-DSN-CR-007 §8/§12）：
+#   TSP 创建 /tmp/tbox-tsp.sock 供 TBOX-SOMEIP 等消费方连接，
+#   并作为 client 连接 /tmp/tbox-mqtt.sock（MQTT daemon 创建的 IPC socket）。
+#   PrivateTmp 会为单元挂载私有 /tmp，隔离这些跨进程 socket 的可见性。
+ReadWritePaths=/var/tbox /var/lib/tbox /var/log/tbox /tmp
+
+# Resource limits
+LimitNOFILE=1024
+
+[Install]
+WantedBy=multi-user.target
