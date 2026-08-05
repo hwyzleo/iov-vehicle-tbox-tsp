@@ -1,6 +1,5 @@
 [Unit]
 Description=TBOX TSP Service
-Documentation=https://app.notion.com/TBOX-TSP-SPEC
 After=network.target
 Wants=network.target
 
