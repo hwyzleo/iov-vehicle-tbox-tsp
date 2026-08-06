@@ -179,3 +179,10 @@ endif()
 tsp_add_test(TspApplicationTest
     test_tsp_application.cpp)
 target_link_libraries(TspApplicationTest PRIVATE tbox_tsp_lib)
+
+# ============================================================
+# CR-008: TSP 配置 schema/profile 校验测试
+# 纯 bash+python3 脚本，无 gtest 依赖；python3/PyYAML 缺失时 SKIP(exit 0)。
+# ============================================================
+add_test(NAME ConfigSchemaTest
+    COMMAND bash ${CMAKE_SOURCE_DIR}/tests/config/test_config_schema.sh)

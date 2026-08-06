@@ -170,8 +170,10 @@ install(FILES packaging/systemd/tbox-tsp.service
     COMPONENT tsp-runtime
 )
 
-# --- tsp-runtime: default config（生产安全：无 VIN/SN/ECU UID 实例值、
-#      完整设备 Topic、凭据或生产业务数据；只含未展开模板/route_id/QoS/target） ---
+# --- tsp-runtime: default config（TBOX-TSP-DSN-CR-008 §15.2: 生产安全默认模板）
+#      只含未展开模板/route_id/QoS/target；无 VIN/SN/ECU UID 实例值、完整设备 Topic、
+#      凭据或生产业务数据。config/dev/**、config/schema/**、config/README.md
+#      不由 tsp-runtime 安装，不进入 rootfs；正式 common 由 BUILD 唯一提供。 ---
 install(FILES config/tsp.default.yaml
     DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}/tbox/conf.d
     RENAME tsp.yaml

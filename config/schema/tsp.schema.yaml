@@ -1,0 +1,116 @@
+# =============================================================================
+# TBOX-TSP-DSN-CR-008 §15.6: TSP 配置声明式 schema
+# =============================================================================
+# 描述 /etc/tbox/conf.d/tsp.yaml 的合法字段结构、类型、范围、必填性、
+# 允许值与禁止字段。由 tools/tsp-config-check.py 加载并驱动校验。
+#
+# 本文件不由 tsp-runtime 安装到 rootfs；供 BUILD metadata 引用与 BUILD
+# staging 阶段校验使用。target 为逻辑安装路径。
+# =============================================================================
+
+schema_version: 1
+target: /etc/tbox/conf.d/tsp.yaml
+
+# --- 顶层允许的键（conf.d/tsp.yaml 文件本身） ---
+# common 在结构上允许（./tsp.yaml 开发覆盖可含 common 覆盖）；
+# production profile 下禁止（见 production_forbidden_top_level），因为正式
+# conf.d/tsp.yaml 不得内联顶层 common:（TSP-CONFIG-REQ-004 / §15.4）。
+top_level_allowed:
+  - tsp
+  - common
+
+# --- production profile 下禁止的顶层键 ---
+# common 由 BUILD configs/orin/rootfs/etc/tbox/common.yaml 唯一提供；
+# 正式 conf.d/tsp.yaml 不得内联顶层 common:（REQ-004 / §15.4）。
+# test profile 允许 common（./tsp.yaml 开发覆盖可设置 common.store.root 等）。
+production_forbidden_top_level:
+  - common
+
+# --- production profile 下禁止的字段（点分路径） ---
+# device-sn 为身份实例值，route 模式不读取；生产禁止（REQ-007 / §15.6）。
+# test profile 允许（config/dev/tsp.yaml legacy 开发使用）。
+production_forbidden_fields:
+  - tsp.device-sn
+
+# --- 字段结构（递归） ---
+# 每个 field 可声明: type, required, min, max, enum, path_safe
+# type: string | integer | number | boolean | map | string_list | map_list
+fields:
+  tsp:
+    type: map
+    fields:
+      # device-sn: legacy 模式读取（tsp_application.cpp / main_legacy.cpp）；
+      # route 模式不读取。production profile 禁止（身份实例值，见
+      # production_forbidden_fields）；test profile 允许（config/dev/tsp.yaml）。
+      device-sn:
+        type: string
+      ipc:
+        type: map
+        fields:
+          socket_path:
+            type: string
+            # /tmp/tbox-tsp.sock 为 framework-ipc 基线（§15.5）；
+            # path_safe 拒绝 .. / 个人目录 / build tree，允许 /tmp/tbox-*.sock
+            path_safe: true
+          downlink_queue_size: {type: integer, min: 1}
+          slow_subscriber_policy:
+            type: string
+            enum: [disconnect, drop, reject]
+      mqtt:
+        type: map
+        fields:
+          socket_path:
+            type: string
+            path_safe: true
+      subscriptions:
+        type: map_list
+        fields:
+          route_id:
+            type: string
+            required: true
+          topic_template:
+            type: string
+            required: true
+            # 仅允许 {ecu_uid} 模板变量；禁止 {device_sn} 与身份实例值
+            template_var: ecu_uid
+          direction:
+            type: string
+            required: true
+            enum: [UP, DOWN]
+          qos:
+            type: integer
+            min: 0
+            max: 2
+          target:
+            type: string
+            required: true
+          mandatory:
+            type: boolean
+
+# --- 禁止字段（任何 profile 下出现即失败） ---
+# secret / credential / identity-cache / Store runtime 状态 / test 资产
+# （REQ-007 / §15.6）
+forbidden_fields:
+  - tsp.broker_host
+  - tsp.broker_port
+  - tsp.username
+  - tsp.password
+  - tsp.token
+  - tsp.cert_path
+  - tsp.key_path
+  - tsp.private_key
+  - tsp.root_ca
+  - tsp.ca_cert
+  - tsp.client_key
+  - tsp.vin
+  - tsp.sn
+  - tsp.ecu_uid
+  - tsp.identity
+  - tsp.mock
+  - tsp.fixture
+  - tsp.bypass
+  # Store runtime 状态不得进入配置（§15.6）
+  - tsp.store.generation
+  - tsp.store.digest
+  - tsp.store.dedup
+  - tsp.store.receipt

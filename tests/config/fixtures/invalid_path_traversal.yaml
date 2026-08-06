@@ -1,0 +1,15 @@
+# Invalid: path traversal in socket_path (profile fail)
+tsp:
+  ipc:
+    socket_path: "../../etc/passwd"
+    downlink_queue_size: 256
+    slow_subscriber_policy: disconnect
+  mqtt:
+    socket_path: /tmp/tbox-mqtt.sock
+  subscriptions:
+    - route_id: fota.uplink
+      topic_template: vehicle/{ecu_uid}/up/fota
+      direction: UP
+      qos: 1
+      target: tsp.fota
+      mandatory: false

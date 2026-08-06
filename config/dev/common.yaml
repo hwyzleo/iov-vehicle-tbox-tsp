@@ -1,0 +1,59 @@
+# =============================================================================
+# DEVELOPMENT-ONLY - 仅供本地调试/单元/集成测试显式引用
+# =============================================================================
+# TBOX-TSP-DSN-CR-008 §15.1 / §15.4: config/dev/** 不由 tsp-runtime 安装，
+# 不进入 BUILD staging 或正式包，也不被 framework-config 作为正式 common 来源。
+#
+# 正式 /etc/tbox/common.yaml 由 BUILD configs/orin/rootfs/etc/tbox/common.yaml
+# 唯一提供；本文件仅在显式以 config_root=config/dev/ 启动或本地调试时生效。
+#
+# 允许清单（allowlist）约束（TSP-CONFIG-REQ-001 / §15.6）：
+#   - 不得包含生产 CA/client key、私钥、Token、用户名/密码、TLS secret、
+#     private_key_ref、HSM handle；
+#   - 不得包含 VIN/SN/ECU UID 实例、完整生产 Topic 或生产 Broker credential；
+#   - 测试值必须为明确占位值并受 allowlist 管理。
+# =============================================================================
+
+# TBOX Common Configuration (framework-config layer 0: common.yaml)
+# 公共配置统一收敛到 common 命名空间下，与代码读取的 common.* 键一致。
+# framework-config requires a 'common.log' map (validated).
+
+common:
+  # Framework-store root path (Design §5)
+  # Each service opens its store via Store::open("tsp", store.root)
+  store:
+    root: "/var/tbox"
+
+  # Framework-IPC common config (CR-003 §8: TSP 读取 common.ipc.*)
+  # production 由 BUILD common.yaml 提供；本地开发由此文件提供。
+  ipc:
+    max_frame_bytes: 10485760       # 单帧上限 10 MiB
+    receive_timeout_ms: 60000
+    connect_timeout_ms: 3000
+    listen_backlog: 5
+    reconnect:
+      initial_backoff_ms: 100
+      max_backoff_ms: 5000
+      multiplier: 2.0
+
+  # Logging (required by framework-config validator: common.log)
+  # CR-008 §15.4: 对齐 framework-log schema（Application::buildLogConfig 读取）
+  log:
+    level: "info"                       # 默认日志级别（trace/debug/info/warn/error）
+    strict: false                       # strict=true 时初始化失败 fail-closed；false 降级
+    format: "standard"
+    console:
+      enabled: true
+    file:
+      enabled: false                    # 生产部署改 true 并指向 /var/log/tbox
+      root: "/var/log/tbox"
+      max_file_size_mb: 10
+      max_files: 5
+      total_budget_mb: 50
+    async:
+      enabled: true
+      queue_size: 4096
+      flush_interval_ms: 1000
+    redact:
+      identifiers: "mask"
+      raw_payload_max_bytes: 256

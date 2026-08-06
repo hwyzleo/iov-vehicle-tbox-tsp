@@ -31,7 +31,7 @@
 using tbox::tsp::LogAdapter;
 
 #ifdef HAS_TBOX_PROV
-#include "prov_client.h"
+#include "tbox/prov/client.h"
 #endif
 
 #include <csignal>
@@ -43,9 +43,11 @@ protected:
         return "tsp";
     }
 
-    // 配置根目录优先级：./config/ 优先于 /etc/tbox/
+    // 配置根目录优先级：./config/dev/ 优先于 /etc/tbox/
+    // CR-008: 调试配置已迁移至 config/dev/（旧 config/common.yaml、
+    // config/tsp.yaml 已删除）；本 legacy 入口仅为回滚验证用，验收后删除。
     std::vector<std::string> getConfigRoots() const override {
-        return {"./config/", "/etc/tbox/"};
+        return {"./config/dev/", "/etc/tbox/"};
     }
 
     bool initialize() override {

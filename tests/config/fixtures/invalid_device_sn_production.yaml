@@ -1,0 +1,16 @@
+# Invalid (production): device-sn identity instance forbidden in production
+tsp:
+  device-sn: "TBOX_PROD_001"
+  ipc:
+    socket_path: /tmp/tbox-tsp.sock
+    downlink_queue_size: 256
+    slow_subscriber_policy: disconnect
+  mqtt:
+    socket_path: /tmp/tbox-mqtt.sock
+  subscriptions:
+    - route_id: fota.uplink
+      topic_template: vehicle/{ecu_uid}/up/fota
+      direction: UP
+      qos: 1
+      target: tsp.fota
+      mandatory: false

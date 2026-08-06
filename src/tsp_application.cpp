@@ -27,7 +27,7 @@
 
 #if !TSP_MQTT_ROUTE_API
 #ifdef HAS_TBOX_PROV
-#include "prov_client.h"
+#include "tbox/prov/client.h"
 #endif
 #endif
 
