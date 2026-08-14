@@ -1,7 +1,7 @@
-// TBOX-TSP IPC 请求分发适配器实现 (CR-003 §2)
+// TBOX-TSP IPC 请求分发适配器实现 (CR-003 §2; CR-009 §Client 与 IPC 契约)
 
 #include "tsp_ipc_dispatcher.h"
-#include "fota_relay_interface.h"
+#include "vehicle_message_gateway.h"
 #include "net_status_provider.h"
 #include "tsp_ipc_protocol.h"
 #include "tbox/tsp/errors.h"
@@ -27,18 +27,43 @@ std::string make_json_response(int32_t status, const nlohmann::json& payload) {
     return j.dump();
 }
 
-std::vector<uint8_t> b64_decode(const std::string& encoded) {
-    std::string decoded = ::hwyz::Utils::base64_decode(encoded);
-    return std::vector<uint8_t>(decoded.begin(), decoded.end());
+std::string b64_encode_bytes(const std::vector<std::byte>& data) {
+    std::string raw;
+    raw.reserve(data.size());
+    for (auto b : data) {
+        raw.push_back(static_cast<char>(static_cast<uint8_t>(b)));
+    }
+    return ::hwyz::Utils::base64_encode(raw);
 }
 
-const char* outcome_str(PublishOutcome o) {
-    return (o == PublishOutcome::UNKNOWN) ? "UNKNOWN" : "ACCEPTED";
+std::vector<std::byte> b64_decode_bytes(const std::string& encoded) {
+    std::string decoded = ::hwyz::Utils::base64_decode(encoded);
+    std::vector<std::byte> out(decoded.size());
+    for (size_t i = 0; i < decoded.size(); ++i) {
+        out[i] = static_cast<std::byte>(static_cast<uint8_t>(decoded[i]));
+    }
+    return out;
+}
+
+// TransportOutcome -> TBOX-TSP-10xx/2xxx 业务状态码（SPEC §7, CR-009 §错误与重试）
+int32_t tsp_error_for_outcome(TransportOutcome o) {
+    switch (o) {
+        case TransportOutcome::Accepted:        return static_cast<int32_t>(TspErrorCode::SUCCESS);
+        case TransportOutcome::Rejected:        return static_cast<int32_t>(TspErrorCode::PAYLOAD_PARSE_FAILED);
+        case TransportOutcome::Timeout:         return static_cast<int32_t>(TspErrorCode::PUBLISH_FAILED);
+        case TransportOutcome::Unknown:         return static_cast<int32_t>(TspErrorCode::UNKNOWN_OUTCOME);
+        case TransportOutcome::Unavailable:     return static_cast<int32_t>(TspErrorCode::ROUTE_API_INCOMPATIBLE);
+        case TransportOutcome::VersionMismatch: return static_cast<int32_t>(TspErrorCode::ROUTE_API_INCOMPATIBLE);
+        case TransportOutcome::PayloadTooLarge: return static_cast<int32_t>(TspErrorCode::FRAME_TOO_LARGE);
+        case TransportOutcome::ProtocolError:   return static_cast<int32_t>(TspErrorCode::PAYLOAD_PARSE_FAILED);
+        case TransportOutcome::Stopping:        return static_cast<int32_t>(TspErrorCode::PUBLISH_FAILED);
+        default: return static_cast<int32_t>(TspErrorCode::INTERNAL_ERROR);
+    }
 }
 
 } // anonymous namespace
 
-TspIpcDispatcher::TspIpcDispatcher(FotaRelayInterface* relay,
+TspIpcDispatcher::TspIpcDispatcher(VehicleMessageRelayInterface* relay,
                                    NetStatusProvider* net_provider,
                                    uint32_t max_payload_bytes)
     : relay_(relay)
@@ -65,16 +90,13 @@ std::string TspIpcDispatcher::dispatch(uint32_t method_id,
 
     try {
         switch (static_cast<ipc::MethodId>(method_id)) {
-            case ipc::MethodId::REPORT_SOFTWARE_INVENTORY:
-                result = handle_report_software_inventory(params_json);
-                break;
-            case ipc::MethodId::GET_RELAY_STATUS:
-                result = handle_get_relay_status(params_json);
+            case ipc::MethodId::EXCHANGE_VEHICLE_MESSAGE:
+                result = handle_exchange_vehicle_message(params_json);
                 break;
             case ipc::MethodId::GET_NET_STATUS:
                 result = handle_get_net_status();
                 break;
-            case ipc::MethodId::SUBSCRIBE_FOTA_COMMAND:
+            case ipc::MethodId::SUBSCRIBE_VEHICLE_MESSAGE:
             case ipc::MethodId::SUBSCRIBE_NET_STATUS:
                 result = handle_subscribe();
                 break;
@@ -135,7 +157,7 @@ std::string TspIpcDispatcher::dispatch(uint32_t method_id,
 // ============================================================
 
 std::pair<int32_t, std::string>
-TspIpcDispatcher::handle_report_software_inventory(std::string_view params) {
+TspIpcDispatcher::handle_exchange_vehicle_message(std::string_view params) {
     nlohmann::json j;
     try {
         j = nlohmann::json::parse(params);
@@ -144,86 +166,58 @@ TspIpcDispatcher::handle_report_software_inventory(std::string_view params) {
             nlohmann::json({{ipc::field::SUCCESS, false}, {ipc::field::ERROR, "Invalid JSON"}}).dump()};
     }
 
-    std::string payload_b64 = j.value(ipc::field::PAYLOAD_B64, "");
-    if (payload_b64.empty()) {
+    std::string envelope_b64 = j.value(ipc::field::ENVELOPE_B64, "");
+    if (envelope_b64.empty()) {
         return {static_cast<int32_t>(TspErrorCode::INVALID_PARAMETER),
-            nlohmann::json({{ipc::field::SUCCESS, false}, {ipc::field::ERROR, "Missing payload_base64"}}).dump()};
+            nlohmann::json({{ipc::field::SUCCESS, false}, {ipc::field::ERROR, "Missing envelope_base64"}}).dump()};
     }
 
-    // 超限帧在分配前拒绝 (CR-003 §6)
-    if (payload_b64.size() > max_payload_bytes_) {
+    // 超限帧在分配前拒绝（CR-003 §6）
+    if (envelope_b64.size() > max_payload_bytes_) {
         LogAdapter::ipc_server().warn(
             "tsp.ipc.frame_too_large",
-            "Payload exceeds frame limit",
-            {tbox::fw::log::Field("payload_bytes", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(payload_b64.size()))),
+            "Envelope exceeds frame limit",
+            {tbox::fw::log::Field("payload_bytes", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(envelope_b64.size()))),
              tbox::fw::log::Field("limit", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(max_payload_bytes_)))}
         );
         return {static_cast<int32_t>(TspErrorCode::FRAME_TOO_LARGE),
             nlohmann::json({{ipc::field::SUCCESS, false}, {ipc::field::ERROR, "Frame too large"}}).dump()};
     }
 
-    FotaSnapshot snapshot;
-    snapshot.snapshot_seq = j.value(ipc::field::SNAPSHOT_SEQ, 0u);
-    snapshot.msg_id       = j.value(ipc::field::MSG_ID, "");
-    snapshot.content_type = j.value(ipc::field::CONTENT_TYPE, "application/x-protobuf");
-    snapshot.trace_id     = j.value(ipc::field::TRACE_ID, "");
-    snapshot.request_id   = j.value(ipc::field::REQUEST_ID, "");
+    VehicleMessage request;
     try {
-        snapshot.payload = b64_decode(payload_b64);
+        request.envelope_bytes = b64_decode_bytes(envelope_b64);
     } catch (const std::exception&) {
         return {FW_SERIALIZATION_FAILED,
             nlohmann::json({{ipc::field::SUCCESS, false}, {ipc::field::ERROR, "base64 decode failed"}}).dump()};
     }
 
-    if (snapshot.msg_id.empty()) {
-        return {static_cast<int32_t>(TspErrorCode::INVALID_PARAMETER),
-            nlohmann::json({{ipc::field::SUCCESS, false}, {ipc::field::ERROR, "Missing msg_id"}}).dump()};
-    }
+    ExchangeOptions options;
+    options.timeout = std::chrono::milliseconds(
+        j.value(ipc::field::TIMEOUT_MS, 0));
+    options.max_response_bytes = j.value(ipc::field::MAX_RESPONSE_BYTES, 16384u);
+
+    CallContext ctx;
+    ctx.trace_id   = j.value(ipc::field::TRACE_ID, "");
+    ctx.request_id = j.value(ipc::field::REQUEST_ID, "");
 
     if (!relay_) {
         return {static_cast<int32_t>(TspErrorCode::NOT_INITIALIZED),
             nlohmann::json({{ipc::field::SUCCESS, false}, {ipc::field::ERROR, "Relay not ready"}}).dump()};
     }
 
-    ReportResult r = relay_->handle_uplink(snapshot);
+    TransportResult<VehicleMessage> r = relay_->exchange(request, options, ctx);
 
     nlohmann::json resp;
-    resp[ipc::field::SUCCESS]  = r.accepted;
-    resp[ipc::field::ACCEPTED] = r.accepted;
-    resp[ipc::field::OUTCOME]  = outcome_str(r.outcome);
-    resp[ipc::field::MSG_ID]   = r.msg_id;
-    return {r.error_code, resp.dump()};
-}
-
-std::pair<int32_t, std::string>
-TspIpcDispatcher::handle_get_relay_status(std::string_view params) {
-    nlohmann::json j;
-    try {
-        j = nlohmann::json::parse(params);
-    } catch (const nlohmann::json::exception&) {
-        return {FW_SERIALIZATION_FAILED,
-            nlohmann::json({{ipc::field::ERROR, "Invalid JSON"}}).dump()};
+    resp[ipc::field::SUCCESS]  = (r.outcome == TransportOutcome::Accepted);
+    resp[ipc::field::OUTCOME]  = transport_outcome_to_string(r.outcome);
+    if (r.value.has_value() && !r.value->envelope_bytes.empty()) {
+        resp[ipc::field::ENVELOPE_B64] = b64_encode_bytes(r.value->envelope_bytes);
     }
-
-    std::string msg_id = j.value(ipc::field::MSG_ID, "");
-    if (msg_id.empty()) {
-        return {static_cast<int32_t>(TspErrorCode::INVALID_PARAMETER),
-            nlohmann::json({{ipc::field::ERROR, "Missing msg_id"}}).dump()};
+    if (!r.error.empty()) {
+        resp[ipc::field::ERROR] = r.error;
     }
-
-    if (!relay_) {
-        return {static_cast<int32_t>(TspErrorCode::NOT_INITIALIZED),
-            nlohmann::json({{ipc::field::ERROR, "Relay not ready"}}).dump()};
-    }
-
-    RelayStatus s = relay_->get_relay_status(msg_id);
-
-    nlohmann::json resp;
-    resp[ipc::field::STATE]        = relay_state_to_string(s.state);
-    resp[ipc::field::MSG_ID]       = s.msg_id;
-    resp[ipc::field::SNAPSHOT_SEQ] = s.snapshot_seq;
-    resp[ipc::field::LAST_ERROR]   = s.last_error;
-    return {s.error_code, resp.dump()};
+    return {tsp_error_for_outcome(r.outcome), resp.dump()};
 }
 
 std::pair<int32_t, std::string>

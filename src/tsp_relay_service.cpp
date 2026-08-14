@@ -1,7 +1,7 @@
-// TBOX-TSP-DSN-CR-005 §3, §12.1: TspRelayService 实现。
+// TBOX-TSP-DSN-CR-005 §3, §12.1; CR-009 §16: TspRelayService 实现。
 //
-// 业务聚合装配顺序：Catalog -> Store -> Registrar -> FotaHandler
-// 停止顺序（CR-005 §7.1）：FOTA callback -> 注册器重试/timer/线程 -> 持久化
+// 业务聚合装配顺序：Catalog -> Store -> Registrar -> VehicleMessageGateway
+// 停止顺序（CR-005 §7.1）：EVENT callback -> 注册器重试/timer/线程 -> 持久化
 // （各组件内部完成 generation/dedup/receipt 持久化与线程 join）。
 
 #include "tsp_relay_service.h"
@@ -9,7 +9,7 @@
 #include "subscription_catalog.h"
 #include "subscription_store.h"
 #include "subscription_registrar.h"
-#include "fota_handler.h"
+#include "vehicle_message_gateway.h"
 #include "tsp_event_publisher.h"
 #include "tbox/tsp/errors.h"
 #include "log_adapter.h"
@@ -21,29 +21,20 @@ TspRelayService::TspRelayService(std::shared_ptr<MqttFacade> mqtt)
     : mqtt_(std::move(mqtt)) {
 }
 
-// 析构定义于 .cpp：此时 FotaHandler/MqttSubscriptionRegistrar 已完整可见，
+// 析构定义于 .cpp：此时 VehicleMessageGateway/MqttSubscriptionRegistrar 已完整可见，
 // unique_ptr 析构方可实例化（避免 incomplete type）。
 TspRelayService::~TspRelayService() {
     stop();
 }
 
-bool TspRelayService::initializeLocal(const std::string& device_sn,
-                                      const std::string& store_root,
-                                      const YAML::Node& catalog_node) {
+bool TspRelayService::initializeLocal(const std::string& store_root,
+                                      const YAML::Node& catalog_node,
+                                      const VehicleMessageGatewayConfig& gateway_config) {
     if (!mqtt_) {
         LogAdapter::application().error(
             "tsp.relay.init_failed", "MqttFacade 未注入");
         return false;
     }
-#if !TSP_MQTT_ROUTE_API
-    // legacy 模式: device_sn 必填（Topic 拼装需要）。
-    // route 模式 (CR-006): 不缓存 UID，device_sn 可为空。
-    if (device_sn.empty()) {
-        LogAdapter::application().error(
-            "tsp.relay.init_failed", "device_sn 为空");
-        return false;
-    }
-#endif
 
     // CR-004 §11.1: 加载业务订阅目录（SSOT）
     catalog_ = std::make_shared<SubscriptionCatalog>();
@@ -63,17 +54,17 @@ bool TspRelayService::initializeLocal(const std::string& device_sn,
     registrar_ = std::make_unique<MqttSubscriptionRegistrar>(
         mqtt_, catalog_, store_);
 
-    // CR-003 §2, §4: FOTA 中继（去重/节流/回执）
-    fota_handler_ = std::make_unique<FotaHandler>(mqtt_);
-    if (!fota_handler_->initialize(device_sn)) {
-        LogAdapter::fota().error("tsp.fota.init_failed", "FOTA 处理器初始化失败");
-        fota_handler_.reset();
+    // CR-009 §16: 通用 VehicleMessage 网关（correlation/EVENT 分流）
+    gateway_ = std::make_unique<VehicleMessageGateway>(mqtt_);
+    if (!gateway_->initialize(gateway_config)) {
+        LogAdapter::relay().error(
+            "tsp.vehicle_message.init_failed", "VehicleMessageGateway 初始化失败");
+        gateway_.reset();
         registrar_.reset();
         store_.reset();
         catalog_.reset();
         return false;
     }
-    fota_handler_->set_catalog(catalog_);
 
     LogAdapter::relay().info(
         "tsp.relay.initialized", "TspRelayService 本地初始化完成");
@@ -81,7 +72,7 @@ bool TspRelayService::initializeLocal(const std::string& device_sn,
 }
 
 bool TspRelayService::startMqttIntegration() {
-    if (!registrar_ || !fota_handler_) {
+    if (!registrar_ || !gateway_) {
         LogAdapter::application().error(
             "tsp.relay.start_failed", "TspRelayService 未初始化");
         return false;
@@ -98,9 +89,10 @@ bool TspRelayService::startMqttIntegration() {
             "tsp.subscription.not_ready", "Mandatory 快照未完成本地提交");
     }
 
-    // CR-003 §4.2: 启动 FOTA 业务（订阅下行）
-    if (!fota_handler_->start()) {
-        LogAdapter::fota().error("tsp.fota.start_failed", "FOTA 处理器启动失败");
+    // CR-009: 启动 VehicleMessageGateway（订阅 routed downlink + 收敛 worker）
+    if (!gateway_->start()) {
+        LogAdapter::relay().error(
+            "tsp.vehicle_message.start_failed", "VehicleMessageGateway 启动失败");
         // 回滚已启动的注册器（join 监控线程）
         registrar_->stop();
         return false;
@@ -119,47 +111,41 @@ void TspRelayService::beginShutdown() {
 
 void TspRelayService::stop() {
     stopping_.store(true, std::memory_order_release);
-    // 停止顺序：FOTA 下行 callback -> 注册器重试/timer/监控线程 -> 持久化
-    // （registrar_->stop() join 监控线程；fota_handler_->stop() 关闭下行处理）
-    if (fota_handler_) fota_handler_->stop();
+    // 停止顺序：VehicleMessageGateway（取消 routed downlink、收敛 in-flight）-> 
+    // 注册器重试/timer/监控线程 -> 持久化
+    if (gateway_) gateway_->stop();
     if (registrar_) registrar_->stop();
     LogAdapter::relay().info("tsp.relay.stopped", "TspRelayService 已停止");
 }
 
 void TspRelayService::set_event_publisher(TspEventPublisher* publisher) {
-    if (fota_handler_) fota_handler_->set_event_publisher(publisher);
+    if (gateway_) gateway_->set_event_publisher(publisher);
 }
 
 bool TspRelayService::is_registration_ready() const {
     return registrar_ && registrar_->is_registration_ready();
 }
 
-ReportResult TspRelayService::handle_uplink(const FotaSnapshot& snapshot) {
-    // STOPPING：reject-only，拒绝新上行（CR-005 §7.1 step1）
+TransportResult<VehicleMessage> TspRelayService::exchange(
+    const VehicleMessage& request,
+    const ExchangeOptions& options,
+    const CallContext& ctx) {
+    // STOPPING：reject-only，拒绝新 exchange（CR-005 §7.1 step1）
     if (stopping_.load(std::memory_order_acquire)) {
-        ReportResult r;
-        r.accepted = false;
-        r.outcome = PublishOutcome::ACCEPTED;
+        TransportResult<VehicleMessage> r;
+        r.outcome = TransportOutcome::Stopping;
         r.error_code = static_cast<int32_t>(TspErrorCode::PUBLISH_FAILED);
-        r.msg_id = snapshot.msg_id;
+        r.error = "stopping";
         return r;
     }
-    if (!fota_handler_) {
-        ReportResult r;
-        r.accepted = false;
-        r.msg_id = snapshot.msg_id;
+    if (!gateway_) {
+        TransportResult<VehicleMessage> r;
+        r.outcome = TransportOutcome::Unavailable;
+        r.error_code = static_cast<int32_t>(TspErrorCode::NOT_INITIALIZED);
+        r.error = "gateway_not_ready";
         return r;
     }
-    return fota_handler_->handle_uplink(snapshot);
-}
-
-RelayStatus TspRelayService::get_relay_status(const std::string& msg_id) {
-    if (!fota_handler_) {
-        RelayStatus s;
-        s.msg_id = msg_id;
-        return s;
-    }
-    return fota_handler_->get_relay_status(msg_id);
+    return gateway_->exchange(request, options, ctx);
 }
 
 } // namespace tsp

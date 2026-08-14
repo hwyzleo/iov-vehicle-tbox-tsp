@@ -39,9 +39,7 @@ fields:
   tsp:
     type: map
     fields:
-      # device-sn: legacy 模式读取（tsp_application.cpp / main_legacy.cpp）；
-      # route 模式不读取。production profile 禁止（身份实例值，见
-      # production_forbidden_fields）；test profile 允许（config/dev/tsp.yaml）。
+      # device-sn: 已随 CR-009 删除 legacy 模式；TSP 唯一 route 模式不读取 device-sn。
       device-sn:
         type: string
       ipc:
@@ -62,6 +60,50 @@ fields:
           socket_path:
             type: string
             path_safe: true
+      vehicle_message:
+        type: map
+        fields:
+          allowed_services:
+            type: string_list
+            required: true
+          allowed_protocol_major:
+            type: integer
+            min: 1
+            max: 255
+            required: true
+          max_envelope_bytes:
+            type: integer
+            min: 1024
+            max: 10485760
+          max_payload_bytes:
+            type: integer
+            min: 256
+            max: 8388608
+          max_in_flight:
+            type: integer
+            min: 1
+            max: 65536
+          downlink_queue_capacity:
+            type: integer
+            min: 1
+            max: 65536
+          worker_count:
+            type: integer
+            min: 1
+            max: 64
+          default_exchange_timeout_ms:
+            type: integer
+            min: 100
+            max: 600000
+      routes:
+        type: map
+        fields:
+          vehicle.fota:
+            type: map
+            fields:
+              uplink: {type: string, required: true}
+              downlink: {type: string, required: true}
+              target: {type: string, required: true}
       subscriptions:
         type: map_list
         fields:

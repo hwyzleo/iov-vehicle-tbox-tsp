@@ -1,8 +1,13 @@
-// TBOX-TSP IPC 请求分发适配器 (CR-003 §2)
+// TBOX-TSP IPC 请求分发适配器 (CR-003 §2; CR-009 §Client 与 IPC 契约)
 //
-// 将 framework-ipc 的 RequestHandler 签名适配到 TSP 业务 handler。
+// 将 framework-ipc 的 RequestHandler 签名适配到 TSP 业务。
 // 只负责 JSON 解码/编码、调用业务 handler 及业务状态映射，
 // 不复制 socket 逻辑（由 framework-ipc Server 负责）。
+//
+// CR-009：旧 report/relay-status 专用 method 已删除；IPC 只承载单一
+// vehicle.common.v1.VehicleMessageEnvelope。EXCHANGE_VEHICLE_MESSAGE 为阻塞式
+// 请求-响应：dispatcher 在线程目标上等待 VehicleMessageRelayInterface::exchange
+// 返回（异步 MQTT RESPONSE correlation 完成同步 exchange）。
 //
 // 响应 JSON 中嵌入 status 字段（TBOX-TSP-10xx 业务状态码），
 // framework 在 ResponseHeader.status_code 中写入 0（传输成功）或 FW-03xx（传输失败）。
@@ -22,15 +27,15 @@
 namespace tbox {
 namespace tsp {
 
-class FotaRelayInterface;
+class VehicleMessageRelayInterface;
 class NetStatusProvider;
 
 class TspIpcDispatcher {
 public:
-    /// @param relay         FOTA 中继业务接口
+    /// @param relay         通用 VehicleMessage 中继业务接口
     /// @param net_provider  网络状态提供者（可为 nullptr）
     /// @param max_payload_bytes 单帧 payload 上限（超限在分配前拒绝，默认 10 MiB）
-    TspIpcDispatcher(FotaRelayInterface* relay,
+    TspIpcDispatcher(VehicleMessageRelayInterface* relay,
                      NetStatusProvider* net_provider,
                      uint32_t max_payload_bytes = 10485760);
 
@@ -44,13 +49,12 @@ public:
                          int client_fd);
 
 private:
-    FotaRelayInterface* relay_;
+    VehicleMessageRelayInterface* relay_;
     NetStatusProvider* net_provider_;
     uint32_t max_payload_bytes_;
 
     // 各 method handler，返回 (status_code, response_json)
-    std::pair<int32_t, std::string> handle_report_software_inventory(std::string_view params);
-    std::pair<int32_t, std::string> handle_get_relay_status(std::string_view params);
+    std::pair<int32_t, std::string> handle_exchange_vehicle_message(std::string_view params);
     std::pair<int32_t, std::string> handle_get_net_status();
     std::pair<int32_t, std::string> handle_subscribe();
 };

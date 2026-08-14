@@ -5,10 +5,11 @@
 #include "subscription_registrar.h"
 #include "subscription_catalog.h"
 #include "subscription_store.h"
-#include "fota_handler.h"
+#include "vehicle_message_gateway.h"
 #include "tsp_event_publisher.h"
 #include "tbox/tsp/types.h"
 #include "mocks.h"
+#include "vehicle_message_test_util.h"
 #include "yaml-cpp/yaml.h"
 
 #include <chrono>
@@ -169,28 +170,33 @@ TEST_F(SubscriptionIntegrationTest, AcceptedChangeAtomicReplace) {
     EXPECT_EQ(mqtt_->snapshot_calls().back().generation, 2u);
 }
 
-// FOTA 上行使用目录展开的 Topic（CR-004 §11.5: 目录是 SSOT）
-TEST_F(SubscriptionIntegrationTest, FotaUplinkUsesCatalogTopic) {
+// FOTA 上行经 VehicleMessageGateway 使用目录 Route（CR-009 §Route 映射）
+TEST_F(SubscriptionIntegrationTest, FotaUplinkUsesCatalogRoute) {
     mqtt_->connected = true;
-    mqtt_->publish_result = {true, PublishOutcome::ACCEPTED};
+    mqtt_->publish_route_result = {true, MqttDeliveryOutcome::Accepted};
     ASSERT_TRUE(registrar_->start(false));
 
-    FotaHandler fota(mqtt_);
-    fota.set_catalog(catalog_);
-    ASSERT_TRUE(fota.initialize("ECU001"));
-    ASSERT_TRUE(fota.start());
+    // 真实 gateway：按 catalog 稳定 route_id 上行，不展开 Topic/不缓存 UID
+    VehicleMessageGatewayConfig cfg;
+    cfg.limits.allowed_services = {"vehicle.fota"};
+    cfg.limits.allowed_protocol_majors = {1};
+    cfg.default_exchange_timeout_ms = 200;
+    VehicleMessageGateway gw(mqtt_);
+    ASSERT_TRUE(gw.initialize(cfg));
+    ASSERT_TRUE(gw.start());
 
-    FotaSnapshot snap;
-    snap.msg_id = "m-up";
-    snap.snapshot_seq = 1;
-    snap.payload = {0x01};
-    auto r = fota.handle_uplink(snap);
-    EXPECT_TRUE(r.accepted);
+    ExchangeOptions opt;
+    opt.timeout = std::chrono::milliseconds(100);
+    auto r = gw.exchange(to_msg(make_request_envelope("m-up")), opt, CallContext{});
 
-    // 目录模板 vehicle/{ecu_uid}/up/fota 展开为 vehicle/ECU001/up/fota
-    ASSERT_EQ(mqtt_->publish_calls().size(), 1u);
-    EXPECT_EQ(mqtt_->publish_calls()[0].topic, "vehicle/ECU001/up/fota");
-    fota.stop();
+    // 上行按 owner=tsp + route_id=fota.uplink（目录 SSOT），不传完整 Topic/UID
+    ASSERT_EQ(mqtt_->publish_route_calls().size(), 1u);
+    EXPECT_EQ(mqtt_->publish_route_calls()[0].owner, "tsp");
+    EXPECT_EQ(mqtt_->publish_route_calls()[0].route_id, "fota.uplink");
+    EXPECT_EQ(mqtt_->publish_route_calls()[0].msg_id, "m-up");
+    // 无业务 RESPONSE -> 超时（Timeout）
+    EXPECT_EQ(r.outcome, TransportOutcome::Timeout);
+    gw.stop();
 }
 
 // 响应丢失后相同 generation 幂等重试 (CR-004 §5, §11.3, §12)

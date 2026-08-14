@@ -13,7 +13,6 @@
 #include <cstdint>
 #include <string>
 #include <vector>
-#include "tsp_build_config.h"
 
 namespace tbox {
 namespace tsp {
@@ -142,23 +141,6 @@ struct RegistrationStatus {
     uint32_t retry_count = 0;
     uint64_t updated_at_ms = 0;
 };
-
-#if !TSP_MQTT_ROUTE_API
-// 展开 Topic 模板：将 {ecu_uid} 替换为当前设备身份 (CR-004 §4, §11.1)。
-// 禁止 device_sn 兜底；模板中 {device_sn} 由 SubscriptionCatalog 校验拦截。
-// route 模式 (CR-006): TSP 不展开模板，由 MQTT 按 PROV 身份展开（本函数仅 legacy 使用）。
-inline std::string expand_topic_template(const std::string& tmpl,
-                                         const std::string& ecu_uid) {
-    std::string out = tmpl;
-    const std::string placeholder = "{ecu_uid}";
-    size_t pos = 0;
-    while ((pos = out.find(placeholder, pos)) != std::string::npos) {
-        out.replace(pos, placeholder.size(), ecu_uid);
-        pos += ecu_uid.size();
-    }
-    return out;
-}
-#endif  // !TSP_MQTT_ROUTE_API
 
 } // namespace tsp
 } // namespace tbox

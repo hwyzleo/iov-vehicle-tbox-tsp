@@ -1,13 +1,15 @@
 // tests/test_tsp_client.cpp
 // 端到端：tsp_client (framework-ipc Client) <-> TSP Server (framework-ipc Server + Dispatcher)
-// 验证 wire protocol 契约：reportSoftwareInventory / getRelayStatus / subscribeFotaCommand
+// 验证 CR-009 wire protocol 契约：exchangeVehicleMessage / subscribeVehicleMessage。
+// 使用 MockVehicleMessageRelay（blocking 模式完成业务 RESPONSE）与 TspEventPublisher
+// 推送 EVENT Envelope。
 #include <gtest/gtest.h>
 #include "tbox/tsp/client.h"
 #include "tsp_framework_server.h"
 #include "tsp_ipc_protocol.h"
 #include "tbox/tsp/errors.h"
 #include "mocks.h"
-#include "utils.h"
+#include "vehicle_message_test_util.h"
 
 #include <chrono>
 #include <thread>
@@ -18,13 +20,20 @@ using namespace tbox::tsp;
 using namespace tbox::tsp::test;
 
 namespace {
-std::string b64(const std::vector<uint8_t>& d) {
-    return ::hwyz::Utils::base64_encode(std::string(d.begin(), d.end()));
-}
-
 std::string unique_socket() {
     return "/tmp/tbox-tsp-test-" + std::to_string(getpid()) + "-" +
            std::to_string(rand()) + ".sock";
+}
+
+// 等待函数
+template <typename F>
+bool wait_for(F&& f, int ms = 2000) {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (f()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return f();
 }
 }
 
@@ -32,7 +41,7 @@ class TspClientServerTest : public ::testing::Test {
 protected:
     void SetUp() override {
         socket_path_ = unique_socket();
-        relay_ = std::make_unique<MockFotaRelay>();
+        relay_ = std::make_unique<MockVehicleMessageRelay>();
         net_ = std::make_unique<MockNetStatusProvider>();
 
         ::tbox::fw::ipc::IpcConfig cfg;
@@ -58,84 +67,106 @@ protected:
         client_.reset();
         server_->stop();
         server_.reset();
+        relay_.reset();
         ::unlink(socket_path_.c_str());
     }
 
     std::string socket_path_;
-    std::unique_ptr<MockFotaRelay> relay_;
+    std::unique_ptr<MockVehicleMessageRelay> relay_;
     std::unique_ptr<MockNetStatusProvider> net_;
     std::unique_ptr<TspFrameworkServer> server_;
     std::unique_ptr<TspClient> client_;
 };
 
-// reportSoftwareInventory: accepted
-TEST_F(TspClientServerTest, ReportSoftwareInventoryAccepted) {
-    relay_->uplink_result = {true, PublishOutcome::ACCEPTED, 0, ""};
+// exchangeVehicleMessage: accepted + 业务 RESPONSE Envelope（blocking relay 完成）
+TEST_F(TspClientServerTest, ExchangeAcceptedWithResponse) {
+    relay_->blocking = true;
+    relay_->reset_blocking();
 
-    FotaSnapshot snap;
-    snap.snapshot_seq = 10;
-    snap.msg_id = "integration-10";
-    snap.content_type = "application/x-protobuf";
-    snap.payload = {0x01, 0x02, 0x03, 0x04};
-    snap.trace_id = "trace-x";
+    const std::string msg_id = "client-req-1";
+    ExchangeOptions options;
+    options.timeout = std::chrono::milliseconds(3000);
+    CallContext ctx;
+    ctx.trace_id = "trace-client";
+    ctx.request_id = "req-client-1";
 
-    auto r = client_->reportSoftwareInventory(snap);
-
-    EXPECT_TRUE(r.accepted);
-    EXPECT_EQ(r.outcome, PublishOutcome::ACCEPTED);
-    EXPECT_EQ(r.msg_id, "integration-10");
-    EXPECT_TRUE(relay_->uplink_called);
-    EXPECT_EQ(relay_->uplink_calls.back().snapshot.snapshot_seq, 10u);
-}
-
-// reportSoftwareInventory: dedup
-TEST_F(TspClientServerTest, ReportSoftwareInventoryDedup) {
-    relay_->uplink_result = {true, PublishOutcome::ACCEPTED,
-        static_cast<int32_t>(TspErrorCode::DEDUP_HIT), ""};
-
-    FotaSnapshot snap;
-    snap.msg_id = "dup-1";
-    snap.payload = {0x01};
-
-    auto r = client_->reportSoftwareInventory(snap);
-    EXPECT_EQ(r.error_code, static_cast<int32_t>(TspErrorCode::DEDUP_HIT));
-}
-
-// getRelayStatus
-TEST_F(TspClientServerTest, GetRelayStatus) {
-    relay_->status_result.state = RelayState::ACCEPTED;
-    relay_->status_result.snapshot_seq = 3;
-    relay_->status_result.error_code = 0;
-
-    auto s = client_->getRelayStatus("m-3");
-    EXPECT_EQ(s.state, RelayState::ACCEPTED);
-    EXPECT_EQ(s.msg_id, "m-3");
-    EXPECT_EQ(s.snapshot_seq, 3u);
-}
-
-// subscribeFotaCommand: 订阅后收到下行事件 (CR-003 §5)
-TEST_F(TspClientServerTest, SubscribeAndReceiveFotaCommand) {
-    std::atomic<bool> received{false};
-    std::string recv_command_id;
-    std::vector<uint8_t> recv_payload;
-
-    auto sub = client_->subscribeFotaCommand([&](const FotaCommand& cmd) {
-        recv_command_id = cmd.command_id;
-        recv_payload = cmd.payload;
-        received = true;
+    std::atomic<bool> done{false};
+    TransportResult<VehicleMessage> result;
+    std::thread t([&] {
+        result = client_->exchangeVehicleMessage(
+            to_msg(make_request_envelope(msg_id)), options, ctx);
+        done = true;
     });
+
+    // 等待 relay 收到请求
+    ASSERT_TRUE(wait_for([&] { return relay_->call_count() == 1; }));
+
+    // relay 完成：Accepted + RESPONSE Envelope
+    TransportResult<VehicleMessage> r;
+    r.outcome = TransportOutcome::Accepted;
+    r.value = to_msg(make_response_envelope(msg_id, "resp-1"));
+    relay_->complete(std::move(r));
+
+    ASSERT_TRUE(wait_for([&] { return done.load(); }));
+    t.join();
+
+    EXPECT_EQ(result.outcome, TransportOutcome::Accepted);
+    ASSERT_TRUE(result.value.has_value());
+    EXPECT_EQ(bytes_to_string(result.value->envelope_bytes),
+              bytes_to_string(make_response_envelope(msg_id, "resp-1")));
+
+    // wire 校验：relay 收到单一 Envelope bytes（无外层 payload/service 重复）
+    const auto& call = relay_->last_call();
+    EXPECT_EQ(bytes_to_string(call.request.envelope_bytes),
+              bytes_to_string(make_request_envelope(msg_id)));
+    EXPECT_EQ(call.ctx.trace_id, "trace-client");
+    EXPECT_EQ(call.ctx.request_id, "req-client-1");
+}
+
+// exchangeVehicleMessage: relay 拒绝 -> Rejected
+TEST_F(TspClientServerTest, ExchangeRejected) {
+    TransportResult<VehicleMessage> rej;
+    rej.outcome = TransportOutcome::Rejected;
+    rej.error = "ttl_expired";
+    relay_->default_result = rej;
+
+    auto result = client_->exchangeVehicleMessage(
+        to_msg(make_request_envelope("client-req-rej")), ExchangeOptions{}, CallContext{});
+    EXPECT_EQ(result.outcome, TransportOutcome::Rejected);
+    EXPECT_EQ(result.error, "ttl_expired");
+    EXPECT_FALSE(result.value.has_value());
+}
+
+// exchangeVehicleMessage: 超时（relay 返回 Timeout）
+TEST_F(TspClientServerTest, ExchangeTimeout) {
+    TransportResult<VehicleMessage> tmo;
+    tmo.outcome = TransportOutcome::Timeout;
+    tmo.error = "business_response_timeout";
+    relay_->default_result = tmo;
+
+    auto result = client_->exchangeVehicleMessage(
+        to_msg(make_request_envelope("client-req-tmo")), ExchangeOptions{}, CallContext{});
+    EXPECT_EQ(result.outcome, TransportOutcome::Timeout);
+}
+
+// subscribeVehicleMessage: 订阅后收到 EVENT Envelope（CR-009 §EVENT 下行）
+TEST_F(TspClientServerTest, SubscribeAndReceiveEvent) {
+    std::atomic<bool> received{false};
+    std::vector<std::byte> recv_bytes;
+
+    auto sub = client_->subscribeVehicleMessage("vehicle.fota",
+        [&](const VehicleMessage& msg) {
+            recv_bytes = msg.envelope_bytes;
+            received = true;
+        });
     ASSERT_TRUE(sub.isActive());
 
     // 等待订阅注册完成
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-    // 服务端推送下行命令
-    FotaCommand cmd;
-    cmd.command_id = "cmd-down-1";
-    cmd.delivery_id = "dlv-1";
-    cmd.schema_version = "1.0";
-    cmd.payload = {0xAA, 0xBB, 0xCC};
-    server_->event_publisher()->publish_fota_command(cmd);
+    // 服务端推送下行 EVENT Envelope
+    auto evt = make_event_envelope("evt-client-1");
+    server_->event_publisher()->publish_vehicle_message("vehicle.fota", evt, "tr", "rq");
 
     // 等待事件到达
     for (int i = 0; i < 100 && !received.load(); i++) {
@@ -143,8 +174,7 @@ TEST_F(TspClientServerTest, SubscribeAndReceiveFotaCommand) {
     }
 
     EXPECT_TRUE(received.load());
-    EXPECT_EQ(recv_command_id, "cmd-down-1");
-    EXPECT_EQ(recv_payload, (std::vector<uint8_t>{0xAA, 0xBB, 0xCC}));
+    EXPECT_EQ(bytes_to_string(recv_bytes), bytes_to_string(evt));
 }
 
 int main(int argc, char** argv) {

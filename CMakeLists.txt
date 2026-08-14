@@ -17,12 +17,11 @@ include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
 # ============================================================
-# CR-006 构建开关：MQTT Route API 迁移
+# TBOX-TSP-DSN-CR-009: 通用 VehicleMessage 单一依赖路径（无 legacy 双路径）
+# 已删除 TSP_USE_MQTT_ROUTE_API=OFF / main_legacy.cpp / prov_client / HAS_TBOX_PROV。
+# TSP 量产唯一路径为 MQTT Route API（publishRoute + subscribeRoutedDownlink +
+# replaceSubscriptionSnapshot）。
 # ============================================================
-# TSP_USE_MQTT_ROUTE_API=ON (默认, CR-006 §10.2): route 模式，TSP 不构造 prov_client、
-#   不缓存 ecu_uid、不拼装完整 Topic；上行 publishRoute，下行 subscribeRoutedDownlink。
-# OFF (deprecated): legacy 完整 Topic 路径，经 PROV readBinding 获取 ecu_uid。
-option(TSP_USE_MQTT_ROUTE_API "Use MQTT route-based API (CR-006); legacy full-topic path is deprecated" ON)
 
 # ============================================================
 # 依赖（BUILD: 受控 staging/sysroot 注入；HOST: tbox-env.sh + CMAKE_PREFIX_PATH）
@@ -51,15 +50,50 @@ endif()
 # --- nlohmann_json（TSP 源码直接使用；CR-007 §7: 直接 TARGET dependency） ---
 find_package(nlohmann_json REQUIRED)
 
-# --- TBox PROV client SDK（仅 legacy 模式用于设备序列号；route 模式不链接） ---
-# CR-007 §6.2: 目标态不为 Topic 构造 tbox::prov_client；PROV/SEC 只由 MQTT
-# 构建闭包带入。legacy 分支为 deprecated 回滚验证入口，HOST 开发使用。
-set(HAS_TBOX_PROV FALSE)
-if(NOT TSP_USE_MQTT_ROUTE_API)
-    if(NOT TARGET tbox::prov_client)
-        find_package(TboxProvClient CONFIG REQUIRED)
-    endif()
-    set(HAS_TBOX_PROV TRUE)
+# ============================================================
+# Proto / protobuf（TBOX-TSP-DSN-CR-009：VEH-PROTO 为文档 SSOT，各服务自备所需 proto）
+# - HOST：protoc 仅生成构建中间文件（不进入 runtime package）；
+# - TARGET：libprotobuf runtime 来自受控依赖（BUILD dep staging / Orin sysroot
+#   已带 libprotobuf.so.17；头文件由 BUILD 纳入 TBOX_DEP_STAGING），
+#   与 TBOX-SOMEIP 的 pkg-config 消费方式一致。
+# ============================================================
+find_program(PROTOC_EXECUTABLE NAMES protoc REQUIRED)
+if(NOT TARGET PkgConfig::PROTOBUF)
+    find_package(PkgConfig REQUIRED)
+    set(PKG_CONFIG_USE_CMAKE_PREFIX_PATH ON)
+    pkg_check_modules(PROTOBUF REQUIRED IMPORTED_TARGET protobuf)
+endif()
+
+set(TSP_PROTO_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/proto")
+set(TSP_PROTO_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/proto")
+file(GLOB_RECURSE TSP_PROTO_FILES CONFIGURE_DEPENDS "${TSP_PROTO_SRC_DIR}/*.proto")
+
+set(TSP_PROTO_GEN_SOURCES "")
+set(TSP_PROTO_GEN_HEADERS "")
+foreach(PROTO_FILE ${TSP_PROTO_FILES})
+    file(RELATIVE_PATH PROTO_REL "${TSP_PROTO_SRC_DIR}" "${PROTO_FILE}")
+    string(REPLACE ".proto" ".pb.cc" PROTO_CC "${PROTO_REL}")
+    string(REPLACE ".proto" ".pb.h" PROTO_H "${PROTO_REL}")
+    set(PROTO_CC_ABS "${TSP_PROTO_GEN_DIR}/${PROTO_CC}")
+    set(PROTO_H_ABS "${TSP_PROTO_GEN_DIR}/${PROTO_H}")
+    list(APPEND TSP_PROTO_GEN_SOURCES "${PROTO_CC_ABS}")
+    list(APPEND TSP_PROTO_GEN_HEADERS "${PROTO_H_ABS}")
+    add_custom_command(
+        OUTPUT "${PROTO_CC_ABS}" "${PROTO_H_ABS}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${TSP_PROTO_GEN_DIR}"
+        COMMAND ${PROTOC_EXECUTABLE} --proto_path=${TSP_PROTO_SRC_DIR}
+                --cpp_out=${TSP_PROTO_GEN_DIR}
+                --experimental_allow_proto3_optional "${PROTO_FILE}"
+        DEPENDS "${PROTO_FILE}"
+        COMMENT "protoc: ${PROTO_REL}"
+    )
+endforeach()
+
+if(TSP_PROTO_GEN_SOURCES)
+    add_library(tsp_proto STATIC ${TSP_PROTO_GEN_SOURCES})
+    target_include_directories(tsp_proto PUBLIC "${TSP_PROTO_GEN_DIR}")
+    target_link_libraries(tsp_proto PUBLIC PkgConfig::PROTOBUF)
+    set_target_properties(tsp_proto PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 
 # ============================================================
@@ -96,7 +130,6 @@ target_link_libraries(tbox_tsp_client
 # Application 单测共享；包含全部业务/传输源，不含 main 入口）
 # ============================================================
 set(TBOX_TSP_DAEMON_SOURCES
-        src/fota_handler.cpp
         src/mqtt_client_adapter.cpp
         src/downlink_route_dispatcher.cpp
         src/subscription_catalog.cpp
@@ -107,6 +140,7 @@ set(TBOX_TSP_DAEMON_SOURCES
         src/tsp_ipc_dispatcher.cpp
         src/tsp_event_publisher.cpp
         src/tsp_framework_server.cpp
+        src/vehicle_message_gateway.cpp   # CR-009 §16: 通用 VehicleMessage 网关
         src/tsp_error_codes.cpp
         src/net_status_provider.cpp
         src/log_adapter.cpp
@@ -119,36 +153,15 @@ target_include_directories(tbox_tsp_lib
 target_link_libraries(tbox_tsp_lib
         PUBLIC ${TSP_FRAMEWORK_LIBS}
                tbox::mqtt_client
+               tsp_proto
                nlohmann_json::nlohmann_json)
 target_compile_definitions(tbox_tsp_lib PUBLIC HAS_FRAMEWORK_LOG=1)
-if(TSP_USE_MQTT_ROUTE_API)
-    target_compile_definitions(tbox_tsp_lib PUBLIC TSP_USE_MQTT_ROUTE_API=1)
-else()
-    target_compile_definitions(tbox_tsp_lib PUBLIC TSP_USE_MQTT_ROUTE_API=0)
-    if(HAS_TBOX_PROV)
-        target_link_libraries(tbox_tsp_lib PUBLIC tbox::prov_client)
-        target_compile_definitions(tbox_tsp_lib PUBLIC HAS_TBOX_PROV=1)
-    endif()
-endif()
 
 # ============================================================
-# Main daemon 可执行文件 (CR-003 + CR-005: framework Application 生命周期)
-# CR-005 §9.1: 构建期切换 Application 生命周期。
-#   ON  -> TspApplication（hwyz::Application 编排）
-#   OFF -> 旧式手写生命周期（回滚验证用，验收后删除）
+# Main daemon 可执行文件 (CR-005 + CR-009: framework Application 生命周期唯一入口)
+# CR-009: main_legacy.cpp 已删除，无 legacy 生命周期/双路径。
 # ============================================================
-option(TSP_USE_FRAMEWORK_APPLICATION "Use hwyz::Application lifecycle" ON)
-# CR-006: main_legacy.cpp 不支持 route API（它是 deprecated legacy 入口）。
-if(NOT TSP_USE_FRAMEWORK_APPLICATION AND TSP_USE_MQTT_ROUTE_API)
-    message(FATAL_ERROR "main_legacy.cpp (TSP_USE_FRAMEWORK_APPLICATION=OFF) does not "
-                        "support TSP_USE_MQTT_ROUTE_API=ON; set TSP_USE_MQTT_ROUTE_API=OFF "
-                        "or TSP_USE_FRAMEWORK_APPLICATION=ON")
-endif()
-if(TSP_USE_FRAMEWORK_APPLICATION)
-    add_executable(tbox_tsp src/main.cpp)
-else()
-    add_executable(tbox_tsp src/main_legacy.cpp)
-endif()
+add_executable(tbox_tsp src/main.cpp)
 target_link_libraries(tbox_tsp PRIVATE tbox_tsp_lib)
 
 # ============================================================

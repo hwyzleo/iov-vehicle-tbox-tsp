@@ -46,7 +46,7 @@ bool DownlinkRouteDispatcher::dispatch(const RoutedDownlinkEvent& event) {
     }
 
     if (handler) {
-        handler(event.payload, event.request_id, event.trace_id);
+        handler(event);
         LogAdapter::fota().info(
             "tsp.route.downlink.forwarded", "routed downlink 已分发", {
                 {"owner", tbox::fw::log::FieldValue::makeString(event.owner)},

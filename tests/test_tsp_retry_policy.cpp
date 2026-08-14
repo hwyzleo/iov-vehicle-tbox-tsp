@@ -8,19 +8,21 @@ using namespace tbox::tsp;
 TEST(TspRetryPolicyTest, ReadOnlyMethodsAllowRetry) {
     EXPECT_TRUE(TspRetryPolicy::should_retry(
         static_cast<uint32_t>(ipc::MethodId::GET_NET_STATUS)));
-    EXPECT_TRUE(TspRetryPolicy::should_retry(
-        static_cast<uint32_t>(ipc::MethodId::GET_RELAY_STATUS)));
 }
 
-TEST(TspRetryPolicyTest, BusinessIdempotentMethodAllowsRetry) {
-    // reportSoftwareInventory: 业务幂等（同 msg_id/snapshot_seq 由 TSP 去重）
-    EXPECT_TRUE(TspRetryPolicy::should_retry(
-        static_cast<uint32_t>(ipc::MethodId::REPORT_SOFTWARE_INVENTORY)));
+TEST(TspRetryPolicyTest, ExchangeForbidsAutoRetry) {
+    // CR-009: EXCHANGE_VEHICLE_MESSAGE 禁止不可见自动重试（重试由 CGW-FOTA
+    // 以原 request/idempotency 身份发起；TSP 侧同 message_id 复用会被拒绝）。
+    EXPECT_FALSE(TspRetryPolicy::should_retry(
+        static_cast<uint32_t>(ipc::MethodId::EXCHANGE_VEHICLE_MESSAGE)));
+    EXPECT_EQ(TspRetryPolicy::categorize(
+        static_cast<uint32_t>(ipc::MethodId::EXCHANGE_VEHICLE_MESSAGE)),
+        TspRetryPolicy::Category::kOneShot);
 }
 
 TEST(TspRetryPolicyTest, SubscribeMethodsForbidRetry) {
     EXPECT_FALSE(TspRetryPolicy::should_retry(
-        static_cast<uint32_t>(ipc::MethodId::SUBSCRIBE_FOTA_COMMAND)));
+        static_cast<uint32_t>(ipc::MethodId::SUBSCRIBE_VEHICLE_MESSAGE)));
     EXPECT_FALSE(TspRetryPolicy::should_retry(
         static_cast<uint32_t>(ipc::MethodId::SUBSCRIBE_NET_STATUS)));
 }
@@ -32,13 +34,10 @@ TEST(TspRetryPolicyTest, UnknownMethodConservativeOneShot) {
 
 TEST(TspRetryPolicyTest, Categorize) {
     EXPECT_EQ(TspRetryPolicy::categorize(
-        static_cast<uint32_t>(ipc::MethodId::GET_RELAY_STATUS)),
+        static_cast<uint32_t>(ipc::MethodId::GET_NET_STATUS)),
         TspRetryPolicy::Category::kReadOnly);
     EXPECT_EQ(TspRetryPolicy::categorize(
-        static_cast<uint32_t>(ipc::MethodId::REPORT_SOFTWARE_INVENTORY)),
-        TspRetryPolicy::Category::kBusinessIdempotent);
-    EXPECT_EQ(TspRetryPolicy::categorize(
-        static_cast<uint32_t>(ipc::MethodId::SUBSCRIBE_FOTA_COMMAND)),
+        static_cast<uint32_t>(ipc::MethodId::SUBSCRIBE_VEHICLE_MESSAGE)),
         TspRetryPolicy::Category::kOneShot);
 }
 

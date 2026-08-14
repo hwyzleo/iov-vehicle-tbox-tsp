@@ -16,7 +16,9 @@ namespace tsp {
 // MqttClientAdapter -- MqttFacade 实现，内部使用 tbox::mqtt::Client (CR-003 §1)
 //
 // TSP 对 MQTT 只链接 tbox::mqtt_client，不操作其 socket/method/JSON，也不持有 MQTT 连接。
-// publish 返回 accepted/unknown（accepted ≠ Broker PUBACK）。
+// CR-009：legacy 完整 Topic publish/subscribe/registerRoute 路径已删除；
+// 唯一路径为 publishRoute + subscribeRoutedDownlink + replaceSubscriptionSnapshot。
+// publishRoute accepted ≠ Broker PUBACK（仅投递阶段语义）。
 class MqttClientAdapter : public MqttFacade {
 public:
     explicit MqttClientAdapter(const std::string& socket_path = "/tmp/tbox-mqtt.sock");
@@ -25,23 +27,6 @@ public:
     bool initialize() override;
     bool start() override;
     void stop() override;
-
-    bool registerRoute(const std::string& internal_addr,
-                       const std::string& topic,
-                       const std::string& direction,
-                       int qos) override;
-
-    MqttPublishResult publish(const std::string& msg_id,
-                              const std::string& topic,
-                              const std::vector<uint8_t>& payload,
-                              int qos,
-                              const std::string& content_type = "application/x-protobuf",
-                              const std::string& trace_id = "",
-                              const std::string& request_id = "") override;
-
-    bool subscribe(const std::string& topic,
-                   int qos,
-                   MessageCallback callback) override;
 
     // ---- Route-based 发布与下行 (CR-006 §5, §6) ----
     MqttPublishResult publishRoute(const std::string& owner,
@@ -73,9 +58,7 @@ private:
     bool initialized_ = false;
     bool started_ = false;
 
-    // 持有下行订阅句柄（RAII），析构自动取消
-    // legacy: downlink_sub_ (full-topic subscribe)；route: routed_sub_ (CR-006 §6)
-    ::tbox::fw::ipc::Subscription downlink_sub_;
+    // 持有 routed 下行订阅句柄（RAII），析构自动取消 (CR-006 §6)
     ::tbox::mqtt::RoutedSubscription routed_sub_;
     mutable std::mutex mutex_;
 };

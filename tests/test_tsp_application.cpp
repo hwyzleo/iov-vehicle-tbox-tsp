@@ -174,22 +174,9 @@ TEST_F(TspApplicationTest, CleanupIsIdempotent) {
     EXPECT_FALSE(std::filesystem::exists(cf.socket_path));
 }
 
-#if !TSP_MQTT_ROUTE_API
-TEST_F(TspApplicationTest, InitializeDeviceSnMissingReturnsFalse) {
-    // legacy: 无 device-sn（且无 PROV/全局 SN）-> initialize 在 MqttClientReady 前失败
-    auto cf = makeConfig("no_device");
-    cleanup_paths_.push_back(cf.dir);
-    TestableTspApplication app;
-    ASSERT_TRUE(app.doLoadConfig(cf.dir));
-    EXPECT_FALSE(app.doInitialize());
-    // 失败后 cleanup 必须安全（幂等）
-    EXPECT_NO_THROW(app.doCleanup());
-    EXPECT_FALSE(std::filesystem::exists(cf.socket_path));
-}
-#else
 TEST_F(TspApplicationTest, InitializeSuccessWithoutDeviceSn) {
-    // route 模式 (CR-006): 不构造 prov_client、不要求 device_sn，
-    //   即使无 device-sn 也能完成本地初始化（MQTT/快照 DEGRADED 不阻塞）。
+    // CR-009: 不构造 prov_client、不要求 device_sn；无 device-sn 也能完成本地初始化
+    // （MQTT/快照 DEGRADED 不阻塞启动）。
     auto cf = makeConfig("no_device");
     cleanup_paths_.push_back(cf.dir);
     TestableTspApplication app;
@@ -198,7 +185,6 @@ TEST_F(TspApplicationTest, InitializeSuccessWithoutDeviceSn) {
     EXPECT_NO_THROW(app.doCleanup());
     EXPECT_FALSE(std::filesystem::exists(cf.socket_path));
 }
-#endif
 
 // ============================================================
 // TspRelayService::initializeLocal 失败回滚（CR-005 §3 业务聚合独立可测）
@@ -217,32 +203,21 @@ TEST(TspRelayServiceTest, InitializeLocalRejectsDuplicateRouteId) {
         "- route_id: fota.uplink\n"
         "  topic_template: vehicle/{ecu_uid}/down/fota\n"
         "  direction: DOWN\n  qos: 1\n  target: tsp.fota\n  mandatory: true\n");
-    EXPECT_FALSE(relay.initializeLocal("TBOX_TEST_001",
-                                       "/tmp/tsp_relay_test_store", catalog));
+    EXPECT_FALSE(relay.initializeLocal("/tmp/tsp_relay_test_store", catalog,
+                                       VehicleMessageGatewayConfig{}));
 }
 
-#if !TSP_MQTT_ROUTE_API
-TEST(TspRelayServiceTest, InitializeLocalRejectsEmptyDeviceSn) {
+TEST(TspRelayServiceTest, InitializeLocalAcceptsWithoutDeviceSn) {
+    // CR-009: 不缓存 UID，无 device_sn 也能完成初始化
     auto mqtt = std::make_shared<tbox::tsp::test::MockMqttFacade>();
     TspRelayService relay(mqtt);
     YAML::Node catalog = YAML::Load(
         "- route_id: fota.uplink\n"
         "  topic_template: vehicle/{ecu_uid}/up/fota\n"
         "  direction: UP\n  qos: 1\n  target: tsp.fota\n  mandatory: false\n");
-    EXPECT_FALSE(relay.initializeLocal("", "/tmp/tsp_relay_test_store", catalog));
+    EXPECT_TRUE(relay.initializeLocal("/tmp/tsp_relay_test_store", catalog,
+                                      VehicleMessageGatewayConfig{}));
 }
-#else
-TEST(TspRelayServiceTest, InitializeLocalAcceptsEmptyDeviceSn) {
-    // route 模式 (CR-006): 不缓存 UID，device_sn 可为空
-    auto mqtt = std::make_shared<tbox::tsp::test::MockMqttFacade>();
-    TspRelayService relay(mqtt);
-    YAML::Node catalog = YAML::Load(
-        "- route_id: fota.uplink\n"
-        "  topic_template: vehicle/{ecu_uid}/up/fota\n"
-        "  direction: UP\n  qos: 1\n  target: tsp.fota\n  mandatory: false\n");
-    EXPECT_TRUE(relay.initializeLocal("", "/tmp/tsp_relay_test_store", catalog));
-}
-#endif
 
 TEST_F(TspApplicationTest, InitializeIpcBindFailureRollsBack) {
     // socket 路径位于 /dev/null 之下，bind 必然失败（ENOTDIR）；
@@ -299,19 +274,17 @@ TEST_F(TspApplicationTest, ExecuteReturnsAfterShutdownRequest) {
 }
 
 // ============================================================
-// beginShutdown 后 relay 拒绝新上行（reject-only）
+// beginShutdown 后 relay 拒绝新 VehicleMessage exchange（reject-only，CR-005 §7.1）
 // ============================================================
 
-TEST_F(TspApplicationTest, BeginShutdownRejectsNewUplink) {
+TEST_F(TspApplicationTest, BeginShutdownRejectsNewExchange) {
     auto cf = makeConfig("valid");
     cleanup_paths_.push_back(cf.dir);
     TestableTspApplication app;
     ASSERT_TRUE(app.doLoadConfig(cf.dir));
     ASSERT_TRUE(app.doInitialize());
 
-    // 通过 FotaRelayInterface facade 验证 STOPPING 拒绝：直接构造一个 snapshot 上行。
-    // initialize 成功后 relay 已就绪；这里复用 app 内部 relay 不便直接访问，
-    // 改为验证 cleanup（含 beginShutdown）后再次 initialize 可恢复，确保停机路径不残留资源。
+    // 通过 cleanup（含 beginShutdown）验证停机路径不残留资源，随后可再次 initialize。
     app.doCleanup();
     EXPECT_FALSE(std::filesystem::exists(cf.socket_path));
     // 再次 initialize 应能成功（无残留 socket/线程/fd）

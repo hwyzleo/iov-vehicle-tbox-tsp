@@ -1,0 +1,56 @@
+// TBOX-TSP-DSN-CR-009: 通用车云消息公共 Envelope。
+//
+// VEH-PROTO 为协议文档 SSOT；各服务自备所需 proto（与 TBOX-SOMEIP-DSN-CR-008
+// "各服务自备所需 proto" 决策一致），以 VEH-PROTO 规范字段号/语义为准。
+// 本文件定义 TBOX-TSP 只解码的公共 Envelope：
+//   - payload(10) 承载不透明 bytes（vehicle.fota.v1.* 业务 payload），TSP 只做
+//     长度/资源准入，绝不解析 Task/Consent/Package/Execution/Control/Log/Policy。
+//   - 字段号固定为设计冻结值（request_id=1 ... trace_context=16），一经发布
+//     不得改号；TSP 不维护本地镜像结构。
+//   - 禁止在 Envelope 外重复定义 payload_bytes / PayloadType / 业务身份。
+//   - TSP 解析后按原 bytes 重序列化（未知兼容字段由 Proto 解析/重序列化保留）。
+//
+// 与 VEH-PROTO、CGW-FOTA、TBOX-SOMEIP 和云端以同一 release-set / golden payload
+// 验证（CR-009 §测试矩阵）。本文件不得私改 VEH-PROTO 同名契约语义。
+
+syntax = "proto3";
+
+package vehicle.common.v1;
+
+option cc_enable_arenas = true;
+
+// 消息方向/形态。
+enum MessageKind {
+  MESSAGE_KIND_UNSPECIFIED = 0;
+  MESSAGE_KIND_REQUEST = 1;    // 请求
+  MESSAGE_KIND_RESPONSE = 2;   // 响应
+  MESSAGE_KIND_EVENT = 3;      // 下行事件/单向事件
+}
+
+// 跨 CGW、TBOX 与云端的调用链关联（非业务身份/幂等身份/安全凭据）。
+message TraceContext {
+  string trace_id = 1;
+  optional string parent_span_id = 2;
+  optional string trace_flags = 3;
+}
+
+// 传输层公共 Envelope。
+message VehicleMessageEnvelope {
+  string request_id = 1;                // 业务请求标识（跨一次业务操作的多个传输消息保持不变）
+  int64  timestamp_ms = 2;              // 消息创建时间，Unix epoch milliseconds
+  string protocol_version = 3;          // Envelope/车云消息协议版本，如 "fota-v1"
+  string device_id = 4;                 // 设备标识
+  string vin = 5;                       // VIN（敏感标识，仅协议承载，不进日志原文）
+  optional string vehicle_task_id = 6;  // 关联 VehicleTask（FOTA 长流程）
+  optional string execution_id = 7;     // 关联 Execution（安装阶段）
+  optional string idempotency_key = 8;  // 写操作/可重试业务操作稳定幂等身份
+  string payload_type = 9;              // fully-qualified 业务消息类型，如 "vehicle.fota.v1.TaskCheckRequest"
+  bytes  payload = 10;                  // payload_type 指定消息的原始序列化 bytes
+
+  string message_id = 11;               // 每条传输消息唯一标识；RESPONSE correlation_id 指向请求 message_id
+  optional string correlation_id = 12;  // 响应关联 ID；EVENT 仅在明确关联时填写
+  MessageKind message_kind = 13;        // REQUEST/RESPONSE/EVENT；UNSPECIFIED 不得作为有效生产消息
+  string service = 14;                  // 稳定版本无关业务域标识，FOTA 固定为 "vehicle.fota"
+  optional int64 expire_at_ms = 15;     // 绝对过期时间（ms since epoch）；存在且已到则拒绝
+  optional TraceContext trace_context = 16;  // 调用链关联
+}

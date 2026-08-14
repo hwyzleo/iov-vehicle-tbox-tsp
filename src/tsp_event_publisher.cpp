@@ -1,4 +1,4 @@
-// TBOX-TSP 下行事件推送器实现 (CR-003 §5, §6)
+// TBOX-TSP 下行事件推送器实现 (CR-003 §5, §6; CR-009 §EVENT 下行)
 
 #include "tsp_event_publisher.h"
 #include "tsp_ipc_protocol.h"
@@ -12,20 +12,22 @@ namespace tsp {
 
 namespace {
 
-std::string b64_encode(const std::vector<uint8_t>& data) {
-    return ::hwyz::Utils::base64_encode(
-        std::string(reinterpret_cast<const char*>(data.data()), data.size()));
+std::string b64_encode(const std::vector<std::byte>& data) {
+    std::string raw;
+    raw.reserve(data.size());
+    for (auto b : data) {
+        raw.push_back(static_cast<char>(static_cast<uint8_t>(b)));
+    }
+    return ::hwyz::Utils::base64_encode(raw);
 }
 
-std::string encode_fota_command(const FotaCommand& cmd) {
+std::string encode_vehicle_message(const VehicleMessageEvent& ev) {
+    // CR-009: wire 只承载单一 envelope_base64；service 仅作为 EVENT 推送分类键。
     nlohmann::json j;
-    j[ipc::field::COMMAND_ID]     = cmd.command_id;
-    j[ipc::field::DELIVERY_ID]    = cmd.delivery_id;
-    j[ipc::field::SCHEMA_VERSION] = cmd.schema_version;
-    j[ipc::field::CONTENT_TYPE]   = cmd.content_type;
-    j[ipc::field::PAYLOAD_B64]    = b64_encode(cmd.payload);
-    if (!cmd.trace_id.empty())   j[ipc::field::TRACE_ID]   = cmd.trace_id;
-    if (!cmd.request_id.empty()) j[ipc::field::REQUEST_ID] = cmd.request_id;
+    j[ipc::field::SERVICE]        = ev.service;
+    j[ipc::field::ENVELOPE_B64]   = b64_encode(ev.envelope_bytes);
+    if (!ev.trace_id.empty())   j[ipc::field::TRACE_ID]   = ev.trace_id;
+    if (!ev.request_id.empty()) j[ipc::field::REQUEST_ID] = ev.request_id;
     return j.dump();
 }
 
@@ -76,33 +78,46 @@ void TspEventPublisher::stop() {
     }
 }
 
-bool TspEventPublisher::publish_fota_command(const FotaCommand& cmd) {
+bool TspEventPublisher::publish_vehicle_message(
+    const std::string& service,
+    const std::vector<std::byte>& envelope_bytes,
+    const std::string& trace_id,
+    const std::string& request_id) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (queue_.size() >= queue_capacity_) {
-            // 队列满：按策略处理
+        size_t svc_count = service_count_[service];
+        if (svc_count >= queue_capacity_) {
+            // 该 service 队列满：按策略处理
             switch (policy_) {
                 case SlowSubscriberPolicy::kReject:
                     LogAdapter::relay().warn(
-                        "tsp.fota.downlink.queue_rejected",
+                        "tsp.vehicle_message.downlink.queue_rejected",
                         "下行队列满，拒绝入队",
                         {tbox::fw::log::Field("policy", tbox::fw::log::FieldValue::makeString(policy_str(policy_))),
-                         tbox::fw::log::Field("queue_size", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(queue_.size())))}
+                         tbox::fw::log::Field("service", tbox::fw::log::FieldValue::makeString(service)),
+                         tbox::fw::log::Field("queue_size", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(svc_count)))}
                     );
                     return false;
                 case SlowSubscriberPolicy::kDrop:
                 case SlowSubscriberPolicy::kDisconnect:
-                    // 丢弃新命令
+                    // 丢弃新事件
                     LogAdapter::relay().warn(
-                        "tsp.fota.downlink.queue_dropped",
-                        "下行队列满，丢弃新命令",
+                        "tsp.vehicle_message.downlink.queue_dropped",
+                        "下行队列满，丢弃新事件",
                         {tbox::fw::log::Field("policy", tbox::fw::log::FieldValue::makeString(policy_str(policy_))),
-                         tbox::fw::log::Field("queue_size", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(queue_.size())))}
+                         tbox::fw::log::Field("service", tbox::fw::log::FieldValue::makeString(service)),
+                         tbox::fw::log::Field("queue_size", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(svc_count)))}
                     );
                     return true;  // 不阻塞调用方，视为已接收但丢弃
             }
         }
-        queue_.push_back(cmd);
+        VehicleMessageEvent ev;
+        ev.service = service;
+        ev.envelope_bytes = envelope_bytes;
+        ev.trace_id = trace_id;
+        ev.request_id = request_id;
+        queue_.push_back(std::move(ev));
+        service_count_[service] = svc_count + 1;
     }
     cv_.notify_one();
     return true;
@@ -115,14 +130,14 @@ size_t TspEventPublisher::queue_size() const {
 
 void TspEventPublisher::worker_loop() {
     LogAdapter::relay().info(
-        "tsp.fota.downlink.publisher_started",
+        "tsp.vehicle_message.downlink.publisher_started",
         "下行事件推送 worker 启动",
-        {tbox::fw::log::Field("queue_capacity", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(queue_capacity_))),
+        {tbox::fw::log::Field("per_service_queue_capacity", tbox::fw::log::FieldValue::makeInt(static_cast<int64_t>(queue_capacity_))),
          tbox::fw::log::Field("policy", tbox::fw::log::FieldValue::makeString(policy_str(policy_)))}
     );
 
     while (true) {
-        FotaCommand cmd;
+        VehicleMessageEvent ev;
         {
             std::unique_lock<std::mutex> lock(mutex_);
             cv_.wait(lock, [this] { return !queue_.empty() || !running_.load(); });
@@ -133,23 +148,27 @@ void TspEventPublisher::worker_loop() {
             if (queue_.empty()) {
                 continue;
             }
-            cmd = std::move(queue_.front());
+            ev = std::move(queue_.front());
             queue_.pop_front();
+            auto it = service_count_.find(ev.service);
+            if (it != service_count_.end() && it->second > 0) {
+                --it->second;
+            }
         }
 
-        const uint32_t event_type = static_cast<uint32_t>(ipc::EventType::FOTA_COMMAND);
+        const uint32_t event_type = static_cast<uint32_t>(ipc::EventType::VEHICLE_MESSAGE);
 
         // 无订阅者：分类错误，不静默丢弃 (CR §4.3)
         if (has_subscriber_fn_ && !has_subscriber_fn_(event_type)) {
             LogAdapter::relay().warn(
-                "tsp.fota.downlink.no_subscriber",
+                "tsp.vehicle_message.downlink.no_subscriber",
                 "下行无订阅者",
-                {tbox::fw::log::Field("command_id", tbox::fw::log::FieldValue::makeString(cmd.command_id))}
+                {tbox::fw::log::Field("service", tbox::fw::log::FieldValue::makeString(ev.service))}
             );
             continue;
         }
 
-        std::string payload_json = encode_fota_command(cmd);
+        std::string payload_json = encode_vehicle_message(ev);
 
         bool sent = false;
         if (push_fn_) {
@@ -158,15 +177,15 @@ void TspEventPublisher::worker_loop() {
 
         if (!sent) {
             LogAdapter::relay().warn(
-                "tsp.fota.downlink.push_failed",
+                "tsp.vehicle_message.downlink.push_failed",
                 "下行事件推送失败",
-                {tbox::fw::log::Field("command_id", tbox::fw::log::FieldValue::makeString(cmd.command_id))}
+                {tbox::fw::log::Field("service", tbox::fw::log::FieldValue::makeString(ev.service))}
             );
         }
     }
 
     LogAdapter::relay().info(
-        "tsp.fota.downlink.publisher_stopped",
+        "tsp.vehicle_message.downlink.publisher_stopped",
         "下行事件推送 worker 停止"
     );
 }

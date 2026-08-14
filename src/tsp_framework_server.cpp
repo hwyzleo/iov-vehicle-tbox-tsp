@@ -1,7 +1,7 @@
-// TBOX-TSP framework-ipc Server 接线实现 (CR-003 §1, §3)
+// TBOX-TSP framework-ipc Server 接线实现 (CR-003 §1, §3; CR-009)
 
 #include "tsp_framework_server.h"
-#include "fota_relay_interface.h"
+#include "vehicle_message_gateway.h"
 #include "net_status_provider.h"
 #include "tsp_ipc_protocol.h"
 #include "log_adapter.h"
@@ -17,7 +17,7 @@ SlowSubscriberPolicy parse_slow_subscriber_policy(const std::string& s) {
 
 TspFrameworkServer::TspFrameworkServer(const std::string& socket_path,
                                        const ::tbox::fw::ipc::IpcConfig& ipc_config,
-                                       FotaRelayInterface* relay,
+                                       VehicleMessageRelayInterface* relay,
                                        NetStatusProvider* net_provider,
                                        uint32_t downlink_queue_size,
                                        SlowSubscriberPolicy slow_policy)
@@ -58,9 +58,9 @@ bool TspFrameworkServer::start() {
     auto request_handler = [server_ptr, dispatcher_ptr](
             uint32_t method_id, std::string_view params_json, int client_fd) -> std::string {
         switch (static_cast<ipc::MethodId>(method_id)) {
-            case ipc::MethodId::SUBSCRIBE_FOTA_COMMAND:
+            case ipc::MethodId::SUBSCRIBE_VEHICLE_MESSAGE:
                 server_ptr->add_subscription(client_fd,
-                    static_cast<uint32_t>(ipc::EventType::FOTA_COMMAND));
+                    static_cast<uint32_t>(ipc::EventType::VEHICLE_MESSAGE));
                 break;
             case ipc::MethodId::SUBSCRIBE_NET_STATUS:
                 server_ptr->add_subscription(client_fd,

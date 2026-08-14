@@ -1,13 +1,12 @@
-// TBOX-TSP-DSN-CR-005 §3, §12.1: TspApplication 实现。
+// TBOX-TSP-DSN-CR-005 §3, §12.1; CR-009 §16: TspApplication 实现。
 //
-// 组合根装配顺序（CR-005 §4, §12.2）：
+// 组合根装配顺序（CR-005 §4, §12.2, CR-009 §生命周期启动）：
 //   Config snapshot -> mqtt_client(init+start) ->
-//   TspRelayService(initializeLocal) -> NetStatusProvider ->
-//   TspFrameworkServer(construct) -> relay.set_event_publisher ->
+//   TspRelayService(initializeLocal, 注入 VehicleMessageGatewayConfig) ->
+//   NetStatusProvider -> TspFrameworkServer(construct) -> relay.set_event_publisher ->
 //   relay.startMqttIntegration -> framework_server.start
-// route 模式 (CR-006): 不获取 device_sn/不构造 prov_client；
-// legacy 模式: Config snapshot -> device_sn(PROV/配置) -> mqtt_client。
-// 清理顺序（§7.1, §12.4）：见头文件不变量注释。
+// CR-006/CR-009: 唯一 route 模式，不获取 device_sn、不构造 prov_client。
+// 清理顺序（§7.1, §12.4, §16.4）：见头文件不变量注释。
 
 #include "tsp_application.h"
 #include "tsp_build_config.h"
@@ -24,12 +23,6 @@
 #include "utils.h"
 
 #include <chrono>
-
-#if !TSP_MQTT_ROUTE_API
-#ifdef HAS_TBOX_PROV
-#include "tbox/prov/client.h"
-#endif
-#endif
 
 namespace tbox {
 namespace tsp {
@@ -90,58 +83,30 @@ bool TspApplication::initialize() {
                                                    "/tmp/tbox-mqtt.sock");
     std::string store_root = cfg->getString("common.store.root", "/var/tbox");
 
+    // ---- CR-009 §16.3: vehicle_message 资源/背压/allowlist 配置 ----
+    vehicle_message_config_.limits.allowed_services.clear();
+    // 首期固定 vehicle.fota（US-012）；后续新 service 经配置扩展。
+    vehicle_message_config_.limits.allowed_services.push_back("vehicle.fota");
+    vehicle_message_config_.limits.allowed_protocol_majors.clear();
+    vehicle_message_config_.limits.allowed_protocol_majors.push_back(
+        static_cast<uint32_t>(cfg->getInt("tsp.vehicle_message.allowed_protocol_major", 1)));
+    vehicle_message_config_.limits.max_envelope_bytes = static_cast<uint32_t>(
+        cfg->getInt("tsp.vehicle_message.max_envelope_bytes", 16384));
+    vehicle_message_config_.limits.max_payload_bytes = static_cast<uint32_t>(
+        cfg->getInt("tsp.vehicle_message.max_payload_bytes", 8192));
+    vehicle_message_config_.max_in_flight = static_cast<uint32_t>(
+        cfg->getInt("tsp.vehicle_message.max_in_flight", 64));
+    vehicle_message_config_.downlink_queue_capacity = static_cast<uint32_t>(
+        cfg->getInt("tsp.vehicle_message.downlink_queue_capacity", 256));
+    vehicle_message_config_.worker_count = static_cast<uint32_t>(
+        cfg->getInt("tsp.vehicle_message.worker_count", 1));
+    vehicle_message_config_.default_exchange_timeout_ms = static_cast<uint32_t>(
+        cfg->getInt("tsp.vehicle_message.default_exchange_timeout_ms", 2500));
+
     // 订阅目录节点：复杂嵌套序列，ImmutableConfigView 无通用数组访问，
     // 使用 ConfigManager::toYaml()（非 deprecated）取 tsp.subscriptions。
     YAML::Node catalog_node =
         hwyz::config::ConfigManager::instance().toYaml()["tsp"]["subscriptions"];
-
-    // ---- device_sn ----
-    // route 模式 (CR-006): 不构造 prov_client、不缓存 ecu_uid、不拼装完整 Topic，
-    //   device_sn 留空，TspRelayService/FotaHandler 在 route 模式忽略它。
-    // legacy 模式 (deprecated): 从 PROV/配置获取 device_sn 用于 Topic 拼装。
-    std::string device_sn;
-#if !TSP_MQTT_ROUTE_API
-#ifdef HAS_TBOX_PROV
-    try {
-        tbox::prov::ProvClient prov_client("/tmp/tbox-prov.sock");
-        if (prov_client.connect()) {
-            auto binding = prov_client.read_binding();
-            if (!binding.ecu_uid.empty()) {
-                device_sn = binding.ecu_uid;
-                LogAdapter::application().info(
-                    "tsp.prov.sn_obtained", "从 TBOX-PROV 获取设备序列号", {
-                        {"device_sn",
-                         tbox::fw::log::FieldValue::makeString(device_sn),
-                         tbox::fw::log::Sensitivity::Identifier}
-                    });
-            } else {
-                LogAdapter::application().warn(
-                    "tsp.prov.empty_uid", "TBOX-PROV 返回空的 ECU UID");
-            }
-            prov_client.disconnect();
-        } else {
-            LogAdapter::application().warn(
-                "tsp.prov.connect_failed", "无法连接到 TBOX-PROV 服务");
-        }
-    } catch (const std::exception& e) {
-        LogAdapter::application().error(
-            "tsp.prov.exception", "从 TBOX-PROV 获取设备序列号异常", {
-                {"error", tbox::fw::log::FieldValue::makeString(e.what())}
-            });
-    }
-#endif
-    if (device_sn.empty()) {
-        device_sn = cfg->getString("tsp.device-sn", "");
-    }
-    if (device_sn.empty()) {
-        device_sn = hwyz::Utils::global_read_string(hwyz::global_key_t::TBOX_SN);
-    }
-    if (device_sn.empty()) {
-        LogAdapter::application().error(
-            "tsp.device_sn.missing", "device_sn 未配置");
-        return false;
-    }
-#endif  // !TSP_MQTT_ROUTE_API
 
     // ---- a. mqtt_client（CR-003 §1: TSP 对 MQTT 只使用 tbox::mqtt_client）----
     mqtt_client_ = std::make_shared<MqttClientAdapter>(mqtt_socket_path);
@@ -161,9 +126,10 @@ bool TspApplication::initialize() {
     }
     init_stage_ = InitStage::MqttClientReady;
 
-    // ---- b. TspRelayService 业务聚合（注入 MqttFacade&）----
+    // ---- b. TspRelayService 业务聚合（注入 MqttFacade& 与 gateway 配置）----
     relay_service_ = std::make_unique<TspRelayService>(mqtt_client_);
-    if (!relay_service_->initializeLocal(device_sn, store_root, catalog_node)) {
+    if (!relay_service_->initializeLocal(store_root, catalog_node,
+                                         vehicle_message_config_)) {
         LogAdapter::application().error(
             "tsp.application.relay_init_failed",
             "TspRelayService initializeLocal 失败");
@@ -176,17 +142,17 @@ bool TspApplication::initialize() {
         NetStatusProviderFactory::ProviderType::MOCK);
 
     // ---- d. TspFrameworkServer（Dispatcher + EventPublisher + IPC Server）----
-    //        依赖 TspRelayService facade（FotaRelayInterface*），不访问 Application。
+    //        依赖 TspRelayService facade（VehicleMessageRelayInterface*），不访问 Application。
     framework_server_ = std::make_unique<TspFrameworkServer>(
         tsp_socket_path_, ipc_config_,
-        relay_service_.get(),          // FotaRelayInterface
+        relay_service_.get(),          // VehicleMessageRelayInterface
         net_status_provider_.get(),
         downlink_queue_size_, slow_subscriber_policy_);
 
-    // ---- e. 接线：FOTA 下行经 EventPublisher 推送 ----
+    // ---- e. 接线：EVENT 下行经 EventPublisher 推送 ----
     relay_service_->set_event_publisher(framework_server_->event_publisher());
 
-    // ---- f. MQTT 集成启动（提交快照、订阅下行、恢复 timer）----
+    // ---- f. MQTT 集成启动（提交快照、订阅下行、启动 gateway、恢复 timer）----
     if (!relay_service_->startMqttIntegration()) {
         LogAdapter::application().error(
             "tsp.application.mqtt_integration_failed",
@@ -249,16 +215,16 @@ int TspApplication::execute() {
 }
 
 // ============================================================
-// 清理（幂等有序停机，CR-005 §7.1, §12.4）
+// 清理（幂等有序停机，CR-005 §7.1, §12.4, CR-009 §生命周期停止）
 // ============================================================
 
 void TspApplication::cleanup() {
-    // 1. Quiesce：relay 进入 STOPPING，reject-only，拒绝新 FOTA 上行/注册
+    // 1. Quiesce：relay 进入 STOPPING，reject-only，拒绝新 VehicleMessage exchange/注册
     if (relay_service_) {
         relay_service_->beginShutdown();
     }
     // 2-5. 停止 relay 业务（停新 publish/重试/timer、取消下行 callback、
-    //      收敛 accepted/unknown、持久化 generation/dedup/receipt）
+    //      in-flight 收敛为 Stopping/Unknown、持久化 generation/dedup/receipt）
     if (relay_service_) {
         relay_service_->stop();
     }

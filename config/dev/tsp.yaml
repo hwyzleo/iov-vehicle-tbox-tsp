@@ -46,6 +46,17 @@ tsp:
   mqtt:
     socket_path: /tmp/tbox-mqtt.sock
 
+  # 通用 VehicleMessage 网关 (TBOX-TSP-DSN-CR-009 §16.3) -- 开发环境较小资源上限
+  vehicle_message:
+    allowed_services: [vehicle.fota]
+    allowed_protocol_major: 1
+    max_envelope_bytes: 16384
+    max_payload_bytes: 8192
+    max_in_flight: 64
+    downlink_queue_capacity: 256
+    worker_count: 1
+    default_exchange_timeout_ms: 2500
+
   # 业务订阅目录 (CR-004 §11.1) -- TSP 业务 Topic 唯一事实来源
   # Topic 保存模板，不固化设备实例值；MQTT 配置不得复制这些业务条目。
   subscriptions:

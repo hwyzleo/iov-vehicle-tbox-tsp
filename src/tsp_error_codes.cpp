@@ -7,8 +7,8 @@ const char* error_code_to_string(TspErrorCode code) {
     switch (code) {
         case TspErrorCode::SUCCESS:               return "SUCCESS";
         case TspErrorCode::PUBLISH_FAILED:        return "TBOX-TSP-1001: 上行发布失败";
-        case TspErrorCode::PAYLOAD_PARSE_FAILED:  return "TBOX-TSP-1002: 下行payload解析失败";
-        case TspErrorCode::DEDUP_HIT:             return "TBOX-TSP-1003: 去重命中";
+        case TspErrorCode::PAYLOAD_PARSE_FAILED:  return "TBOX-TSP-1002: Envelope/Route/方向校验失败";
+        case TspErrorCode::RESPONSE_CONFLICT:     return "TBOX-TSP-1003: 重复/迟到响应或消息身份冲突";
         case TspErrorCode::ROUTE_REGISTER_FAILED: return "TBOX-TSP-1004: 路由注册失败";
         case TspErrorCode::SUBSCRIPTION_INVALID:         return "TBOX-TSP-1005: 业务订阅目录/快照无效";
         case TspErrorCode::SUBSCRIPTION_REGISTER_FAILED: return "TBOX-TSP-1006: 订阅快照注册失败";

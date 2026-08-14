@@ -1,12 +1,21 @@
-// TBOX-TSP 公共 DTO (CR-003 §4, §5, SPEC §5.2)
+// TBOX-TSP 公共 DTO (TBOX-TSP-DSN-CR-009 §Client 与 IPC 契约, SPEC §5.2)
 //
-// 本头由 daemon (TspIpcDispatcher/TspEventPublisher) 与 client SDK
-// (tbox::tsp::TspClient) 共享，构成双方的 protocol contract。
+// 本头由 daemon (TspIpcDispatcher/TspEventPublisher/VehicleMessageGateway) 与
+// client SDK (tbox::tsp::TspClient) 共享，构成双方的 protocol contract。
 // 调用方不接触 method_id、JSON/base64、socket。
+//
+// CR-009：旧 FOTA snapshot/command DTO（FotaSnapshot/FotaCommand/RelayStatus/
+// ReportResult）已删除；唯一业务载体为单一序列化
+// vehicle.common.v1.VehicleMessageEnvelope（payload 保持不透明）。
+// tbox::tsp_client 只暴露通用 exchange/subscribe，不暴露 FOTA 生成类型。
 
 #pragma once
 
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -14,74 +23,67 @@ namespace tbox {
 namespace tsp {
 
 // ============================================================
-// 上行：FOTA 版本清单快照 (CR-003 §4)
+// 通用车云消息（CR-009 §Client 与 IPC 契约）
 // ============================================================
-struct FotaSnapshot {
-    uint32_t snapshot_seq = 0;       // 幂等键之一
-    std::string msg_id;              // 幂等键之二 / IPC 重试与查询关联键
-    std::string content_type = "application/x-protobuf";
-    std::vector<uint8_t> payload;    // 原始二进制（wire 层 base64，不进日志）
-    std::string trace_id;            // 合法且长度受限的上行关联标识
-    std::string request_id;
+// 单一序列化 vehicle.common.v1.VehicleMessageEnvelope 的字节；业务 bytes 位于
+// payload=10，本层保持不透明。wire 只对 envelope_bytes 做一次 base64。
+struct VehicleMessage {
+    std::vector<std::byte> envelope_bytes;
 };
 
-// ============================================================
-// 下行：FOTA 云端命令 (CR-003 §5)
-// ============================================================
-struct FotaCommand {
-    std::string command_id;          // 业务幂等键
-    std::string delivery_id;         // 投递幂等键（断线重放判定）
-    std::string schema_version;
-    std::string content_type = "application/x-protobuf";
-    std::vector<uint8_t> payload;    // 原始二进制（wire 层 base64）
-    std::string trace_id;
-    std::string request_id;
+// 传输结果（CR-009 §错误与重试 / SPEC §16.4）：
+// Accepted 不等于 MQTT PUBACK 或 FOTA 业务成功；value 仅在 TSP 收到对应业务
+// RESPONSE Envelope 时存在。
+enum class TransportOutcome : uint8_t {
+    Accepted = 0,        // 已受理并完成业务 RESPONSE（value 为 RESPONSE Envelope）
+    Rejected,            // 拒绝（TTL 过期、allowlist/容量/方向拒绝等）
+    Timeout,             // 已由 MQTT 接受但业务 RESPONSE 超时
+    Unknown,             // 结果不确定（MQTT 投递结果未知/响应丢失）
+    Unavailable,         // MQTT route/能力不可用（DEGRADED）
+    VersionMismatch,     // 协议/能力版本不兼容（不走 legacy fallback）
+    PayloadTooLarge,     // 超出资源上限（不截断、不分片、不落盘）
+    ProtocolError,       // Envelope/方向/route/关联错误
+    Stopping             // 服务停止中，拒绝新请求
 };
 
-// ============================================================
-// 中继状态 (CR-003 §2, SPEC §5.2)
-// ============================================================
-enum class RelayState : uint8_t {
-    UNKNOWN = 0,
-    ACCEPTED,    // TSP 已校验并由 MQTT daemon 接管（≠ Broker PUBACK）
-    PUBLISHED,   // MQTT daemon 已发送
-    ACKED,       // Broker 已 PUBACK
-    FAILED       // 失败
-};
-
-inline const char* relay_state_to_string(RelayState s) {
-    switch (s) {
-        case RelayState::UNKNOWN:   return "UNKNOWN";
-        case RelayState::ACCEPTED:  return "ACCEPTED";
-        case RelayState::PUBLISHED: return "PUBLISHED";
-        case RelayState::ACKED:     return "ACKED";
-        case RelayState::FAILED:    return "FAILED";
+inline const char* transport_outcome_to_string(TransportOutcome o) {
+    switch (o) {
+        case TransportOutcome::Accepted:        return "Accepted";
+        case TransportOutcome::Rejected:        return "Rejected";
+        case TransportOutcome::Timeout:         return "Timeout";
+        case TransportOutcome::Unknown:         return "Unknown";
+        case TransportOutcome::Unavailable:     return "Unavailable";
+        case TransportOutcome::VersionMismatch: return "VersionMismatch";
+        case TransportOutcome::PayloadTooLarge: return "PayloadTooLarge";
+        case TransportOutcome::ProtocolError:   return "ProtocolError";
+        case TransportOutcome::Stopping:        return "Stopping";
         default: return "?";
     }
 }
 
-struct RelayStatus {
-    RelayState state = RelayState::UNKNOWN;
-    std::string msg_id;
-    uint32_t snapshot_seq = 0;
-    int32_t error_code = 0;          // TBOX-TSP-10xx 业务状态码
-    std::string last_error;
+// 调用选项（CR-009 §Client 与 IPC 契约）
+struct ExchangeOptions {
+    std::chrono::milliseconds timeout{2500};     // 等待业务 RESPONSE 的 deadline（须 < SOME/IP Method deadline）
+    std::size_t max_response_bytes = 16384;      // 业务 RESPONSE Envelope 上限
 };
 
-// ============================================================
-// 上行发布结果语义 (CR-003 §4)
-// ============================================================
-enum class PublishOutcome : uint8_t {
-    ACCEPTED,   // TSP 已校验并经 mqtt_client 接管
-    UNKNOWN     // 响应丢失，仅可复用相同 msg_id 查询/单次重试
+// 调用上下文（链路关联；非业务身份）
+struct CallContext {
+    std::string trace_id;     // 合法且长度受限的链路关联标识（原样传播）
+    std::string request_id;   // 单次中继请求标识
 };
 
-struct ReportResult {
-    bool accepted = false;                       // TSP 已校验并由 MQTT daemon 接管
-    PublishOutcome outcome = PublishOutcome::ACCEPTED;
-    int32_t error_code = 0;                      // TBOX-TSP-10xx
-    std::string msg_id;                          // 回显，用于 unknown 时查询/重试
+// 通用交换结果（CR-009 §Client 与 IPC 契约）
+template <typename T>
+struct TransportResult {
+    TransportOutcome outcome = TransportOutcome::Unknown;
+    std::optional<T> value;            // 仅 Accepted 且存在业务 RESPONSE 时非空
+    int32_t error_code = 0;            // TBOX-TSP-10xx 业务状态码（0 = 无）
+    std::string error;                 // 受控摘要（不记录完整 Envelope/payload/身份）
 };
+
+// 下行 EVENT 回调：携带原始序列化 Envelope，TSP 直接推送。
+using VehicleMessageHandler = std::function<void(const VehicleMessage&)>;
 
 } // namespace tsp
 } // namespace tbox

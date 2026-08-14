@@ -2,33 +2,24 @@
 #pragma once
 
 #include "mqtt_facade.h"
-#include "fota_relay_interface.h"
+#include "vehicle_message_gateway.h"
 #include "net_status_provider.h"
 #include "tbox/tsp/types.h"
 #include <vector>
 #include <mutex>
 #include <atomic>
+#include <condition_variable>
 
 namespace tbox {
 namespace tsp {
 namespace test {
 
 // ============================================================
-// MockMqttFacade -- 记录 publish/registerRoute/subscribe 调用，
-// 可配置 publish 返回结果；持有 subscribe 回调以便测试投递下行。
+// MockMqttFacade -- 记录 publishRoute/subscribeRoutedDownlink/快照调用，
+// 可配置 publishRoute 返回结果；持有 routed downlink 回调以便测试投递下行。
 // ============================================================
 class MockMqttFacade : public MqttFacade {
 public:
-    struct PublishCall {
-        std::string msg_id;
-        std::string topic;
-        std::vector<uint8_t> payload;
-        int qos = 0;
-        std::string content_type;
-        std::string trace_id;
-        std::string request_id;
-    };
-
     struct PublishRouteCall {
         std::string owner;
         std::string route_id;
@@ -40,36 +31,19 @@ public:
         std::string request_id;
     };
 
-    // 配置 publish 返回结果
-    MqttPublishResult publish_result{true, PublishOutcome::ACCEPTED};
-    // 配置 publishRoute 返回结果 (CR-006)
-    MqttPublishResult publish_route_result{true, PublishOutcome::ACCEPTED};
+    // 配置 publishRoute 返回结果
+    MqttPublishResult publish_route_result{true, MqttDeliveryOutcome::Accepted};
     // 配置 replaceSubscriptionSnapshot 返回结果 (CR-004)
     ReplaceSnapshotResult snapshot_result;
     // 连接状态（可由测试切换以模拟断/连, CR-004 §7）
     mutable bool connected = true;
+    // 是否支持 routed downlink（subscribeRoutedDownlink 返回结果）
+    bool routed_downlink_supported = true;
 
     bool initialize() override { return true; }
     bool start() override { return true; }
     void stop() override {}
 
-    bool registerRoute(const std::string&, const std::string&, const std::string&, int) override {
-        return true;
-    }
-
-    MqttPublishResult publish(const std::string& msg_id,
-                              const std::string& topic,
-                              const std::vector<uint8_t>& payload,
-                              int qos,
-                              const std::string& content_type = "application/x-protobuf",
-                              const std::string& trace_id = "",
-                              const std::string& request_id = "") override {
-        std::lock_guard<std::mutex> lock(mutex_);
-        publish_calls_.push_back({msg_id, topic, payload, qos, content_type, trace_id, request_id});
-        return publish_result;
-    }
-
-    // CR-006 §5: route-based 上行发布
     MqttPublishResult publishRoute(const std::string& owner,
                                    const std::string& route_id,
                                    const std::string& msg_id,
@@ -83,19 +57,12 @@ public:
         return publish_route_result;
     }
 
-    bool subscribe(const std::string& topic, int /*qos*/, MessageCallback callback) override {
-        std::lock_guard<std::mutex> lock(mutex_);
-        sub_callback_ = std::move(callback);
-        return true;
-    }
-
-    // CR-006 §6: route-based 下行订阅
     bool subscribeRoutedDownlink(const std::string& owner,
                                  RoutedDownlinkCallback callback) override {
         std::lock_guard<std::mutex> lock(mutex_);
         routed_owner_ = owner;
         routed_callback_ = std::move(callback);
-        return true;
+        return routed_downlink_supported;
     }
 
     ReplaceSnapshotResult replaceSubscriptionSnapshot(
@@ -127,16 +94,6 @@ public:
 
     bool is_connected() const override { return connected; }
 
-    // 测试辅助：模拟收到下行消息（legacy full-topic）
-    void deliver_downlink(const std::string& topic, const std::vector<uint8_t>& payload) {
-        MessageCallback cb;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            cb = sub_callback_;
-        }
-        if (cb) cb(topic, payload);
-    }
-
     // 测试辅助：模拟收到 routed downlink 事件 (CR-006 §6)
     void deliver_routed_downlink(const RoutedDownlinkEvent& event) {
         RoutedDownlinkCallback cb;
@@ -145,11 +102,6 @@ public:
             cb = routed_callback_;
         }
         if (cb) cb(event);
-    }
-
-    std::vector<PublishCall> publish_calls() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return publish_calls_;
     }
 
     std::vector<PublishRouteCall> publish_route_calls() const {
@@ -168,9 +120,7 @@ public:
     }
 
     mutable std::mutex mutex_;
-    std::vector<PublishCall> publish_calls_;
     std::vector<PublishRouteCall> publish_route_calls_;
-    MessageCallback sub_callback_;
     std::string routed_owner_;
     RoutedDownlinkCallback routed_callback_;
     std::vector<SubscriptionSnapshot> snapshot_calls_;
@@ -178,34 +128,82 @@ public:
 };
 
 // ============================================================
-// MockFotaRelay -- 实现 FotaRelayInterface，记录 handle_uplink 调用
+// MockVehicleMessageRelay -- 实现 VehicleMessageRelayInterface。
+// 默认返回配置好的结果（非阻塞）；blocking 模式下记录 in-flight 请求并阻塞，
+// 直到测试调用 complete() 提供结果（用于 client<->server wire contract 测试）。
 // ============================================================
-class MockFotaRelay : public FotaRelayInterface {
+class MockVehicleMessageRelay : public VehicleMessageRelayInterface {
 public:
-    struct UplinkCall {
-        FotaSnapshot snapshot;
+    struct ExchangeCall {
+        VehicleMessage request;
+        ExchangeOptions options;
+        CallContext ctx;
     };
 
-    ReportResult uplink_result{true, PublishOutcome::ACCEPTED, 0, ""};
-    RelayStatus status_result{};
-    bool uplink_called = false;
-    int uplink_count = 0;
-    std::vector<UplinkCall> uplink_calls;
+    // 非阻塞模式默认结果
+    TransportResult<VehicleMessage> default_result;
+    // blocking 模式开关
+    bool blocking = false;
 
-    ReportResult handle_uplink(const FotaSnapshot& snapshot) override {
-        uplink_called = true;
-        uplink_count++;
-        uplink_calls.push_back({snapshot});
-        ReportResult r = uplink_result;
-        r.msg_id = snapshot.msg_id;
-        return r;
+    TransportResult<VehicleMessage> exchange(
+        const VehicleMessage& request,
+        const ExchangeOptions& options,
+        const CallContext& ctx) override {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            calls_.push_back({request, options, ctx});
+        }
+        if (!blocking) {
+            return default_result;
+        }
+        // blocking：等待测试 complete()
+        std::unique_lock<std::mutex> lk(mutex_);
+        cv_.wait(lk, [this] { return completed_ || cancelled_.load(); });
+        if (cancelled_.load()) {
+            TransportResult<VehicleMessage> r;
+            r.outcome = TransportOutcome::Stopping;
+            return r;
+        }
+        return pending_result_;
     }
 
-    RelayStatus get_relay_status(const std::string& msg_id) override {
-        RelayStatus s = status_result;
-        s.msg_id = msg_id;
-        return s;
+    // blocking 模式：为下一个/当前 in-flight 请求提供结果并唤醒
+    void complete(TransportResult<VehicleMessage> result) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pending_result_ = std::move(result);
+            completed_ = true;
+        }
+        cv_.notify_all();
     }
+
+    void reset_blocking() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        completed_ = false;
+        cancelled_ = false;
+    }
+
+    void cancel_waiting() {
+        cancelled_.store(true);
+        cv_.notify_all();
+    }
+
+    int call_count() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return static_cast<int>(calls_.size());
+    }
+
+    ExchangeCall last_call() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return calls_.back();
+    }
+
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    std::vector<ExchangeCall> calls_;
+    TransportResult<VehicleMessage> pending_result_;
+    bool completed_ = false;
+    std::atomic<bool> cancelled_{false};
 };
 
 // ============================================================

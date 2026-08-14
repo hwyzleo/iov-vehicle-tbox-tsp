@@ -1,10 +1,10 @@
-// TBOX-TSP-DSN-CR-005 §3, §12.1: TspApplication 进程级组合根。
+// TBOX-TSP-DSN-CR-005 §3, §12.1; CR-009 §16: TspApplication 进程级组合根。
 //
 // 继承 hwyz::Application，统一编排配置加载、framework-log 初始化、信号安装、
 // 长驻执行与最终 flush；装配并释放 MqttClientAdapter / TspRelayService（业务聚合）/
 // TspFrameworkServer（Dispatcher + EventPublisher + IPC Server）/ NetStatusProvider。
 //
-// 生命周期不变量（CR-005 §7.1, §12.4）：
+// 生命周期不变量（CR-005 §7.1, §12.4, CR-009 §生命周期）：
 //   cleanup 顺序 = relay.beginShutdown -> relay.stop -> framework_server.stop
 //                  -> relay.reset -> mqtt_client.stop/reset -> net_status.reset
 //   relay 必须先于 mqtt_client 销毁（relay 持有 MqttFacade& 引用）；
@@ -18,6 +18,7 @@
 #include "application.h"
 #include "ipc.h"
 #include "tsp_event_publisher.h"  // SlowSubscriberPolicy
+#include "vehicle_message_gateway.h"  // VehicleMessageGatewayConfig
 
 #include <memory>
 #include <string>
@@ -71,6 +72,7 @@ private:
     std::string tsp_socket_path_;
     uint32_t downlink_queue_size_ = 256;
     SlowSubscriberPolicy slow_subscriber_policy_ = SlowSubscriberPolicy::kDisconnect;
+    VehicleMessageGatewayConfig vehicle_message_config_;
 };
 
 } // namespace tsp

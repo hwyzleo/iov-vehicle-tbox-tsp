@@ -1,4 +1,4 @@
-// TBOX-TSP 公共错误码 (CR-003 §8, SPEC §7)
+// TBOX-TSP 公共错误码 (CR-003 §8, SPEC §7, CR-009 §错误与重试)
 //
 // 业务错误码 TBOX-TSP-10xx 嵌入 IPC 响应 JSON 的 status 字段；
 // framework-ipc 传输层错误码 FW-0301~0307 写入 ResponseHeader.status_code。
@@ -19,8 +19,8 @@ enum class TspErrorCode : int32_t {
 
     // 业务中继失败 (SPEC §7, TBOX-TSP-10xx)
     PUBLISH_FAILED = 1001,        // 上行发布失败（MQTT 不可用 / 超时）
-    PAYLOAD_PARSE_FAILED = 1002,  // 下行 payload 解析失败
-    DEDUP_HIT = 1003,             // 去重命中，已丢弃重复上报
+    PAYLOAD_PARSE_FAILED = 1002,  // Envelope/Route/方向校验失败
+    RESPONSE_CONFLICT = 1003,     // 重复/迟到响应或消息身份冲突
     ROUTE_REGISTER_FAILED = 1004, // 业务路由注册失败
     SUBSCRIPTION_INVALID = 1005,         // 业务订阅目录/快照无效 (CR-004 §10)
     SUBSCRIPTION_REGISTER_FAILED = 1006, // 订阅快照注册失败或持续无法恢复 (CR-004 §10)
@@ -31,7 +31,7 @@ enum class TspErrorCode : int32_t {
     FRAME_TOO_LARGE = 2002,
     NOT_INITIALIZED = 2003,
     CONNECTION_FAILED = 2004,     // 本机 IPC 传输失败（FW-03xx 映射）
-    UNKNOWN_OUTCOME = 2005,       // 响应丢失，需用相同 msg_id 查询/重试
+    UNKNOWN_OUTCOME = 2005,       // 响应丢失，结果未知
     NO_SUBSCRIBER = 2006,         // 下行无订阅者
     INTERNAL_ERROR = 9999
 };

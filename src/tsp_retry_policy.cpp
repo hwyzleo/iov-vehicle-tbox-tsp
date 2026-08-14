@@ -7,16 +7,14 @@ TspRetryPolicy::Category TspRetryPolicy::categorize(uint32_t method_id) {
     switch (static_cast<ipc::MethodId>(method_id)) {
         // 只读/幂等：允许一次重试
         case ipc::MethodId::GET_NET_STATUS:
-        case ipc::MethodId::GET_RELAY_STATUS:
             return Category::kReadOnly;
 
-        // 业务幂等：reportSoftwareInventory（同 msg_id/snapshot_seq 由 TSP 去重）
-        case ipc::MethodId::REPORT_SOFTWARE_INVENTORY:
-            return Category::kBusinessIdempotent;
-
-        // 一次性/订阅：禁止自动重放
+        // 一次性/订阅：禁止自动重放。
+        // EXCHANGE_VEHICLE_MESSAGE：CR-009 禁止不可见自动重试；重试由 CGW-FOTA
+        //   以原 request/idempotency 身份发起，TSP 侧同 message_id 复用会被拒绝。
+        case ipc::MethodId::EXCHANGE_VEHICLE_MESSAGE:
+        case ipc::MethodId::SUBSCRIBE_VEHICLE_MESSAGE:
         case ipc::MethodId::SUBSCRIBE_NET_STATUS:
-        case ipc::MethodId::SUBSCRIBE_FOTA_COMMAND:
             return Category::kOneShot;
 
         default:
@@ -26,7 +24,7 @@ TspRetryPolicy::Category TspRetryPolicy::categorize(uint32_t method_id) {
 
 bool TspRetryPolicy::should_retry(uint32_t method_id) {
     Category cat = categorize(method_id);
-    return cat == Category::kReadOnly || cat == Category::kBusinessIdempotent;
+    return cat == Category::kReadOnly;
 }
 
 } // namespace tsp

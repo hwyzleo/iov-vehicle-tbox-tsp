@@ -29,6 +29,25 @@ tsp:
   mqtt:
     socket_path: /tmp/tbox-mqtt.sock
 
+  # 通用 VehicleMessage 网关 (TBOX-TSP-DSN-CR-009 §16.3)
+  # 有界资源/allowlist 限制；尖括号值由实现/容量测试回填。
+  vehicle_message:
+    allowed_services: [vehicle.fota]      # service allowlist（首期固定 vehicle.fota）
+    allowed_protocol_major: 1            # 允许的 Envelope protocol major
+    max_envelope_bytes: 16384            # 序列化 Envelope 总长上限
+    max_payload_bytes: 8192              # payload(10) 上限（不截断/不分片/不落盘）
+    max_in_flight: 64                    # 并发 correlation 上限
+    downlink_queue_capacity: 256         # 每 service 下行队列容量
+    worker_count: 1                      # correlation 超时收敛 worker 数
+    default_exchange_timeout_ms: 2500    # 默认 exchange deadline（须 < SOME/IP Method deadline）
+
+  # Route 映射 (CR-009 §Route 映射)
+  routes:
+    vehicle.fota:
+      uplink: fota.uplink
+      downlink: fota.downlink
+      target: tsp.fota
+
   # 业务订阅目录 (CR-004 §11.1, CR-006 §13.3) -- TSP 业务 Topic 唯一事实来源
   # MQTT 配置不得复制这些业务条目；Topic 保存模板，不固化设备实例值。
   # digest 输入为 owner/route_id/topic_template/direction/qos/target/mandatory。

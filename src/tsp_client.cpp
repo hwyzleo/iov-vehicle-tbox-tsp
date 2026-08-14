@@ -1,7 +1,9 @@
-// TBOX-TSP 客户端 facade 实现 (CR-003 §7)
+// TBOX-TSP 客户端 facade 实现 (CR-003 §7; CR-009 §Client 与 IPC 契约)
 //
-// 内部使用 framework-ipc Client + TspRetryPolicy。
-// 不向业务调用方泄露 framework 异常类型：FW-03xx 统一映射为公开 client 错误。
+// 内部使用 framework-ipc Client。
+// CR-009：只暴露通用 exchange/subscribe；wire 只承载单一 Envelope bytes。
+// EXCHANGE_VEHICLE_MESSAGE 使用 callOnce（禁止不可见自动重试；重试由 CGW-FOTA
+// 以原 request/idempotency 身份发起）。不向业务调用方泄露 framework 异常类型。
 
 #include "tbox/tsp/client.h"
 #include "tsp_retry_policy.h"
@@ -17,26 +19,35 @@ namespace tsp {
 
 namespace {
 
-std::string b64_encode(const std::vector<uint8_t>& data) {
-    return ::hwyz::Utils::base64_encode(
-        std::string(reinterpret_cast<const char*>(data.data()), data.size()));
+std::string b64_encode_bytes(const std::vector<std::byte>& data) {
+    std::string raw;
+    raw.reserve(data.size());
+    for (auto b : data) {
+        raw.push_back(static_cast<char>(static_cast<uint8_t>(b)));
+    }
+    return ::hwyz::Utils::base64_encode(raw);
 }
 
-std::vector<uint8_t> b64_decode(const std::string& encoded) {
+std::vector<std::byte> b64_decode_bytes(const std::string& encoded) {
     std::string decoded = ::hwyz::Utils::base64_decode(encoded);
-    return std::vector<uint8_t>(decoded.begin(), decoded.end());
+    std::vector<std::byte> out(decoded.size());
+    for (size_t i = 0; i < decoded.size(); ++i) {
+        out[i] = static_cast<std::byte>(static_cast<uint8_t>(decoded[i]));
+    }
+    return out;
 }
 
-PublishOutcome parse_outcome(const std::string& s) {
-    return (s == "UNKNOWN") ? PublishOutcome::UNKNOWN : PublishOutcome::ACCEPTED;
-}
-
-RelayState parse_state(const std::string& s) {
-    if (s == "ACCEPTED")  return RelayState::ACCEPTED;
-    if (s == "PUBLISHED") return RelayState::PUBLISHED;
-    if (s == "ACKED")     return RelayState::ACKED;
-    if (s == "FAILED")    return RelayState::FAILED;
-    return RelayState::UNKNOWN;
+TransportOutcome parse_outcome(const std::string& s) {
+    if (s == "Accepted")        return TransportOutcome::Accepted;
+    if (s == "Rejected")        return TransportOutcome::Rejected;
+    if (s == "Timeout")         return TransportOutcome::Timeout;
+    if (s == "Unknown")         return TransportOutcome::Unknown;
+    if (s == "Unavailable")     return TransportOutcome::Unavailable;
+    if (s == "VersionMismatch") return TransportOutcome::VersionMismatch;
+    if (s == "PayloadTooLarge") return TransportOutcome::PayloadTooLarge;
+    if (s == "ProtocolError")   return TransportOutcome::ProtocolError;
+    if (s == "Stopping")        return TransportOutcome::Stopping;
+    return TransportOutcome::Unknown;
 }
 
 } // anonymous namespace
@@ -73,101 +84,80 @@ public:
         return {transport_ok, fw_status, response_json};
     }
 
-    ReportResult report_software_inventory(const FotaSnapshot& snapshot) {
-        const uint32_t method = static_cast<uint32_t>(ipc::MethodId::REPORT_SOFTWARE_INVENTORY);
+    TransportResult<VehicleMessage> exchange_vehicle_message(
+        const VehicleMessage& request,
+        const ExchangeOptions& options,
+        const CallContext& ctx) {
+        const uint32_t method = static_cast<uint32_t>(ipc::MethodId::EXCHANGE_VEHICLE_MESSAGE);
 
         nlohmann::json params;
-        params[ipc::field::SNAPSHOT_SEQ] = snapshot.snapshot_seq;
-        params[ipc::field::MSG_ID]       = snapshot.msg_id;
-        params[ipc::field::CONTENT_TYPE] = snapshot.content_type;
-        params[ipc::field::PAYLOAD_B64]  = b64_encode(snapshot.payload);
-        if (!snapshot.trace_id.empty())   params[ipc::field::TRACE_ID]   = snapshot.trace_id;
-        if (!snapshot.request_id.empty()) params[ipc::field::REQUEST_ID] = snapshot.request_id;
+        params[ipc::field::ENVELOPE_B64] = b64_encode_bytes(request.envelope_bytes);
+        params[ipc::field::TIMEOUT_MS] = static_cast<uint32_t>(options.timeout.count());
+        params[ipc::field::MAX_RESPONSE_BYTES] = static_cast<uint32_t>(options.max_response_bytes);
+        if (!ctx.trace_id.empty())   params[ipc::field::TRACE_ID]   = ctx.trace_id;
+        if (!ctx.request_id.empty()) params[ipc::field::REQUEST_ID] = ctx.request_id;
 
         auto [transport_ok, fw_status, response_json] = send_request(method, params.dump());
 
-        ReportResult r;
-        r.msg_id = snapshot.msg_id;
+        TransportResult<VehicleMessage> r;
 
         if (!transport_ok) {
-            // 传输失败：unknown outcome，仅可复用相同 msg_id 查询/单次重试
-            r.accepted = false;
-            r.outcome = PublishOutcome::UNKNOWN;
-            r.error_code = static_cast<int32_t>(TspErrorCode::UNKNOWN_OUTCOME);
+            // 传输失败：TSP client 不可达 -> Unavailable（不生成新业务身份重试）
+            r.outcome = TransportOutcome::Unavailable;
+            r.error_code = static_cast<int32_t>(map_fw_status(fw_status));
+            r.error = "transport_failed";
             return r;
         }
 
         // 解析业务状态
         try {
             auto j = nlohmann::json::parse(response_json);
+            r.outcome = parse_outcome(j.value(ipc::field::OUTCOME, "Unknown"));
             r.error_code = j.value(ipc::field::STATUS, 0);
-            r.accepted = j.value(ipc::field::ACCEPTED, false);
-            r.outcome = parse_outcome(j.value(ipc::field::OUTCOME, "ACCEPTED"));
-            if (j.contains(ipc::field::MSG_ID)) {
-                r.msg_id = j.value(ipc::field::MSG_ID, snapshot.msg_id);
+            r.error = j.value(ipc::field::ERROR, "");
+            std::string resp_b64 = j.value(ipc::field::ENVELOPE_B64, "");
+            if (!resp_b64.empty()) {
+                VehicleMessage resp;
+                resp.envelope_bytes = b64_decode_bytes(resp_b64);
+                r.value = std::move(resp);
             }
         } catch (...) {
-            r.accepted = false;
+            r.outcome = TransportOutcome::ProtocolError;
             r.error_code = static_cast<int32_t>(TspErrorCode::INTERNAL_ERROR);
+            r.error = "invalid_response";
         }
         return r;
     }
 
-    ::tbox::fw::ipc::Subscription subscribe_fota_command(FotaCommandCallback callback) {
-        const uint32_t method = static_cast<uint32_t>(ipc::MethodId::SUBSCRIBE_FOTA_COMMAND);
-        const uint32_t event  = static_cast<uint32_t>(ipc::EventType::FOTA_COMMAND);
-
-        auto wrapped = [cb = std::move(callback)](uint32_t /*event_type*/,
-                                                   std::string_view payload_json) {
-            FotaCommand cmd;
-            try {
-                auto j = nlohmann::json::parse(payload_json);
-                cmd.command_id     = j.value(ipc::field::COMMAND_ID, "");
-                cmd.delivery_id    = j.value(ipc::field::DELIVERY_ID, "");
-                cmd.schema_version = j.value(ipc::field::SCHEMA_VERSION, "");
-                cmd.content_type   = j.value(ipc::field::CONTENT_TYPE, "application/x-protobuf");
-                cmd.trace_id       = j.value(ipc::field::TRACE_ID, "");
-                cmd.request_id     = j.value(ipc::field::REQUEST_ID, "");
-                std::string b64 = j.value(ipc::field::PAYLOAD_B64, "");
-                if (!b64.empty()) cmd.payload = b64_decode(b64);
-            } catch (...) {
-                // 解析失败：不回调，避免向业务投递坏帧
-                return;
-            }
-            if (cb) cb(cmd);
-        };
-
-        return fw_client_->subscribe(method, event, wrapped);
-    }
-
-    RelayStatus get_relay_status(const std::string& msg_id) {
-        const uint32_t method = static_cast<uint32_t>(ipc::MethodId::GET_RELAY_STATUS);
+    ::tbox::fw::ipc::Subscription subscribe_vehicle_message(
+        std::string_view service, VehicleMessageHandler handler) {
+        const uint32_t method = static_cast<uint32_t>(ipc::MethodId::SUBSCRIBE_VEHICLE_MESSAGE);
+        const uint32_t event  = static_cast<uint32_t>(ipc::EventType::VEHICLE_MESSAGE);
 
         nlohmann::json params;
-        params[ipc::field::MSG_ID] = msg_id;
+        params[ipc::field::SERVICE] = std::string(service);
 
-        auto [transport_ok, fw_status, response_json] = send_request(method, params.dump());
+        auto wrapped = [svc = std::string(service), cb = std::move(handler)](
+                           uint32_t /*event_type*/, std::string_view payload_json) {
+            // 解析失败不回调，避免向业务投递坏帧
+            try {
+                auto j = nlohmann::json::parse(payload_json);
+                // 分类键不一致（理论上按订阅事件推送，防御式忽略）
+                if (!j.value(ipc::field::SERVICE, "").empty() &&
+                    j.value(ipc::field::SERVICE, "") != svc) {
+                    return;
+                }
+                std::string b64 = j.value(ipc::field::ENVELOPE_B64, "");
+                if (b64.empty()) return;
+                VehicleMessage msg;
+                msg.envelope_bytes = b64_decode_bytes(b64);
+                if (cb) cb(msg);
+            } catch (...) {
+                return;
+            }
+        };
 
-        RelayStatus s;
-        s.msg_id = msg_id;
-        if (!transport_ok) {
-            s.state = RelayState::UNKNOWN;
-            s.error_code = static_cast<int32_t>(map_fw_status(fw_status));
-            s.last_error = "transport failed";
-            return s;
-        }
-        try {
-            auto j = nlohmann::json::parse(response_json);
-            s.error_code = j.value(ipc::field::STATUS, 0);
-            s.state = parse_state(j.value(ipc::field::STATE, "UNKNOWN"));
-            s.msg_id = j.value(ipc::field::MSG_ID, msg_id);
-            s.snapshot_seq = j.value(ipc::field::SNAPSHOT_SEQ, 0u);
-            s.last_error = j.value(ipc::field::LAST_ERROR, "");
-        } catch (...) {
-            s.state = RelayState::UNKNOWN;
-            s.error_code = static_cast<int32_t>(TspErrorCode::INTERNAL_ERROR);
-        }
-        return s;
+        return fw_client_->subscribe(method, event, params.dump(), std::move(wrapped));
     }
 
 private:
@@ -189,16 +179,16 @@ bool TspClient::connect() { return impl_->connect(); }
 void TspClient::disconnect() { impl_->disconnect(); }
 bool TspClient::is_connected() const { return impl_->is_connected(); }
 
-ReportResult TspClient::reportSoftwareInventory(const FotaSnapshot& snapshot) {
-    return impl_->report_software_inventory(snapshot);
+TransportResult<VehicleMessage> TspClient::exchangeVehicleMessage(
+    const VehicleMessage& request,
+    const ExchangeOptions& options,
+    const CallContext& ctx) {
+    return impl_->exchange_vehicle_message(request, options, ctx);
 }
 
-::tbox::fw::ipc::Subscription TspClient::subscribeFotaCommand(FotaCommandCallback callback) {
-    return impl_->subscribe_fota_command(std::move(callback));
-}
-
-RelayStatus TspClient::getRelayStatus(const std::string& msg_id) {
-    return impl_->get_relay_status(msg_id);
+::tbox::fw::ipc::Subscription TspClient::subscribeVehicleMessage(
+    std::string_view service, VehicleMessageHandler handler) {
+    return impl_->subscribe_vehicle_message(service, std::move(handler));
 }
 
 } // namespace tsp
