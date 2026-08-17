@@ -179,7 +179,7 @@ TEST_F(SubscriptionIntegrationTest, FotaUplinkUsesCatalogRoute) {
     // 真实 gateway：按 catalog 稳定 route_id 上行，不展开 Topic/不缓存 UID
     VehicleMessageGatewayConfig cfg;
     cfg.limits.allowed_services = {"vehicle.fota"};
-    cfg.limits.allowed_protocol_majors = {1};
+    cfg.limits.allowed_protocol_versions = {"fota-v1"};
     cfg.default_exchange_timeout_ms = 200;
     VehicleMessageGateway gw(mqtt_);
     ASSERT_TRUE(gw.initialize(cfg));

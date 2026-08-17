@@ -66,10 +66,8 @@ fields:
           allowed_services:
             type: string_list
             required: true
-          allowed_protocol_major:
-            type: integer
-            min: 1
-            max: 255
+          allowed_protocol_version:
+            type: string
             required: true
           max_envelope_bytes:
             type: integer

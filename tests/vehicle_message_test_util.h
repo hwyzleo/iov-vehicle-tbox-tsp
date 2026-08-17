@@ -51,7 +51,7 @@ inline std::vector<std::byte> make_request_envelope(
     VehicleMessageEnvelope env;
     env.set_request_id(request_id);
     env.set_timestamp_ms(0);
-    env.set_protocol_version("1.0");
+    env.set_protocol_version("fota-v1");
     env.set_device_id("dev-1");
     env.set_vin("VIN1");
     env.set_idempotency_key("idem-" + message_id);
@@ -76,7 +76,7 @@ inline std::vector<std::byte> make_response_envelope(
     VehicleMessageEnvelope env;
     env.set_request_id("req-r");
     env.set_timestamp_ms(0);
-    env.set_protocol_version("1.0");
+    env.set_protocol_version("fota-v1");
     env.set_device_id("dev-1");
     env.set_vin("VIN1");
     env.set_payload_type("vehicle.fota.v1.FotaResponse");
@@ -99,7 +99,7 @@ inline std::vector<std::byte> make_event_envelope(
     VehicleMessageEnvelope env;
     env.set_request_id("req-e");
     env.set_timestamp_ms(0);
-    env.set_protocol_version("1.0");
+    env.set_protocol_version("fota-v1");
     env.set_device_id("dev-1");
     env.set_vin("VIN1");
     env.set_payload_type("vehicle.fota.v1.FotaEvent");

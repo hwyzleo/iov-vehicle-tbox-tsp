@@ -45,24 +45,7 @@ std::vector<std::byte> string_to_bytes(const std::string& s) {
     return out;
 }
 
-// 从 protocol_version 字符串提取 major（允许 "1" / "1.0" / "fota-v1" 等；
-// 取首个十进制前缀）。空或无法解析视为 major 缺失。
-bool parse_protocol_major(const std::string& version, uint32_t& major) {
-    if (version.empty()) return false;
-    size_t i = 0;
-    while (i < version.size() && std::isdigit(static_cast<unsigned char>(version[i]))) {
-        ++i;
-    }
-    if (i == 0) return false;
-    try {
-        major = static_cast<uint32_t>(std::stoul(version.substr(0, i)));
-        return true;
-    } catch (...) {
-        return false;
-    }
-}
-
-// payload_type 能力目录：vehicle.fota.v1.<MessageName> fully-qualified name。
+// payload_type 能力目录：vehicle.fota.v1.<MessageName> fully-qualified name.
 // TSP 只做 FQN 格式/能力门槛校验，不解释具体 FOTA 消息（US-012）。
 bool payload_type_in_capability(const std::string& service,
                                 const std::string& payload_type) {
@@ -89,7 +72,6 @@ struct VehicleMessageGateway::EnvelopeValidation {
         vehicle::common::v1::MESSAGE_KIND_UNSPECIFIED;
     std::string message_id;
     std::string correlation_id;
-    uint32_t protocol_major = 0;
     uint32_t payload_size = 0;
     bool expired = false;
 };
@@ -243,16 +225,11 @@ VehicleMessageGateway::validate_envelope(const std::vector<std::byte>& bytes,
         return v;
     }
 
-    // protocol major
-    if (!parse_protocol_major(env.protocol_version(), v.protocol_major)) {
+    // protocol_version：不透明版本串，按 SSOT allowlist 整串精确匹配（不解析数值 major）
+    const auto& versions = config_.limits.allowed_protocol_versions;
+    if (std::find(versions.begin(), versions.end(), env.protocol_version()) == versions.end()) {
         v.outcome = TransportOutcome::VersionMismatch;
-        v.reason = "protocol_major_missing";
-        return v;
-    }
-    const auto& majors = config_.limits.allowed_protocol_majors;
-    if (std::find(majors.begin(), majors.end(), v.protocol_major) == majors.end()) {
-        v.outcome = TransportOutcome::VersionMismatch;
-        v.reason = "protocol_major_unsupported";
+        v.reason = "protocol_version_unsupported";
         return v;
     }
 

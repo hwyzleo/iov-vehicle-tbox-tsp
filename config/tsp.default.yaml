@@ -33,7 +33,7 @@ tsp:
   # 有界资源/allowlist 限制；尖括号值由实现/容量测试回填。
   vehicle_message:
     allowed_services: [vehicle.fota]      # service allowlist（首期固定 vehicle.fota）
-    allowed_protocol_major: 1            # 允许的 Envelope protocol major
+    allowed_protocol_version: fota-v1   # 允许的 Envelope protocol_version（不透明串，整串匹配）
     max_envelope_bytes: 16384            # 序列化 Envelope 总长上限
     max_payload_bytes: 8192              # payload(10) 上限（不截断/不分片/不落盘）
     max_in_flight: 64                    # 并发 correlation 上限

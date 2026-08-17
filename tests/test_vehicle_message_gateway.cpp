@@ -27,7 +27,7 @@ namespace {
 VehicleMessageGatewayConfig test_config() {
     VehicleMessageGatewayConfig c;
     c.limits.allowed_services = {"vehicle.fota"};
-    c.limits.allowed_protocol_majors = {1};
+    c.limits.allowed_protocol_versions = {"fota-v1"};
     c.limits.max_envelope_bytes = 16384;
     c.limits.max_payload_bytes = 8192;
     c.max_in_flight = 64;

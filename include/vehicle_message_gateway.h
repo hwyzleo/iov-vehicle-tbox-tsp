@@ -40,7 +40,9 @@ class DownlinkRouteDispatcher;
 // 资源/allowlist 限制（tsp.vehicle_message.*；有界默认由实现/容量测试回填）
 struct VehicleMessageLimits {
     std::vector<std::string> allowed_services = {"vehicle.fota"};
-    std::vector<uint32_t> allowed_protocol_majors = {1};
+    // protocol_version 是不透明版本串（SSOT canonical，如 "fota-v1"）；按整串 allowlist
+    // 精确匹配，禁止从中解析数值 major（VEH-PROTO / iov-cloud-parent-proto SSOT）。
+    std::vector<std::string> allowed_protocol_versions = {"fota-v1"};
     uint32_t max_envelope_bytes = 16384;   // 序列化 Envelope 总长上限
     uint32_t max_payload_bytes = 8192;     // payload(10) 上限
 };

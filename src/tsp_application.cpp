@@ -87,9 +87,9 @@ bool TspApplication::initialize() {
     vehicle_message_config_.limits.allowed_services.clear();
     // 首期固定 vehicle.fota（US-012）；后续新 service 经配置扩展。
     vehicle_message_config_.limits.allowed_services.push_back("vehicle.fota");
-    vehicle_message_config_.limits.allowed_protocol_majors.clear();
-    vehicle_message_config_.limits.allowed_protocol_majors.push_back(
-        static_cast<uint32_t>(cfg->getInt("tsp.vehicle_message.allowed_protocol_major", 1)));
+    vehicle_message_config_.limits.allowed_protocol_versions.clear();
+    vehicle_message_config_.limits.allowed_protocol_versions.push_back(
+        cfg->getString("tsp.vehicle_message.allowed_protocol_version", "fota-v1"));
     vehicle_message_config_.limits.max_envelope_bytes = static_cast<uint32_t>(
         cfg->getInt("tsp.vehicle_message.max_envelope_bytes", 16384));
     vehicle_message_config_.limits.max_payload_bytes = static_cast<uint32_t>(
