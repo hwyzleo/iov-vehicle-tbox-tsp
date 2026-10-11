@@ -16,7 +16,10 @@
 
 #include "vehicle_message_gateway.h"
 #include "mqtt_facade.h"
+#include "sec_business_key_facade.h"
 #include "subscription_types.h"
+#include "v2c_key_provisioning_coordinator.h"
+#include "v2c_key_provisioning_store.h"
 
 #include "yaml-cpp/yaml.h"
 
@@ -43,9 +46,12 @@ public:
     // 初始化本地业务（不启动 MQTT transport）：
     //   加载并校验订阅目录、构造 store/registrar、构造并初始化 VehicleMessageGateway。
     // catalog_node 为 tsp.subscriptions 序列。失败返回 false 并清理已构造对象。
+    // CR-010: sec 非空时构造并初始化 V2cKeyProvisioningCoordinator。
     bool initializeLocal(const std::string& store_root,
                          const YAML::Node& catalog_node,
-                         const VehicleMessageGatewayConfig& gateway_config);
+                         const VehicleMessageGatewayConfig& gateway_config,
+                         std::shared_ptr<SecBusinessKeyFacade> sec = nullptr,
+                         const V2cKeyProvisioningConfig& keyprov_config = {});
 
     // MQTT 集成启动：提交 owner=tsp 完整快照、订阅下行、启动恢复注册 timer。
     // MQTT 暂不可用时进入 DEGRADED/退避，不阻塞（返回 true）。
@@ -76,6 +82,11 @@ private:
     std::shared_ptr<SubscriptionStore> store_;
     std::unique_ptr<MqttSubscriptionRegistrar> registrar_;
     std::unique_ptr<VehicleMessageGateway> gateway_;
+    // CR-010: V2C 初始密钥开通（sec 未注入时不构造）
+    std::shared_ptr<SecBusinessKeyFacade> sec_;
+    std::shared_ptr<V2cKeyProvisioningStore> keyprov_store_;
+    V2cKeyProvisioningConfig keyprov_config_;
+    std::unique_ptr<V2cKeyProvisioningCoordinator> keyprov_;
     std::atomic<bool> stopping_{false};
 };
 

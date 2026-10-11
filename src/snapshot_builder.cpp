@@ -23,12 +23,20 @@ std::vector<SubscriptionItem> sorted_by_route_id(std::vector<SubscriptionItem> i
 std::string SnapshotBuilder::serialize_item(const SubscriptionItem& item) const {
     // 规范化序列化：字段以 '|' 分隔，顺序固定。
     // mandatory 以 0/1 表达，保证布尔不因平台表达差异影响摘要。
+    // CR-015: enabled/readiness_scope/criticality 参与摘要（capability 开关变化即语义变化）。
+    std::string enabled_str = "-";
+    if (item.enabled.has_value()) {
+        enabled_str = *item.enabled ? "1" : "0";
+    }
     return item.route_id + "|" +
            item.topic_template + "|" +
            direction_to_string(item.direction) + "|" +
            std::to_string(static_cast<int>(item.qos)) + "|" +
            item.target + "|" +
-           (item.mandatory ? "1" : "0");
+           (item.mandatory ? "1" : "0") + "|" +
+           enabled_str + "|" +
+           item.readiness_scope + "|" +
+           subscription_criticality_to_string(item.criticality);
 }
 
 std::string SnapshotBuilder::compute_digest(const std::vector<SubscriptionItem>& items) const {

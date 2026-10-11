@@ -46,6 +46,27 @@ tsp:
   mqtt:
     socket_path: /tmp/tbox-mqtt.sock
 
+  # SEC daemon IPC socket (CR-010 §3.2)
+  sec:
+    socket_path: /tmp/tbox-sec.sock
+
+  # V2C 初始密钥开通（开发环境显式开启以验证 capability gate）
+  key_provisioning:
+    enabled: true
+    business_domain: V2C_COMM
+    certificate_profile: mqtt
+    purposes: [UPLINK_AEAD, DOWNLINK_AEAD]
+    route_up: keyprov.uplink
+    route_down: keyprov.downlink
+    request_timeout_ms: 10000
+    ack_timeout_ms: 10000
+    max_attempts_before_alert: 8
+    retry:
+      initial_ms: 500
+      max_ms: 30000
+      multiplier: 2.0
+      jitter: true
+
   # 通用 VehicleMessage 网关 (TBOX-TSP-DSN-CR-009 §16.3) -- 开发环境较小资源上限
   vehicle_message:
     allowed_services: [vehicle.fota]
@@ -72,3 +93,22 @@ tsp:
       qos: 1
       target: tsp.fota
       mandatory: true
+    # CR-015 capability-gated keyprov route（开发开启）
+    - route_id: keyprov.uplink
+      topic_template: vehicle/{ecu_uid}/up/keyprov
+      direction: UP
+      qos: 1
+      target: tsp.keyprov
+      mandatory: false
+      enabled: true
+      readiness_scope: security.keyprov
+      criticality: CAPABILITY_MANDATORY
+    - route_id: keyprov.downlink
+      topic_template: vehicle/{ecu_uid}/down/keyprov
+      direction: DOWN
+      qos: 1
+      target: tsp.keyprov
+      mandatory: false
+      enabled: true
+      readiness_scope: security.keyprov
+      criticality: CAPABILITY_MANDATORY

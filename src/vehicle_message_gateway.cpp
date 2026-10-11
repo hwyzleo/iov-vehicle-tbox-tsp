@@ -494,6 +494,23 @@ TransportResult<VehicleMessage> VehicleMessageGateway::exchange(
 }
 
 // ============================================================
+// CR-010 §3.1: 注册额外 owner=tsp 业务下行 handler
+// ============================================================
+void VehicleMessageGateway::register_downlink_handler(
+    const std::string& owner,
+    const std::string& route_id,
+    const std::string& target,
+    std::function<void(const RoutedDownlinkEvent&)> handler) {
+    if (!route_dispatcher_) {
+        LogAdapter::relay().warn(
+            "tsp.vehicle_message.downlink.register_failed",
+            "dispatcher 未就绪，下行 handler 注册失败");
+        return;
+    }
+    route_dispatcher_->register_handler(owner, route_id, target, std::move(handler));
+}
+
+// ============================================================
 // 下行：RESPONSE -> correlation；EVENT -> 订阅队列（CR-009 §EVENT 下行）
 // ============================================================
 void VehicleMessageGateway::handle_routed_downlink(const RoutedDownlinkEvent& event) {

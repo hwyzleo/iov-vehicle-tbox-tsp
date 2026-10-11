@@ -1,0 +1,227 @@
+syntax = "proto3";
+
+package security.keyprov.v1;
+
+option java_multiple_files = true;
+option java_package = "net.hwyz.iov.security.keyprov.v1";
+option java_outer_classname = "VehicleKeyProvisioningProto";
+
+// =============================================================================
+// security.keyprov.v1 - V2C 初始业务密钥开通 canonical wire
+//   (PAR-PROTO-REQ-CR-006 / PAR-PROTO-DSN-CR-006)
+// =============================================================================
+// SSOT：本文件是 TBOX 首次注册激活 V2C 业务密钥开通的唯一车云 wire 权威来源。
+// TBOX-TSP、TBOX-MQTT、VAGW、VMD 及 VEH-PROTO 只能锁版消费本文件发布的
+// source bundle / DescriptorSet / 生成制品，禁止复制 Proto、手写量产 JSON
+// codec 或维护第二套字段别名。
+//
+// 传输：所有 payload 统一放入 vehicle.common.v1.VehicleMessageEnvelope.payload，
+// payload_type 固定为本文件完整类型名 security.keyprov.v1.<MessageName>，
+// Envelope.service 固定为 security.keyprov。本文件不定义、不复制 Envelope；
+// 依赖 net.hwyz.iov.cloud.proto:proto-vehicle-common 提供 Envelope。
+//
+// 方向与关联（PAR-PROTO-DSN-CR-006 §3）：
+//   KeyProvisioningRequest      UP   REQUEST  message_id = requestId 或显式 correlation
+//   KeyProvisioningResponse     DOWN RESPONSE correlation_id -> Request.message_id
+//   KeyProvisioningAck          UP   REQUEST  requestId + correlation 到原 Response
+//   KeyProvisioningAckResult    DOWN RESPONSE correlation_id -> Ack.message_id
+//   KeyProvisioningStatusRequest UP  REQUEST  新 message_id，payload 保持原 requestId
+//   KeyProvisioningStatusResponse DOWN RESPONSE correlation_id -> StatusRequest.message_id
+//
+// Topic（仅传输路由，不是 payload 身份权威）：
+//   UP   -> vehicle/{ecu_uid}/up/keyprov
+//   DOWN -> vehicle/{ecu_uid}/down/keyprov
+//
+// protocol_version：Envelope 字段 3 继续使用不透明字符串 keyprov-v1，消费者按
+// 整串 allowlist 精确匹配，禁止数值 major 推导、前缀/别名/fallback。
+//
+// 字段稳定性：字段号、枚举值与 package 自 v1 起永久保留。字段只追加；删除或改名
+// 后必须 reserved，不得复用；枚举只追加，保留 *_UNSPECIFIED=0；不得改变
+// bytes/string、标量/repeated、字段语义或默认成功行为。破坏性变化必须新 package major。
+//
+// 时间：统一 UTC epoch milliseconds。valid_from_ms=0 或 valid_to_ms=0 表示未设置；
+// 设置时必须满足 from < to。expire_at_ms 早于当前可信时间时不得导入。
+//
+// ---- Normative 大小上限（PAR-PROTO-DSN-CR-006 §4.3）------------------------
+//   request_id/idempotency_key/key_id/code/action/proof_algorithm <= 128 UTF-8 bytes
+//   business_domain/key_algorithm/certificate_profile              <= 64  UTF-8 bytes
+//   purposes/items/current_versions/supported_wrapping_suites      <= 8   items
+//   certificate_digest/device_identity_digest                      <= 64  bytes
+//   wrapped_key                                                    <= 4096 bytes/item
+//   parameters                                                     <= 2048 bytes/item
+//   import_proof                                                   <= 1024 bytes/item
+//   ProtocolError.message                                          <= 256 UTF-8 bytes
+//   payload（Envelope.payload 总长）                               <= 16384 bytes
+// 解码前先执行 Envelope/payload 总长门禁；解码后执行字段与 repeated count 门禁。
+// 超限整体拒绝，不截断、不落盘、不回显内容。
+//
+// ---- 敏感性与日志分类（PAR-PROTO-DSN-CR-006 §5）---------------------------
+//   wrapped_key / parameters                 SecretCiphertext   允许受控传输；禁日志、禁普通持久化
+//   import_proof                             SecurityProof      允许 ACK 传输；禁普通日志、仅短期处理
+//   device_identity_digest / certificate_digest IdentifierDigest 允许；仅摘要形式、有界
+//   request_id / key_id / business version   OperationalMetadata 允许；可按策略记录/摘要
+//   key plaintext / private key / slot / KMS keyRef Secret      禁止进入 wire
+// 本文件生成的 Proto toString()、JSON formatter、debug dump 与异常对象不得用于
+// keyprov payload 日志；测试与生成代码须通过敏感字段扫描。
+//
+// ---- 语义与完整性门禁（PAR-PROTO-DSN-CR-006 §4.4）-------------------------
+//   * v1 V2C_COMM 的 Request purpose 集必须完整等于 UPLINK_AEAD + DOWNLINK_AEAD，无重复。
+//   * SUCCEEDED Response 必须提供两个且仅两个对应 item；任一缺失、重复、UNSPECIFIED、
+//     版本为 0、未知 suite 或过期均整体拒绝。
+//   * ACK 成功必须覆盖 Response 的完整 purpose/keyId/businessKeyVersion；
+//     importProof 与 proof_algorithm 成对出现。
+//   * error 仅在非成功结果出现；成功时不得携带 error。
+//   * unknown fields 按标准保留；未知关键枚举不得被当作默认成功，消费者 fail-closed。
+// =============================================================================
+
+// 业务密钥用途。v1 V2C_COMM 要求 Request.purposes 完整等于 UPLINK_AEAD + DOWNLINK_AEAD。
+enum KeyPurpose {
+  KEY_PURPOSE_UNSPECIFIED = 0;      // 禁止用于有效请求项
+  KEY_PURPOSE_UPLINK_AEAD = 1;      // 上行 AEAD
+  KEY_PURPOSE_DOWNLINK_AEAD = 2;    // 下行 AEAD
+}
+
+// 密钥开通流程结果（Response / AckResult 公共结果）。error 仅在非 SUCCEEDED 出现。
+enum KeyProvisioningResult {
+  KEY_PROVISIONING_RESULT_UNSPECIFIED = 0;
+  KEY_PROVISIONING_RESULT_SUCCEEDED = 1;
+  KEY_PROVISIONING_RESULT_RETRYABLE_FAILURE = 2;
+  KEY_PROVISIONING_RESULT_REJECTED = 3;
+  KEY_PROVISIONING_RESULT_CONFLICT = 4;
+  KEY_PROVISIONING_RESULT_EXPIRED = 5;
+}
+
+// 件内导入结果（件内 HSM/TBOX-SEC 提交后产生）。
+enum KeyImportResult {
+  KEY_IMPORT_RESULT_UNSPECIFIED = 0;
+  KEY_IMPORT_RESULT_IMPORTED = 1;
+  KEY_IMPORT_RESULT_FAILED = 2;
+  KEY_IMPORT_RESULT_UNKNOWN = 3;    // unknown-outcome，须用原 requestId 对账收敛
+}
+
+// 业务开通状态（Status 对账返回，非加密敏感信息）。
+enum KeyProvisioningStatus {
+  KEY_PROVISIONING_STATUS_UNSPECIFIED = 0;
+  KEY_PROVISIONING_STATUS_REQUESTED = 1;
+  KEY_PROVISIONING_STATUS_ISSUED = 2;
+  KEY_PROVISIONING_STATUS_ACK_PENDING = 3;
+  KEY_PROVISIONING_STATUS_ACTIVE = 4;
+  KEY_PROVISIONING_STATUS_FAILED = 5;
+  KEY_PROVISIONING_STATUS_UNKNOWN = 6;
+}
+
+// 密钥封装套件。只有经 TBOX-SEC、VMD/framework-security 与安全评审共同确认
+// 实现后才进入 allowlist；不支持的枚举必须 fail-closed。
+enum WrappingSuite {
+  WRAPPING_SUITE_UNSPECIFIED = 0;
+  WRAPPING_SUITE_HPKE_BASE_X25519_SHA256_AES128GCM = 1;
+  WRAPPING_SUITE_ECDH_ES_P256_HKDF_SHA256_AES256GCM = 2;
+}
+
+// 稳定错误对象。仅承载稳定 code、retryable、action 与脱敏 message；
+// 不得携带 Wrapped Key、证书、设备标识明文、KMS 引用或内部异常堆栈。
+message ProtocolError {
+  string code = 1;        // <= 128 UTF-8 bytes，稳定错误码
+  bool retryable = 2;     // 是否可重试
+  string action = 3;      // <= 128 UTF-8 bytes，建议动作
+  string message = 4;     // <= 256 UTF-8 bytes，脱敏展示信息
+}
+
+// 设备证书引用。certificate_digest 为摘要（<= 64 bytes），不是设备身份凭证。
+message CertificateRef {
+  bytes certificate_digest = 1;         // <= 64 bytes
+  string certificate_profile = 2;       // <= 64 UTF-8 bytes
+  string key_encipherment_key_id = 3;   // <= 128 UTF-8 bytes
+}
+
+// 设备当前持有的业务密钥版本（用于服务端判定升级/换发）。
+message CurrentKeyVersion {
+  KeyPurpose purpose = 1;
+  uint64 business_key_version = 2;      // 0 表示无版本；成功响应版本不得为 0
+}
+
+// 上行：业务密钥开通申请。
+message KeyProvisioningRequest {
+  string request_id = 1;                                  // <= 128 bytes；一次未终结流程内稳定
+  string idempotency_key = 2;                             // <= 128 bytes；规范化生成，服务端复核
+  string business_domain = 3;                             // <= 64 bytes
+  repeated KeyPurpose purposes = 4;                       // v1 == {UPLINK_AEAD, DOWNLINK_AEAD}，<= 8
+  bytes device_identity_digest = 5;                       // <= 64 bytes；绑定/审计提示，非授权凭证
+  CertificateRef certificate_ref = 6;
+  repeated WrappingSuite supported_wrapping_suites = 7;   // <= 8
+  repeated CurrentKeyVersion current_versions = 8;        // <= 8
+  int64 timestamp_ms = 9;                                 // UTC epoch ms，freshness
+  int64 expire_at_ms = 10;                                // UTC epoch ms，请求可接受期限
+}
+
+// 单个 Wrapped Key item。wrapped_key 与 parameters 为 SecretCiphertext，禁止日志与普通持久化。
+message WrappedKeyItem {
+  KeyPurpose purpose = 1;
+  string key_id = 2;                             // <= 128 bytes；VMD 业务目录 ID，非 KMS keyRef
+  uint64 business_key_version = 3;               // 成功项不得为 0
+  bytes wrapped_key = 4;                         // <= 4096 bytes
+  string key_algorithm = 5;                      // <= 64 UTF-8 bytes
+  WrappingSuite wrapping_suite = 6;              // 未知/UNSPECIFIED fail-closed
+  int64 valid_from_ms = 7;                       // 0=未设置
+  int64 valid_to_ms = 8;                         // 0=未设置；设置时 from < to
+  bytes parameters = 9;                          // <= 2048 bytes，不透明有界参数
+}
+
+// 下行：Wrapped Key 响应。SUCCEEDED 必须携带完整且仅对应的 purpose item 集。
+message KeyProvisioningResponse {
+  string request_id = 1;
+  KeyProvisioningResult result = 2;
+  repeated WrappedKeyItem items = 3;             // <= 8；SUCCEEDED 时恰为请求 purpose 集
+  int64 expire_at_ms = 4;                        // Wrapped Key bundle 可接受期限
+  ProtocolError error = 5;                       // 仅非 SUCCEEDED 出现
+}
+
+// 单个件内导入结果。import_proof 为 SecurityProof（非敏感持钥证明），
+// 允许 ACK 传输但禁止普通日志与长期 Store；与 proof_algorithm 成对出现。
+message KeyImportItemResult {
+  KeyPurpose purpose = 1;
+  string key_id = 2;                             // <= 128 bytes
+  uint64 business_key_version = 3;
+  KeyImportResult result = 4;
+  bytes import_proof = 5;                        // <= 1024 bytes
+  string proof_algorithm = 6;                    // <= 128 UTF-8 bytes
+}
+
+// 上行：件内导入 ACK。不得包含 Wrapped Key、明文密钥、slot、设备私钥引用或 KMS keyRef。
+// 只有完整批次在 TBOX-SEC/HSM 内提交后才能发送成功 ACK。
+message KeyProvisioningAck {
+  string request_id = 1;
+  repeated KeyImportItemResult items = 2;        // <= 8；成功时覆盖 Response 的完整 purpose/keyId/version
+  int64 timestamp_ms = 3;
+}
+
+// 下行：ACK 结果对账。使 TBOX 区分“MQTT 已接受”与“VMD 已提交业务激活”。
+message KeyProvisioningAckResult {
+  string request_id = 1;
+  KeyProvisioningResult result = 2;
+  int64 occurred_at_ms = 3;
+  ProtocolError error = 4;                       // 仅非成功结果出现
+}
+
+// 上行：按原 requestId 查询业务开通状态（使用新 Envelope.message_id）。
+message KeyProvisioningStatusRequest {
+  string request_id = 1;                         // 原业务流程 requestId
+  int64 timestamp_ms = 2;
+}
+
+// 单 purpose 的非敏感业务状态（不含密钥材料）。
+message KeyPurposeStatus {
+  KeyPurpose purpose = 1;
+  string key_id = 2;                             // <= 128 bytes
+  uint64 business_key_version = 3;
+  KeyImportResult import_result = 4;
+}
+
+// 下行：状态对账响应。ACK 丢失、断网或重启时用原 requestId 收敛，不创建新业务版本。
+message KeyProvisioningStatusResponse {
+  string request_id = 1;
+  KeyProvisioningStatus status = 2;
+  repeated KeyPurposeStatus items = 3;           // <= 8
+  int64 occurred_at_ms = 4;
+  ProtocolError error = 5;                       // 仅非成功结果出现
+}

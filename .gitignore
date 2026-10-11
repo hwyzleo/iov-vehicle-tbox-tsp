@@ -35,6 +35,7 @@
 cmake-build-debug/
 .idea/
 build/
+build-*/
 
 docs/superpowers/
 .superpowers/

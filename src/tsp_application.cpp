@@ -108,6 +108,37 @@ bool TspApplication::initialize() {
     YAML::Node catalog_node =
         hwyz::config::ConfigManager::instance().toYaml()["tsp"]["subscriptions"];
 
+    // ---- CR-010: SEC 客户端与 V2C keyprov 配置 ----
+    std::string sec_socket_path = cfg->getString("tsp.sec.socket_path",
+                                                 "/tmp/tbox-sec.sock");
+    keyprov_config_.enabled =
+        cfg->getBool("tsp.key_provisioning.enabled", false);
+    keyprov_config_.business_domain =
+        cfg->getString("tsp.key_provisioning.business_domain", "V2C_COMM");
+    keyprov_config_.route_up =
+        cfg->getString("tsp.key_provisioning.route_up", "keyprov.uplink");
+    keyprov_config_.route_down =
+        cfg->getString("tsp.key_provisioning.route_down", "keyprov.downlink");
+    keyprov_config_.certificate_profile =
+        cfg->getString("tsp.key_provisioning.certificate_profile", "mqtt");
+    keyprov_config_.request_timeout_ms = static_cast<uint32_t>(
+        cfg->getInt("tsp.key_provisioning.request_timeout_ms", 10000));
+    keyprov_config_.ack_timeout_ms = static_cast<uint32_t>(
+        cfg->getInt("tsp.key_provisioning.ack_timeout_ms", 10000));
+    keyprov_config_.max_attempts_before_alert = static_cast<uint32_t>(
+        cfg->getInt("tsp.key_provisioning.max_attempts_before_alert", 8));
+    keyprov_config_.retry_initial_ms = static_cast<uint32_t>(
+        cfg->getInt("tsp.key_provisioning.retry.initial_ms", 500));
+    keyprov_config_.retry_max_ms = static_cast<uint32_t>(
+        cfg->getInt("tsp.key_provisioning.retry.max_ms", 30000));
+    keyprov_config_.retry_multiplier =
+        cfg->getDouble("tsp.key_provisioning.retry.multiplier", 2.0);
+    keyprov_config_.retry_jitter =
+        cfg->getBool("tsp.key_provisioning.retry.jitter", true);
+    auto purposes = cfg->getStringList("tsp.key_provisioning.purposes");
+    if (!purposes.empty()) keyprov_config_.purposes = std::move(purposes);
+    sec_client_ = std::make_shared<SecClientBusinessKeyAdapter>(sec_socket_path);
+
     // ---- a. mqtt_client（CR-003 §1: TSP 对 MQTT 只使用 tbox::mqtt_client）----
     mqtt_client_ = std::make_shared<MqttClientAdapter>(mqtt_socket_path);
     if (!mqtt_client_->initialize()) {
@@ -129,7 +160,8 @@ bool TspApplication::initialize() {
     // ---- b. TspRelayService 业务聚合（注入 MqttFacade& 与 gateway 配置）----
     relay_service_ = std::make_unique<TspRelayService>(mqtt_client_);
     if (!relay_service_->initializeLocal(store_root, catalog_node,
-                                         vehicle_message_config_)) {
+                                         vehicle_message_config_,
+                                         sec_client_, keyprov_config_)) {
         LogAdapter::application().error(
             "tsp.application.relay_init_failed",
             "TspRelayService initializeLocal 失败");
@@ -240,6 +272,8 @@ void TspApplication::cleanup() {
     }
     // 8. 释放 NetStatusProvider
     net_status_provider_.reset();
+    // 9. 释放 SEC 客户端（relay 已在前一步销毁）
+    sec_client_.reset();
     init_stage_ = InitStage::None;
     // 9. 最终日志 flush 由 Application::run 在 cleanup 后统一完成。
 }

@@ -11,6 +11,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -53,7 +54,38 @@ inline bool direction_from_string(const std::string& s, Direction& out) {
 }
 
 // ============================================================
-// 单条业务订阅项 (CR-004 §3, §11.1)
+// 订阅项关键性 (TBOX-MQTT-DSN-CR-015 §3)
+// ============================================================
+// OPTIONAL：不影响任何就绪；GLOBAL_MANDATORY：进入共享 Cloud Ready；
+// CAPABILITY_MANDATORY：capability-scoped，不进入共享 Cloud Ready（如 keyprov）。
+enum class SubscriptionCriticality : uint8_t {
+    OPTIONAL = 0,
+    GLOBAL_MANDATORY = 1,
+    CAPABILITY_MANDATORY = 2
+};
+
+inline const char* subscription_criticality_to_string(SubscriptionCriticality c) {
+    switch (c) {
+        case SubscriptionCriticality::OPTIONAL:             return "OPTIONAL";
+        case SubscriptionCriticality::GLOBAL_MANDATORY:     return "GLOBAL_MANDATORY";
+        case SubscriptionCriticality::CAPABILITY_MANDATORY: return "CAPABILITY_MANDATORY";
+        default: return "?";
+    }
+}
+
+inline bool subscription_criticality_from_string(const std::string& s,
+                                                 SubscriptionCriticality& out) {
+    if (s == "OPTIONAL")             { out = SubscriptionCriticality::OPTIONAL; return true; }
+    if (s == "GLOBAL_MANDATORY")     { out = SubscriptionCriticality::GLOBAL_MANDATORY; return true; }
+    if (s == "CAPABILITY_MANDATORY") { out = SubscriptionCriticality::CAPABILITY_MANDATORY; return true; }
+    return false;
+}
+
+// CR-015 快照契约版本：catalog-governed route 需要双方一致
+constexpr uint32_t kSubscriptionContractVersion = 1;
+
+// ============================================================
+// 单条业务订阅项 (CR-004 §3, §11.1; CR-015 §3)
 // ============================================================
 struct SubscriptionItem {
     std::string route_id;        // owner 内稳定唯一
@@ -62,6 +94,12 @@ struct SubscriptionItem {
     uint8_t qos = 1;             // 0/1/2
     std::string target;          // 目标处理器，如 tsp.fota
     bool mandatory = false;
+    // ---- TBOX-MQTT-DSN-CR-015 ----
+    // enabled 语义与 route 类型相关：legacy route 缺省=true；capability route 缺省=false。
+    std::optional<bool> enabled;
+    // 空=全局（进入共享 Cloud Ready）；非空=capability scope（如 security.keyprov）。
+    std::string readiness_scope;
+    SubscriptionCriticality criticality = SubscriptionCriticality::OPTIONAL;
 };
 
 // ============================================================
@@ -72,6 +110,7 @@ struct SubscriptionSnapshot {
     uint64_t generation = 0;                 // 集合语义变化时单调递增
     std::string content_digest;              // 规范化集合摘要 (SHA-256 hex)
     bool registration_complete = false;      // 是否包含全部 Mandatory 项
+    uint32_t contract_version = kSubscriptionContractVersion;  // CR-015
     std::vector<SubscriptionItem> items;
 };
 

@@ -19,6 +19,8 @@
 #include "ipc.h"
 #include "tsp_event_publisher.h"  // SlowSubscriberPolicy
 #include "vehicle_message_gateway.h"  // VehicleMessageGatewayConfig
+#include "sec_business_key_facade.h"
+#include "v2c_key_provisioning_coordinator.h"  // V2cKeyProvisioningConfig
 
 #include <memory>
 #include <string>
@@ -66,6 +68,10 @@ private:
     std::unique_ptr<TspRelayService> relay_service_;
     std::unique_ptr<TspFrameworkServer> framework_server_;
     std::unique_ptr<NetStatusProvider> net_status_provider_;
+
+    // CR-010: SEC 业务密钥客户端与 V2C keyprov 配置
+    std::shared_ptr<SecBusinessKeyFacade> sec_client_;
+    V2cKeyProvisioningConfig keyprov_config_;
 
     // initialize 读取、cleanup 复用的配置
     ::tbox::fw::ipc::IpcConfig ipc_config_{};

@@ -1,6 +1,7 @@
 # tests/CMakeLists.txt
 
 find_package(GTest REQUIRED)
+find_package(TboxSecClient CONFIG REQUIRED)
 include_directories(${GTEST_INCLUDE_DIRS})
 # miniconda GTest config 未设置 include dir，显式补充
 if(NOT GTEST_INCLUDE_DIRS OR NOT EXISTS "${GTEST_INCLUDE_DIRS}/gtest/gtest.h")
@@ -19,6 +20,7 @@ set(TEST_COMMON_INCLUDES
 set(TEST_COMMON_LIBS
     ${TSP_FRAMEWORK_LIBS}
     tsp_proto
+    tbox::sec_client
     nlohmann_json::nlohmann_json
     gtest gtest_main
 )
@@ -144,6 +146,37 @@ tsp_add_test(SubscriptionIntegrationTest
     ${PROJECT_SOURCE_DIR}/src/downlink_route_dispatcher.cpp
     ${PROJECT_SOURCE_DIR}/src/tsp_event_publisher.cpp
     ${PROJECT_SOURCE_DIR}/src/tsp_error_codes.cpp
+    ${PROJECT_SOURCE_DIR}/src/log_adapter.cpp)
+
+# ============================================================
+# CR-010: V2C 初始密钥开通（keyprov protocol / store / coordinator / 集成）
+# ============================================================
+tsp_add_test(KeyProvProtocolTest
+    test_keyprov_protocol.cpp
+    ${PROJECT_SOURCE_DIR}/src/keyprov_protocol.cpp)
+
+tsp_add_test(V2cKeyProvisioningStoreTest
+    test_v2c_key_provisioning_store.cpp
+    ${PROJECT_SOURCE_DIR}/src/v2c_key_provisioning_store.cpp
+    ${PROJECT_SOURCE_DIR}/src/log_adapter.cpp)
+
+tsp_add_test(V2cKeyProvisioningCoordinatorTest
+    test_v2c_key_provisioning_coordinator.cpp
+    ${PROJECT_SOURCE_DIR}/src/v2c_key_provisioning_coordinator.cpp
+    ${PROJECT_SOURCE_DIR}/src/keyprov_protocol.cpp
+    ${PROJECT_SOURCE_DIR}/src/v2c_key_provisioning_store.cpp
+    ${PROJECT_SOURCE_DIR}/src/log_adapter.cpp)
+
+tsp_add_test(KeyProvisioningIntegrationTest
+    test_key_provisioning_integration.cpp
+    ${PROJECT_SOURCE_DIR}/src/v2c_key_provisioning_coordinator.cpp
+    ${PROJECT_SOURCE_DIR}/src/keyprov_protocol.cpp
+    ${PROJECT_SOURCE_DIR}/src/v2c_key_provisioning_store.cpp
+    ${PROJECT_SOURCE_DIR}/src/subscription_catalog.cpp
+    ${PROJECT_SOURCE_DIR}/src/snapshot_builder.cpp
+    ${PROJECT_SOURCE_DIR}/src/registration_state.cpp
+    ${PROJECT_SOURCE_DIR}/src/subscription_store.cpp
+    ${PROJECT_SOURCE_DIR}/src/subscription_registrar.cpp
     ${PROJECT_SOURCE_DIR}/src/log_adapter.cpp)
 
 # ============================================================

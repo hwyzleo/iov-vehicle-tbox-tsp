@@ -48,5 +48,9 @@ tbox::fw::log::Logger LogAdapter::subscription() {
     return tbox::fw::log::Logger::get("subscription");
 }
 
+tbox::fw::log::Logger LogAdapter::keyprov() {
+    return tbox::fw::log::Logger::get("keyprov");
+}
+
 } // namespace tsp
 } // namespace tbox

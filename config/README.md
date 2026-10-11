@@ -52,6 +52,23 @@ config/
 > 注：去重窗口（dedup-window-ms）与节流间隔（throttle-interval-ms）当前为代码
 > 常量（`include/constants.h`），不通过配置文件消费，故不进入默认模板。
 
+## V2C 初始密钥开通配置（TBOX-TSP-DSN-CR-010）
+
+`tsp.default.yaml` 新增非秘密治理项：
+
+- `tsp.sec.socket_path`：TBOX-SEC IPC socket（基线 `/tmp/tbox-sec.sock`）；
+- `tsp.key_provisioning`：`enabled`（量产默认 `false`）、`business_domain`、
+  `purposes`、`route_up`/`route_down`、`request_timeout_ms`/`ack_timeout_ms`、
+  `max_attempts_before_alert`、`retry`；
+- `tsp.subscriptions` 新增 capability-gated `keyprov.uplink`/`keyprov.downlink`
+  （`criticality: CAPABILITY_MANDATORY`、`readiness_scope: security.keyprov`、
+  `mandatory: false`、量产 `enabled: false`）。
+
+约束（CR-010 §8）：算法、keyId、业务版本与 Wrapped Key **不得**进入静态配置。
+`enabled=true` 只是启用意图；Coordinator 仍须通过运行时 capability gate
+（MQTT capability ready + 证书身份可见 + SEC 能力可用）后才发起申请。
+keyprov 订阅就绪不进入共享 Cloud Ready，不影响 FOTA。
+
 ## 本地开发运行
 
 ```bash

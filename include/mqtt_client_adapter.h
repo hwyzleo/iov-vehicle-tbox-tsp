@@ -43,6 +43,14 @@ public:
 
     bool is_connected() const override;
 
+    // ---- TBOX-MQTT-DSN-CR-014/015: Cloud / Capability Readiness ----
+    CloudReadiness getCloudReadiness() override;
+    bool subscribeCloudReadinessChanged(CloudReadinessCallback callback) override;
+    CapabilityReadiness getCapabilityReadiness(const std::string& capability) override;
+    bool subscribeCapabilityReadinessChanged(
+        const std::string& capability,
+        CapabilityReadinessCallback callback) override;
+
     // ---- 业务订阅快照 (CR-007 §4) ----
     // 将完整版本化快照转换为 tbox::mqtt::OwnerSubscriptionSnapshot，经
     // client_->replaceSubscriptionSnapshot 原子提交给 MQTT daemon。
@@ -60,6 +68,9 @@ private:
 
     // 持有 routed 下行订阅句柄（RAII），析构自动取消 (CR-006 §6)
     ::tbox::mqtt::RoutedSubscription routed_sub_;
+    // Cloud Readiness / Capability Readiness 事件订阅句柄（RAII, CR-014/015）
+    ::tbox::mqtt::SubscriptionHandle cloud_ready_sub_;
+    ::tbox::mqtt::SubscriptionHandle capability_sub_;
     mutable std::mutex mutex_;
 };
 

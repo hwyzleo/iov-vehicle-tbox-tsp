@@ -29,7 +29,9 @@ TspRelayService::~TspRelayService() {
 
 bool TspRelayService::initializeLocal(const std::string& store_root,
                                       const YAML::Node& catalog_node,
-                                      const VehicleMessageGatewayConfig& gateway_config) {
+                                      const VehicleMessageGatewayConfig& gateway_config,
+                                      std::shared_ptr<SecBusinessKeyFacade> sec,
+                                      const V2cKeyProvisioningConfig& keyprov_config) {
     if (!mqtt_) {
         LogAdapter::application().error(
             "tsp.relay.init_failed", "MqttFacade 未注入");
@@ -66,6 +68,28 @@ bool TspRelayService::initializeLocal(const std::string& store_root,
         return false;
     }
 
+    // CR-010 §3.1: V2C keyprov 编排（sec 未注入时跳过，保持既有行为）
+    if (sec) {
+        sec_ = std::move(sec);
+        keyprov_config_ = keyprov_config;
+        keyprov_store_ = std::make_shared<V2cKeyProvisioningStore>(store_root);
+        keyprov_ = std::make_unique<V2cKeyProvisioningCoordinator>(
+            mqtt_, sec_, keyprov_store_);
+        if (!keyprov_->initialize(keyprov_config_)) {
+            LogAdapter::keyprov().error(
+                "tsp.keyprov.init_failed",
+                "V2cKeyProvisioningCoordinator 初始化失败");
+            keyprov_.reset();
+            keyprov_store_.reset();
+            sec_.reset();
+            gateway_.reset();
+            registrar_.reset();
+            store_.reset();
+            catalog_.reset();
+            return false;
+        }
+    }
+
     LogAdapter::relay().info(
         "tsp.relay.initialized", "TspRelayService 本地初始化完成");
     return true;
@@ -98,6 +122,16 @@ bool TspRelayService::startMqttIntegration() {
         return false;
     }
 
+    // CR-010 §3.1: keyprov 下行路由与 Coordinator 启动（在 gateway start 后注册 handler）
+    if (keyprov_) {
+        gateway_->register_downlink_handler(
+            "tsp", keyprov_config_.route_down, "tsp.keyprov",
+            [this](const RoutedDownlinkEvent& event) {
+                if (keyprov_) keyprov_->handle_routed_downlink(event);
+            });
+        keyprov_->start(true);
+    }
+
     LogAdapter::relay().info(
         "tsp.relay.mqtt_integration_started", "TspRelayService MQTT 集成已启动");
     return true;
@@ -105,14 +139,16 @@ bool TspRelayService::startMqttIntegration() {
 
 void TspRelayService::beginShutdown() {
     stopping_.store(true, std::memory_order_release);
+    if (keyprov_) keyprov_->beginShutdown();
     LogAdapter::relay().info(
         "tsp.relay.stopping", "TspRelayService 进入 STOPPING，拒绝新中继请求");
 }
 
 void TspRelayService::stop() {
     stopping_.store(true, std::memory_order_release);
-    // 停止顺序：VehicleMessageGateway（取消 routed downlink、收敛 in-flight）-> 
-    // 注册器重试/timer/监控线程 -> 持久化
+    // 停止顺序：keyprov Coordinator（清 Wrapped Key buffer）-> VehicleMessageGateway
+    // （取消 routed downlink、收敛 in-flight）-> 注册器重试/timer/线程 -> 持久化
+    if (keyprov_) keyprov_->stop();
     if (gateway_) gateway_->stop();
     if (registrar_) registrar_->stop();
     LogAdapter::relay().info("tsp.relay.stopped", "TspRelayService 已停止");

@@ -62,6 +62,18 @@ bool SubscriptionCatalog::load_from_yaml(const YAML::Node& node, std::string& er
                 entry["qos"].as<int>(1));
             item.target = entry["target"].as<std::string>("");
             item.mandatory = entry["mandatory"].as<bool>(false);
+            // CR-015: capability 路由可选字段
+            if (entry["enabled"]) {
+                item.enabled = entry["enabled"].as<bool>();
+            }
+            item.readiness_scope = entry["readiness_scope"].as<std::string>("");
+            std::string crit = entry["criticality"].as<std::string>("");
+            if (!crit.empty() &&
+                !subscription_criticality_from_string(crit, item.criticality)) {
+                error = "invalid criticality '" + crit +
+                        "' for route_id=" + item.route_id;
+                return false;
+            }
             parsed.push_back(std::move(item));
         }
     }

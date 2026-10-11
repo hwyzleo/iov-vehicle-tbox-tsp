@@ -28,6 +28,7 @@ public:
     static tbox::fw::log::Logger ipc_server();
     static tbox::fw::log::Logger application();
     static tbox::fw::log::Logger subscription();  // CR-004: 业务订阅快照
+    static tbox::fw::log::Logger keyprov();       // CR-010: V2C 初始密钥开通
 
 private:
     static bool s_initialized;

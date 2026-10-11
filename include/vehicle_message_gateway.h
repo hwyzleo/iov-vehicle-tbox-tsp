@@ -89,6 +89,14 @@ public:
     // 下行入口（DownlinkRouteDispatcher 分发 owner=tsp+fota.downlink+tsp.fota）
     void handle_routed_downlink(const RoutedDownlinkEvent& event);
 
+    // CR-010 §3.1: 注册额外 owner=tsp 的业务下行 handler（如 keyprov.downlink）。
+    // 必须在 start() 之后调用（start 创建 dispatcher 并订阅 owner）。
+    void register_downlink_handler(
+        const std::string& owner,
+        const std::string& route_id,
+        const std::string& target,
+        std::function<void(const RoutedDownlinkEvent&)> handler);
+
     // EVENT 下行推送器接线（Application/Relay 在 IPC 构造后调用）
     void set_event_publisher(TspEventPublisher* publisher);
 

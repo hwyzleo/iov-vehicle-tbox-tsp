@@ -29,6 +29,29 @@ tsp:
   mqtt:
     socket_path: /tmp/tbox-mqtt.sock
 
+  # SEC daemon IPC socket (CR-010 §3.2: TSP 使用 tbox::sec_client 查询/导入业务密钥)
+  sec:
+    socket_path: /tmp/tbox-sec.sock
+
+  # V2C 初始密钥开通 (TBOX-TSP-DSN-CR-010 §8)
+  # 量产默认 enabled=false：只有 release-set 显式开启且运行时 capability gate 全通过
+  # 才创建有效开通流程。算法/keyId/业务版本/Wrapped Key 不进静态配置。
+  key_provisioning:
+    enabled: false
+    business_domain: V2C_COMM
+    certificate_profile: mqtt
+    purposes: [UPLINK_AEAD, DOWNLINK_AEAD]
+    route_up: keyprov.uplink
+    route_down: keyprov.downlink
+    request_timeout_ms: 10000
+    ack_timeout_ms: 10000
+    max_attempts_before_alert: 8
+    retry:
+      initial_ms: 500
+      max_ms: 30000
+      multiplier: 2.0
+      jitter: true
+
   # 通用 VehicleMessage 网关 (TBOX-TSP-DSN-CR-009 §16.3)
   # 有界资源/allowlist 限制；尖括号值由实现/容量测试回填。
   vehicle_message:
@@ -64,3 +87,23 @@ tsp:
       qos: 1
       target: tsp.fota
       mandatory: true
+    # CR-015 capability-gated keyprov route（enabled=false 量产默认禁用；
+    # 能力就绪不进入共享 Cloud Ready；模板/方向/QoS/target 由 MQTT catalog 冻结）
+    - route_id: keyprov.uplink
+      topic_template: vehicle/{ecu_uid}/up/keyprov
+      direction: UP
+      qos: 1
+      target: tsp.keyprov
+      mandatory: false
+      enabled: false
+      readiness_scope: security.keyprov
+      criticality: CAPABILITY_MANDATORY
+    - route_id: keyprov.downlink
+      topic_template: vehicle/{ecu_uid}/down/keyprov
+      direction: DOWN
+      qos: 1
+      target: tsp.keyprov
+      mandatory: false
+      enabled: false
+      readiness_scope: security.keyprov
+      criticality: CAPABILITY_MANDATORY

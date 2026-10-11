@@ -60,6 +60,40 @@ fields:
           socket_path:
             type: string
             path_safe: true
+      sec:
+        type: map
+        fields:
+          socket_path:
+            type: string
+            path_safe: true
+      key_provisioning:
+        type: map
+        fields:
+          enabled: {type: boolean}
+          business_domain: {type: string}
+          certificate_profile: {type: string}
+          purposes: {type: string_list}
+          route_up: {type: string}
+          route_down: {type: string}
+          request_timeout_ms:
+            type: integer
+            min: 100
+            max: 600000
+          ack_timeout_ms:
+            type: integer
+            min: 100
+            max: 600000
+          max_attempts_before_alert:
+            type: integer
+            min: 1
+            max: 1000
+          retry:
+            type: map
+            fields:
+              initial_ms: {type: integer, min: 10, max: 600000}
+              max_ms: {type: integer, min: 10, max: 600000}
+              multiplier: {type: number, min: 1.0}
+              jitter: {type: boolean}
       vehicle_message:
         type: map
         fields:
@@ -126,6 +160,14 @@ fields:
             required: true
           mandatory:
             type: boolean
+          # TBOX-MQTT-DSN-CR-015: capability-gated route 可选字段
+          enabled:
+            type: boolean
+          readiness_scope:
+            type: string
+          criticality:
+            type: string
+            enum: [OPTIONAL, GLOBAL_MANDATORY, CAPABILITY_MANDATORY]
 
 # --- 禁止字段（任何 profile 下出现即失败） ---
 # secret / credential / identity-cache / Store runtime 状态 / test 资产

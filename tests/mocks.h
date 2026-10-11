@@ -4,7 +4,10 @@
 #include "mqtt_facade.h"
 #include "vehicle_message_gateway.h"
 #include "net_status_provider.h"
+#include "sec_business_key_facade.h"
 #include "tbox/tsp/types.h"
+#include "tbox/sec/business_key.h"
+#include "tbox/sec/errors.h"
 #include <vector>
 #include <mutex>
 #include <atomic>
@@ -94,6 +97,54 @@ public:
 
     bool is_connected() const override { return connected; }
 
+    // ---- CR-014/015: readiness 可配置状态与事件投递 ----
+    CloudReadiness cloud_readiness;
+    CapabilityReadiness capability_readiness;
+    bool cloud_ready_subscribe_ok = true;
+    bool capability_subscribe_ok = true;
+
+    CloudReadiness getCloudReadiness() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return cloud_readiness;
+    }
+    bool subscribeCloudReadinessChanged(CloudReadinessCallback cb) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        cloud_callback_ = std::move(cb);
+        return cloud_ready_subscribe_ok;
+    }
+    CapabilityReadiness getCapabilityReadiness(const std::string& capability) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        CapabilityReadiness r = capability_readiness;
+        if (r.capability.empty()) r.capability = capability;
+        return r;
+    }
+    bool subscribeCapabilityReadinessChanged(
+            const std::string& /*capability*/, CapabilityReadinessCallback cb) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        capability_callback_ = std::move(cb);
+        return capability_subscribe_ok;
+    }
+
+    // 测试辅助：投递 Cloud/Capability readiness 事件
+    void deliver_cloud_readiness(const CloudReadiness& r) {
+        CloudReadinessCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            cloud_readiness = r;
+            cb = cloud_callback_;
+        }
+        if (cb) cb(r);
+    }
+    void deliver_capability_readiness(const CapabilityReadiness& r) {
+        CapabilityReadinessCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            capability_readiness = r;
+            cb = capability_callback_;
+        }
+        if (cb) cb(r);
+    }
+
     // 测试辅助：模拟收到 routed downlink 事件 (CR-006 §6)
     void deliver_routed_downlink(const RoutedDownlinkEvent& event) {
         RoutedDownlinkCallback cb;
@@ -125,6 +176,106 @@ public:
     RoutedDownlinkCallback routed_callback_;
     std::vector<SubscriptionSnapshot> snapshot_calls_;
     uint64_t snapshot_call_count_ = 0;
+    CloudReadinessCallback cloud_callback_;
+    CapabilityReadinessCallback capability_callback_;
+};
+
+// ============================================================
+// FakeSecClient -- SecBusinessKeyFacade 契约测试实现。
+// 以普通可拷贝字段配置结果，方法内构造（SecureBuffer 不可复制）。
+// ============================================================
+class FakeSecClient : public SecBusinessKeyFacade {
+public:
+    struct StatusItem {
+        std::string purpose;
+        int state = 0;  // tbox::sec::BusinessKeyState
+        uint64_t business_key_version = 0;
+        std::string key_id_digest;
+    };
+
+    // 状态查询
+    int status_error_code = 0;  // tbox::sec::ErrorCode
+    std::vector<StatusItem> status_items;
+    int status_calls = 0;
+
+    // 导入
+    int import_error_code = 0;
+    int import_state = 2;  // COMMITTED
+    std::vector<StatusItem> import_items;
+    std::vector<uint8_t> import_proof;
+    std::string proof_algorithm = "hmac-sha256";
+    int import_calls = 0;
+    std::vector<std::string> imported_request_ids;
+    std::size_t last_import_item_count = 0;
+
+    // 结果查询
+    int query_error_code = 0;
+    int query_state = 2;
+    std::vector<StatusItem> query_items;
+    int query_calls = 0;
+
+    tbox::sec::ErrorCode get_business_key_status(
+        const std::string& /*domain*/,
+        const std::vector<std::string>& purposes,
+        tbox::sec::BusinessKeyStatusSet& out) override {
+        ++status_calls;
+        out.items.clear();
+        for (const auto& si : status_items) {
+            tbox::sec::BusinessKeyStatus s;
+            s.purpose = si.purpose;
+            s.state = static_cast<tbox::sec::BusinessKeyState>(si.state);
+            s.business_key_version = si.business_key_version;
+            s.key_id_digest = si.key_id_digest;
+            out.items.push_back(std::move(s));
+        }
+        (void)purposes;
+        return static_cast<tbox::sec::ErrorCode>(status_error_code);
+    }
+
+    tbox::sec::ErrorCode import_wrapped_business_keys(
+        const std::string& request_id,
+        const std::string& business_domain,
+        const std::vector<tbox::sec::WrappedKeyItem>& items,
+        tbox::sec::ImportResult& out) override {
+        ++import_calls;
+        imported_request_ids.push_back(request_id);
+        last_import_item_count = items.size();
+        out = tbox::sec::ImportResult{};
+        out.request_id = request_id;
+        out.business_domain = business_domain;
+        out.state = static_cast<tbox::sec::BusinessKeyImportState>(import_state);
+        for (const auto& si : import_items) {
+            tbox::sec::BusinessKeyStatus s;
+            s.purpose = si.purpose;
+            s.state = static_cast<tbox::sec::BusinessKeyState>(si.state);
+            s.business_key_version = si.business_key_version;
+            s.key_id_digest = si.key_id_digest;
+            out.items.push_back(std::move(s));
+        }
+        out.import_proof.assign(import_proof);
+        out.proof_algorithm = proof_algorithm;
+        return static_cast<tbox::sec::ErrorCode>(import_error_code);
+    }
+
+    tbox::sec::ErrorCode get_business_key_import_result(
+        const std::string& request_id,
+        tbox::sec::ImportResult& out) override {
+        ++query_calls;
+        out = tbox::sec::ImportResult{};
+        out.request_id = request_id;
+        out.state = static_cast<tbox::sec::BusinessKeyImportState>(query_state);
+        for (const auto& si : query_items) {
+            tbox::sec::BusinessKeyStatus s;
+            s.purpose = si.purpose;
+            s.state = static_cast<tbox::sec::BusinessKeyState>(si.state);
+            s.business_key_version = si.business_key_version;
+            s.key_id_digest = si.key_id_digest;
+            out.items.push_back(std::move(s));
+        }
+        out.import_proof.assign(import_proof);
+        out.proof_algorithm = proof_algorithm;
+        return static_cast<tbox::sec::ErrorCode>(query_error_code);
+    }
 };
 
 // ============================================================

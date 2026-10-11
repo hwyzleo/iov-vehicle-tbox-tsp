@@ -56,7 +56,7 @@ REPO_ROOT = os.path.dirname(SCRIPT_DIR)
 DEFAULT_SCHEMA = os.path.join(REPO_ROOT, "config", "schema", "tsp.schema.yaml")
 
 # TSP framework-ipc 基线 socket（§15.5）；production 仅允许这些精确值
-TSP_APPROVED_SOCKET_PATHS = {"/tmp/tbox-tsp.sock", "/tmp/tbox-mqtt.sock"}
+TSP_APPROVED_SOCKET_PATHS = {"/tmp/tbox-tsp.sock", "/tmp/tbox-mqtt.sock", "/tmp/tbox-sec.sock"}
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +286,11 @@ class SchemaValidator:
         mqtt_sock = self._get_path(node, ["tsp", "mqtt", "socket_path"])
         if isinstance(mqtt_sock, str) and mqtt_sock and mqtt_sock != "/tmp/tbox-mqtt.sock":
             self._perr(f"tsp.mqtt.socket_path: must be /tmp/tbox-mqtt.sock in production, "
+                       f"got unapproved value")
+        # CR-010 §3.2: SEC 业务密钥 IPC socket 必须为基线值
+        sec_sock = self._get_path(node, ["tsp", "sec", "socket_path"])
+        if isinstance(sec_sock, str) and sec_sock and sec_sock != "/tmp/tbox-sec.sock":
+            self._perr(f"tsp.sec.socket_path: must be /tmp/tbox-sec.sock in production, "
                        f"got unapproved value")
         # 任何 string 值含 mock 标记
         self._scan_all_strings(node, "tsp", self._mock_scan_cb)

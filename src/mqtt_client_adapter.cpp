@@ -32,8 +32,10 @@ bool MqttClientAdapter::start() {
 
 void MqttClientAdapter::stop() {
     LogAdapter::mqtt_client().info("tsp.mqtt.stopping", "MqttClientAdapter 停止");
-    // 取消 routed 下行订阅（RAII 析构，CR-006 §6）
+    // 取消 routed 下行订阅与 readiness 事件订阅（RAII 析构，CR-006 §6 / CR-014 §5）
     routed_sub_.cancel();
+    cloud_ready_sub_.cancel();
+    capability_sub_.cancel();
     started_ = false;
     if (client_) {
         client_->disconnect();
@@ -115,6 +117,20 @@ SnapshotStatus from_wire_status(::tbox::mqtt::SnapshotAcceptStatus s) {
     return SnapshotStatus::UNKNOWN;
 }
 
+// TSP SubscriptionCriticality -> wire
+::tbox::mqtt::SubscriptionCriticality to_wire_criticality(
+        SubscriptionCriticality c) {
+    switch (c) {
+        case SubscriptionCriticality::OPTIONAL:
+            return ::tbox::mqtt::SubscriptionCriticality::OPTIONAL;
+        case SubscriptionCriticality::GLOBAL_MANDATORY:
+            return ::tbox::mqtt::SubscriptionCriticality::GLOBAL_MANDATORY;
+        case SubscriptionCriticality::CAPABILITY_MANDATORY:
+            return ::tbox::mqtt::SubscriptionCriticality::CAPABILITY_MANDATORY;
+    }
+    return ::tbox::mqtt::SubscriptionCriticality::OPTIONAL;
+}
+
 } // anonymous namespace
 
 ReplaceSnapshotResult MqttClientAdapter::replaceSubscriptionSnapshot(
@@ -129,6 +145,7 @@ ReplaceSnapshotResult MqttClientAdapter::replaceSubscriptionSnapshot(
     wire.generation = snapshot.generation;
     wire.content_digest = snapshot.content_digest;
     wire.registration_complete = snapshot.registration_complete;
+    wire.contract_version = snapshot.contract_version;
     wire.items.reserve(snapshot.items.size());
     for (const auto& item : snapshot.items) {
         ::tbox::mqtt::SubscriptionItem wi;
@@ -138,6 +155,9 @@ ReplaceSnapshotResult MqttClientAdapter::replaceSubscriptionSnapshot(
         wi.qos = item.qos;
         wi.target = item.target;
         wi.mandatory = item.mandatory;
+        wi.enabled = item.enabled;                // CR-015
+        wi.readiness_scope = item.readiness_scope;
+        wi.criticality = to_wire_criticality(item.criticality);
         wire.items.push_back(std::move(wi));
     }
 
@@ -164,6 +184,94 @@ SnapshotStatusResult MqttClientAdapter::getSubscriptionSnapshotStatus(
     r.content_digest = wr.content_digest;
     r.registration_complete = wr.registration_complete;
     return r;
+}
+
+// ============================================================
+// CR-014/015: Cloud / Capability Readiness
+// ============================================================
+CloudReadiness MqttClientAdapter::getCloudReadiness() {
+    CloudReadiness out;
+    if (!client_) return out;
+    auto wr = client_->getSubscriptionReadiness();
+    out.cloud_ready = wr.cloud_ready;
+    out.connection_generation = wr.connection_generation;
+    out.cert_session_generation = wr.cert_session_generation;
+    out.credential_id = wr.credential_id;
+    out.credential_version = wr.credential_version;
+    out.device_identity_digest = wr.device_identity_digest;
+    out.certificate_ref = wr.certificate_ref;
+    out.reason_code = wr.reason_code;
+    out.contract_version = wr.contract_version;
+    out.contract_supported = wr.contract_supported;
+    return out;
+}
+
+bool MqttClientAdapter::subscribeCloudReadinessChanged(
+        CloudReadinessCallback callback) {
+    if (!client_) return false;
+    ::tbox::mqtt::CloudReadinessCallback wrapped =
+        [cb = std::move(callback)](const ::tbox::mqtt::CloudReadinessSnapshot& ev) {
+            if (!cb) return;
+            CloudReadiness out;
+            out.cloud_ready = ev.cloud_ready;
+            out.connection_generation = ev.connection_generation;
+            out.cert_session_generation = ev.cert_session_generation;
+            out.credential_id = ev.credential_id;
+            out.credential_version = ev.credential_version;
+            out.device_identity_digest = ev.device_identity_digest;
+            out.certificate_ref = ev.certificate_ref;
+            out.reason_code = ev.reason_code;
+            out.contract_version = ev.contract_version;
+            out.contract_supported = ev.contract_supported;
+            cb(out);
+        };
+    cloud_ready_sub_ = client_->subscribeCloudReadinessChanged(std::move(wrapped));
+    return cloud_ready_sub_.isActive();
+}
+
+CapabilityReadiness MqttClientAdapter::getCapabilityReadiness(
+        const std::string& capability) {
+    CapabilityReadiness out;
+    out.capability = capability;
+    if (!client_) return out;
+    auto wr = client_->getCapabilityReadiness(capability);
+    out.enabled = wr.enabled;
+    out.contract_supported = wr.contract_supported;
+    out.snapshot_accepted = wr.snapshot_accepted;
+    out.uplink_ready = wr.uplink_ready;
+    out.downlink_suback_ready = wr.downlink_suback_ready;
+    out.ready = wr.ready;
+    out.owner_generation = wr.owner_generation;
+    out.connection_generation = wr.connection_generation;
+    out.cert_session_generation = wr.cert_session_generation;
+    out.reason_code = wr.reason_code;
+    return out;
+}
+
+bool MqttClientAdapter::subscribeCapabilityReadinessChanged(
+        const std::string& capability,
+        CapabilityReadinessCallback callback) {
+    if (!client_) return false;
+    ::tbox::mqtt::CapabilityReadinessCallback wrapped =
+        [cb = std::move(callback)](const ::tbox::mqtt::CapabilityReadiness& ev) {
+            if (!cb) return;
+            CapabilityReadiness out;
+            out.capability = ev.capability;
+            out.enabled = ev.enabled;
+            out.contract_supported = ev.contract_supported;
+            out.snapshot_accepted = ev.snapshot_accepted;
+            out.uplink_ready = ev.uplink_ready;
+            out.downlink_suback_ready = ev.downlink_suback_ready;
+            out.ready = ev.ready;
+            out.owner_generation = ev.owner_generation;
+            out.connection_generation = ev.connection_generation;
+            out.cert_session_generation = ev.cert_session_generation;
+            out.reason_code = ev.reason_code;
+            cb(out);
+        };
+    capability_sub_ = client_->subscribeCapabilityReadinessChanged(
+        capability, std::move(wrapped));
+    return capability_sub_.isActive();
 }
 
 } // namespace tsp

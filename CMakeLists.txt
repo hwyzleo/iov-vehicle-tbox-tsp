@@ -47,6 +47,12 @@ if(NOT TARGET tbox::mqtt_client)
     find_package(TboxMqttClient CONFIG REQUIRED)
 endif()
 
+# --- TBox SEC client SDK（TBOX-TSP-DSN-CR-010 §3.2 / TBOX-SEC-DSN-CR-019:
+#     keyprov 件内状态查询与 Wrapped Key 原子导入，只通过 tbox::sec_client） ---
+if(NOT TARGET tbox::sec_client)
+    find_package(TboxSecClient CONFIG REQUIRED)
+endif()
+
 # --- nlohmann_json（TSP 源码直接使用；CR-007 §7: 直接 TARGET dependency） ---
 find_package(nlohmann_json REQUIRED)
 
@@ -57,16 +63,46 @@ find_package(nlohmann_json REQUIRED)
 #   已带 libprotobuf.so.17；头文件由 BUILD 纳入 TBOX_DEP_STAGING），
 #   与 TBOX-SOMEIP 的 pkg-config 消费方式一致。
 # ============================================================
-find_program(PROTOC_EXECUTABLE NAMES protoc REQUIRED)
+# 先解析 pkg-config protobuf（headers/libs），再选择与它同源目录的 protoc。
+# 若不这样做，find_program 可能命中 /usr/local/bin/protoc(3.12.4) 而 pkg-config
+# 提供的是 Homebrew protobuf(35.x) 头文件，导致“旧生成代码 + 新 headers”不匹配。
+#
+# 注意：FindPkgConfig 会缓存 __pkg_config_checked_<prefix>，旧 build/ 目录可能
+# 因此保留过期的 protobuf 结果（如已损坏的 /usr/local 3.12.4）。先清除该标记
+# 以便重配置时始终按当前环境重新解析 protobuf，避免旧缓存钉死错误版本。
+unset(__pkg_config_checked_PROTOBUF CACHE)
 if(NOT TARGET PkgConfig::PROTOBUF)
     find_package(PkgConfig REQUIRED)
     set(PKG_CONFIG_USE_CMAKE_PREFIX_PATH ON)
     pkg_check_modules(PROTOBUF REQUIRED IMPORTED_TARGET protobuf)
 endif()
 
+# 优先在 pkg-config protobuf 前缀的 bin/ 下查找 protoc（同源）；否则回退 PATH。
+# 使用独立变量（非缓存）避免旧 build/ 里过期 PROTOC_EXECUTABLE 缓存干扰。
+unset(TSP_PROTOBUF_PROTOC CACHE)
+if(PROTOBUF_INCLUDEDIR)
+    get_filename_component(_tsp_protobuf_prefix "${PROTOBUF_INCLUDEDIR}" DIRECTORY)
+    find_program(TSP_PROTOBUF_PROTOC NAMES protoc
+        HINTS "${_tsp_protobuf_prefix}/bin" "${_tsp_protobuf_prefix}/../bin"
+        NO_DEFAULT_PATH)
+    unset(_tsp_protobuf_prefix)
+endif()
+if(NOT TSP_PROTOBUF_PROTOC)
+    find_program(TSP_PROTOBUF_PROTOC NAMES protoc REQUIRED)
+endif()
+set(PROTOC_EXECUTABLE "${TSP_PROTOBUF_PROTOC}")
+message(STATUS "TSP protoc: ${PROTOC_EXECUTABLE} (protobuf ${PROTOBUF_VERSION})")
+
 set(TSP_PROTO_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/proto")
 set(TSP_PROTO_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/proto")
 file(GLOB_RECURSE TSP_PROTO_FILES CONFIGURE_DEPENDS "${TSP_PROTO_SRC_DIR}/*.proto")
+
+# protoc 路径变化时强制重新生成，避免旧生成物与当前头文件版本错配。
+# configure_file(COPYONLY) 仅在内容变化时更新 stamp 的 mtime。
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/tsp_protoc_path.in"
+     "${PROTOC_EXECUTABLE}\n")
+configure_file("${CMAKE_CURRENT_BINARY_DIR}/tsp_protoc_path.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/tsp_protoc_path.stamp" COPYONLY)
 
 set(TSP_PROTO_GEN_SOURCES "")
 set(TSP_PROTO_GEN_HEADERS "")
@@ -84,7 +120,7 @@ foreach(PROTO_FILE ${TSP_PROTO_FILES})
         COMMAND ${PROTOC_EXECUTABLE} --proto_path=${TSP_PROTO_SRC_DIR}
                 --cpp_out=${TSP_PROTO_GEN_DIR}
                 --experimental_allow_proto3_optional "${PROTO_FILE}"
-        DEPENDS "${PROTO_FILE}"
+        DEPENDS "${PROTO_FILE}" "${CMAKE_CURRENT_BINARY_DIR}/tsp_protoc_path.stamp"
         COMMENT "protoc: ${PROTO_REL}"
     )
 endforeach()
@@ -141,6 +177,10 @@ set(TBOX_TSP_DAEMON_SOURCES
         src/tsp_event_publisher.cpp
         src/tsp_framework_server.cpp
         src/vehicle_message_gateway.cpp   # CR-009 §16: 通用 VehicleMessage 网关
+        src/keyprov_protocol.cpp         # CR-010 §4.2: keyprov wire codec
+        src/v2c_key_provisioning_store.cpp      # CR-010 §5: 非敏感流程状态持久化
+        src/v2c_key_provisioning_coordinator.cpp # CR-010 §3.1: V2C keyprov 编排
+        src/sec_business_key_adapter.cpp         # CR-010 §3.2: SEC 业务密钥适配器
         src/tsp_error_codes.cpp
         src/net_status_provider.cpp
         src/log_adapter.cpp
@@ -153,6 +193,7 @@ target_include_directories(tbox_tsp_lib
 target_link_libraries(tbox_tsp_lib
         PUBLIC ${TSP_FRAMEWORK_LIBS}
                tbox::mqtt_client
+               tbox::sec_client
                tsp_proto
                nlohmann_json::nlohmann_json)
 target_compile_definitions(tbox_tsp_lib PUBLIC HAS_FRAMEWORK_LOG=1)

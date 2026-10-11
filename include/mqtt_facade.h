@@ -40,11 +40,47 @@ struct RoutedDownlinkEvent {
 using RoutedDownlinkCallback =
     std::function<void(const RoutedDownlinkEvent&)>;
 
+// ============================================================
+// Cloud / Capability Readiness (TBOX-MQTT-DSN-CR-014/015)
+// ============================================================
+struct CloudReadiness {
+    bool cloud_ready = false;
+    uint64_t connection_generation = 0;
+    uint64_t cert_session_generation = 0;
+    std::string credential_id;
+    uint64_t credential_version = 0;
+    std::string device_identity_digest;  // sha256(leaf DER)
+    std::string certificate_ref;         // sha256:<hex fingerprint>
+    std::string reason_code;
+    uint32_t contract_version = 0;
+    bool contract_supported = true;
+};
+
+using CloudReadinessCallback = std::function<void(const CloudReadiness&)>;
+
+struct CapabilityReadiness {
+    std::string capability;
+    bool enabled = false;
+    bool contract_supported = false;
+    bool snapshot_accepted = false;
+    bool uplink_ready = false;
+    bool downlink_suback_ready = false;
+    bool ready = false;
+    uint64_t owner_generation = 0;
+    uint64_t connection_generation = 0;
+    uint64_t cert_session_generation = 0;
+    std::string reason_code;
+};
+
+using CapabilityReadinessCallback =
+    std::function<void(const CapabilityReadiness&)>;
+
 // MQTT Facade -- 对 TBOX-MQTT 服务的客户端接口
 // SPEC §5.1 / CR-006: TSP 对 MQTT 只使用 tbox::mqtt_client 的
 // publishRoute / subscribeRoutedDownlink / replaceSubscriptionSnapshot，
 // 不操作其 socket/method/JSON，也不持有 MQTT 连接。
 // CR-009: legacy 完整 Topic publish/subscribe/registerRoute 路径已删除。
+// CR-010: 新增 Cloud/Capability Readiness 权威快照与事件订阅。
 class MqttFacade {
 public:
     virtual ~MqttFacade() = default;
@@ -89,6 +125,21 @@ public:
 
     // 检查 TBOX-MQTT 连接状态
     virtual bool is_connected() const = 0;
+
+    // ---- TBOX-MQTT-DSN-CR-014: Cloud Readiness 权威快照与事件 ----
+    // cloud_ready 与本次 TLS context 实际装载的 leaf 客户端证书身份绑定；
+    // callers 不得自行拼装身份。contract_supported=false 时不得宣告 ready。
+    virtual CloudReadiness getCloudReadiness() = 0;
+    virtual bool subscribeCloudReadinessChanged(CloudReadinessCallback callback) = 0;
+
+    // ---- TBOX-MQTT-DSN-CR-015: Capability Readiness ----
+    // capability=security.keyprov；ready = enabled && contract_supported &&
+    // snapshot_accepted && uplink_ready && downlink_suback_ready && cloud_ready。
+    // 不进入共享 Cloud Ready。
+    virtual CapabilityReadiness getCapabilityReadiness(const std::string& capability) = 0;
+    virtual bool subscribeCapabilityReadinessChanged(
+        const std::string& capability,
+        CapabilityReadinessCallback callback) = 0;
 };
 
 } // namespace tsp
