@@ -19,6 +19,8 @@
 
 #include <tbox/sec/business_key.h>
 
+#include "mqtt_session_context.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -78,6 +80,35 @@ constexpr const char* kKeyprovSuiteEcdhEsP256 =
     "WRAPPING_SUITE_ECDH_ES_P256_HKDF_SHA256_AES256GCM";
 
 // ============================================================
+// 会话身份（CR-011 §4）：三种上行身份必填，同源不可拼接
+// ============================================================
+//
+// 结构完整性由 keyprov_validate_identity 判定；完整性不等于“可发布”，
+// 也不代表证书已被云端认证。最终是否可发送由 MQTT daemon guard 判定。
+struct KeyprovSessionIdentity {
+    std::string ecu_uid;                   // MQTT leaf CN 规范值 ^[A-Z0-9-]{1,64}$
+    std::string device_identity_digest;    // 与 UID 同源（sha256 等，可为 sha256:<hex>）
+    std::string certificate_ref;           // 与 UID 同源（sha256:<hex>）
+    MqttSessionContext session;            // daemon epoch + connection/cert 代际
+};
+
+// UID 规范校验：ASCII 大写字母/数字/连字符，长度 1..64。
+// TSP 只验证规范值，不提供宽松修复（CR-011 §4）。
+bool keyprov_is_canonical_uid(const std::string& uid);
+
+// 摘要归一化：兼容 "sha256:<hex>" 与裸 hex（<= kKeyprovMaxDigestBytes），
+// 其它 <= 上限的字符串按原 bytes 接受。失败时 out 为空。
+bool keyprov_normalize_digest(const std::string& in, std::vector<uint8_t>& out);
+
+// 结构性完整性校验（身份必填，无默认值、无兜底）：
+//   - ecu_uid 非空且规范；
+//   - device_identity_digest / certificate_ref 非空；
+//   - session 完整（daemon_epoch 非空且两代际 > 0）。
+// 失败返回 false 并写入脱敏 reason（不含完整 UID/身份值）。
+bool keyprov_validate_identity(const KeyprovSessionIdentity& identity,
+                               std::string& reason);
+
+// ============================================================
 // 编解码状态
 // ============================================================
 enum class KeyProvCodecStatus : uint8_t {
@@ -98,7 +129,6 @@ const char* keyprov_codec_status_to_string(KeyProvCodecStatus s);
 // ============================================================
 struct KeyProvCertificateRef {
     std::string certificate_profile;              // <=64
-    std::vector<uint8_t> certificate_digest;      // <=64 bytes
     std::string key_encipherment_key_id;          // <=128
 };
 
@@ -112,7 +142,8 @@ struct KeyProvRequestData {
     std::string idempotency_key;                  // <=128
     std::string business_domain;                  // <=64
     std::vector<int> purposes;                    // {UPLINK, DOWNLINK}
-    std::vector<uint8_t> device_identity_digest;  // <=64 bytes
+    // CR-011 §4: device_identity_digest / certificate_ref.certificate_digest
+    // 不再由调用方填写，统一由 builder 从必填的 KeyprovSessionIdentity 派生。
     KeyProvCertificateRef certificate_ref;
     std::vector<int> supported_wrapping_suites;   // <=8
     std::vector<KeyProvCurrentVersion> current_versions;  // <=8
@@ -202,14 +233,19 @@ struct KeyProvEncodeOutcome {
 // ============================================================
 // 编码（只产出完整 Envelope bytes；不产生可读 JSON）
 // ============================================================
+// identity 为必填参数：缺失/非法时返回 FieldInvalid，不产生可发送 Envelope。
+// device_id 统一由公共 helper 从同一 identity 填写；Request 的身份摘要/引用
+// 也从该 identity 派生，保证同源。
 // message_id 为本次传输唯一标识；trace_id 可空。
 KeyProvEncodeOutcome build_keyprov_request_envelope(
+    const KeyprovSessionIdentity& identity,
     const KeyProvRequestData& in,
     const std::string& message_id,
     const std::string& trace_id);
 
 // ACK：correlation_id 指向响应 message_id（可空）。
 KeyProvEncodeOutcome build_keyprov_ack_envelope(
+    const KeyprovSessionIdentity& identity,
     const std::string& request_id,
     const std::vector<KeyProvImportItemResult>& items,
     int64_t timestamp_ms,
@@ -218,6 +254,7 @@ KeyProvEncodeOutcome build_keyprov_ack_envelope(
 
 // 状态对账请求：使用新 message_id，payload 保留原 request_id。
 KeyProvEncodeOutcome build_keyprov_status_request_envelope(
+    const KeyprovSessionIdentity& identity,
     const std::string& request_id,
     int64_t timestamp_ms,
     const std::string& message_id,

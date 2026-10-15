@@ -32,6 +32,7 @@ public:
         std::string content_type;
         std::string trace_id;
         std::string request_id;
+        std::optional<MqttSessionContext> expected_session;  // CR-011
     };
 
     // 配置 publishRoute 返回结果
@@ -56,7 +57,20 @@ public:
                                    const std::string& trace_id = "",
                                    const std::string& request_id = "") override {
         std::lock_guard<std::mutex> lock(mutex_);
-        publish_route_calls_.push_back({owner, route_id, msg_id, payload, qos, content_type, trace_id, request_id});
+        publish_route_calls_.push_back({owner, route_id, msg_id, payload, qos, content_type, trace_id, request_id, std::nullopt});
+        return publish_route_result;
+    }
+
+    // CR-011: 携 expected_session 的重载（不忽略、不转发旧接口）。
+    MqttPublishResult publishRoute(const std::string& owner,
+                                   const std::string& route_id,
+                                   const std::string& msg_id,
+                                   const std::vector<uint8_t>& payload,
+                                   const MqttPublishOptions& options) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        publish_route_calls_.push_back({owner, route_id, msg_id, payload, options.qos,
+                                        options.content_type, options.trace_id,
+                                        options.request_id, options.expected_session});
         return publish_route_result;
     }
 

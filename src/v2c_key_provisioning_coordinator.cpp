@@ -5,7 +5,6 @@
 #include "log_adapter.h"
 
 #include <algorithm>
-#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <random>
@@ -20,28 +19,6 @@ using tbox::sec::ErrorCode;
 namespace {
 
 constexpr const char* kCapabilityKeyprov = "security.keyprov";
-
-bool is_hex(const std::string& s) {
-    if (s.empty() || (s.size() % 2) != 0) return false;
-    for (char c : s) {
-        if (!std::isxdigit(static_cast<unsigned char>(c))) return false;
-    }
-    return true;
-}
-
-std::vector<uint8_t> hex_to_bytes(const std::string& s) {
-    auto nib = [](char c) -> uint8_t {
-        if (c >= '0' && c <= '9') return static_cast<uint8_t>(c - '0');
-        if (c >= 'a' && c <= 'f') return static_cast<uint8_t>(c - 'a' + 10);
-        return static_cast<uint8_t>(c - 'A' + 10);
-    };
-    std::vector<uint8_t> out;
-    out.reserve(s.size() / 2);
-    for (std::size_t i = 0; i + 1 < s.size(); i += 2) {
-        out.push_back(static_cast<uint8_t>((nib(s[i]) << 4) | nib(s[i + 1])));
-    }
-    return out;
-}
 
 // 从 SEC ImportResult 构造 ACK items（仅非敏感字段 + import_proof）
 std::vector<KeyProvImportItemResult> build_ack_items(
@@ -174,6 +151,13 @@ bool V2cKeyProvisioningCoordinator::start(bool start_monitor) {
     if (start_monitor_) {
         worker_ = std::thread([this] { worker_loop(); });
     }
+    // CR-011 §5.1: 订阅后主动拉取一次完整快照，避免仅依赖首个事件。
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        apply_cloud_readiness_locked(mqtt_->getCloudReadiness());
+        apply_capability_readiness_locked(
+            mqtt_->getCapabilityReadiness(kCapabilityKeyprov));
+    }
     LogAdapter::keyprov().info(
         "tsp.keyprov.started", "V2cKeyProvisioningCoordinator 启动", {
             {"monitor", tbox::fw::log::FieldValue::makeBool(start_monitor_)}
@@ -218,24 +202,97 @@ void V2cKeyProvisioningCoordinator::worker_loop() {
 void V2cKeyProvisioningCoordinator::on_cloud_readiness(
     const CloudReadiness& readiness) {
     std::lock_guard<std::mutex> lock(mutex_);
-    cloud_ = readiness;
-    identity_digest_raw_ = readiness.device_identity_digest;
-    certificate_ref_raw_ = readiness.certificate_ref;
-    if (readiness.cloud_ready) {
-        counters_.cloud_ready_events++;
-    }
-    capability_event_seen_ = true;
+    apply_cloud_readiness_locked(readiness);
     cv_.notify_all();
 }
 
 void V2cKeyProvisioningCoordinator::on_capability_readiness(
     const CapabilityReadiness& readiness) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (readiness.capability == kCapabilityKeyprov) {
-        capability_ = readiness;
-        capability_event_seen_ = true;
-    }
+    apply_capability_readiness_locked(readiness);
     cv_.notify_all();
+}
+
+// CR-011 §5.1: ready 撤销 / epoch / connection / cert 变化 / IPC 重连 /
+// 序列缺口先失效身份缓存与未发送任务（保留业务 requestId）。
+void V2cKeyProvisioningCoordinator::invalidate_identity_locked(
+    const char* reason) {
+    if (identity_valid_) {
+        LogAdapter::keyprov().info(
+            "tsp.keyprov.identity_invalidated",
+            "keyprov 会话身份失效", {
+                {"reason", tbox::fw::log::FieldValue::makeString(reason)}
+            });
+    }
+    identity_valid_ = false;
+    identity_ = KeyprovSessionIdentity{};
+    // 旧传输态不得跨上下文重发；Cloud deadline 必须暂停。
+    pending_items_.clear();
+    last_response_message_id_.clear();
+    deadline_ms_ = 0;
+    // 业务 requestId 保留：网络代际不是业务幂等键（CR-011 §6）。
+}
+
+void V2cKeyProvisioningCoordinator::apply_cloud_readiness_locked(
+    const CloudReadiness& readiness) {
+    const bool epoch_changed =
+        readiness.session.daemon_epoch != cloud_.session.daemon_epoch;
+    if (epoch_changed) {
+        // epoch 变化时不跨生命周期比较 sequence。
+        last_cloud_sequence_ = 0;
+    }
+
+    // 同 epoch 内乱序/重复事件：不覆盖新状态（迟到事件不得回退身份）。
+    if (!epoch_changed && readiness.event_sequence != 0 &&
+        last_cloud_sequence_ != 0 &&
+        readiness.event_sequence <= last_cloud_sequence_) {
+        return;
+    }
+    const bool sequence_gap =
+        !epoch_changed && last_cloud_sequence_ != 0 &&
+        readiness.event_sequence > last_cloud_sequence_ + 1;
+    if (readiness.event_sequence != 0) {
+        last_cloud_sequence_ = readiness.event_sequence;
+    }
+
+    const bool connection_changed =
+        readiness.session.connection_generation !=
+        cloud_.session.connection_generation;
+    const bool cert_changed =
+        readiness.session.cert_session_generation !=
+        cloud_.session.cert_session_generation;
+
+    cloud_ = readiness;
+    if (readiness.cloud_ready) {
+        counters_.cloud_ready_events++;
+    }
+    capability_event_seen_ = true;
+
+    if (epoch_changed || connection_changed || cert_changed ||
+        sequence_gap || !readiness.cloud_ready) {
+        invalidate_identity_locked(epoch_changed ? "daemon_epoch_changed"
+                                  : connection_changed ? "connection_changed"
+                                  : cert_changed ? "cert_session_changed"
+                                  : sequence_gap ? "event_sequence_gap"
+                                                 : "cloud_not_ready");
+    }
+}
+
+void V2cKeyProvisioningCoordinator::apply_capability_readiness_locked(
+    const CapabilityReadiness& readiness) {
+    if (readiness.capability != kCapabilityKeyprov) return;
+    capability_ = readiness;
+    capability_event_seen_ = true;
+    if (!readiness.ready) {
+        // capability 撤销：暂停网络操作并失效未发送任务（保留 requestId）。
+        invalidate_identity_locked("capability_not_ready");
+    }
+}
+
+void V2cKeyProvisioningCoordinator::refresh_readiness_locked() {
+    apply_cloud_readiness_locked(mqtt_->getCloudReadiness());
+    apply_capability_readiness_locked(
+        mqtt_->getCapabilityReadiness(kCapabilityKeyprov));
 }
 
 // ============================================================
@@ -252,6 +309,8 @@ V2cKeyProvisioningSnapshot V2cKeyProvisioningCoordinator::snapshot() const {
     s.state = state_;
     s.request_id = record_.request_id;
     s.capability_ready = capability_ready_;
+    s.identity_valid = identity_valid_;
+    s.publish_session_supported = publish_session_supported_;
     s.reason_code = gate_reason_;
     s.attempt_count = record_.attempt_count;
     s.last_error = record_.last_error;
@@ -381,7 +440,7 @@ void V2cKeyProvisioningCoordinator::handle_routed_downlink(
 // 状态推进
 // ============================================================
 bool V2cKeyProvisioningCoordinator::capability_gate_locked(
-    std::string& reason) const {
+    std::string& reason) {
     if (!config_.enabled) {
         reason = "disabled";
         return false;
@@ -390,20 +449,52 @@ bool V2cKeyProvisioningCoordinator::capability_gate_locked(
         reason = "stopping";
         return false;
     }
+    // CR-011 §5.1: MQTT readiness v3 与 session-bound publish 能力必须分别确认。
+    publish_session_supported_ =
+        cloud_.publish_contract_version >= kMqttPublishSessionContractVersion;
+    if (!cloud_.contract_supported ||
+        cloud_.contract_version < kMqttCloudReadinessContractVersionV3) {
+        reason = "readiness_v3_unsupported";
+        return false;
+    }
+    if (!publish_session_supported_) {
+        reason = "session_bound_publish_unsupported";
+        return false;
+    }
     if (!capability_.ready) {
         reason = capability_.reason_code.empty()
                      ? "capability_not_ready"
                      : capability_.reason_code;
         return false;
     }
-    if (!cloud_.certificate_ref.empty() && cloud_.certificate_ref != certificate_ref_raw_) {
-        reason = "identity_changed";
+    if (!cloud_.cloud_ready) {
+        reason = "cloud_not_ready";
         return false;
     }
-    if (identity_digest_raw_.empty() || certificate_ref_raw_.empty()) {
-        reason = "identity_unavailable";
+    // cloud/capability 必须同 epoch、同 connection/cert 代际。
+    if (capability_.connection_generation !=
+            cloud_.session.connection_generation ||
+        capability_.cert_session_generation !=
+            cloud_.session.cert_session_generation) {
+        reason = "generation_mismatch";
         return false;
     }
+    if (!keyprov_is_canonical_uid(cloud_.ecu_uid)) {
+        reason = "uid_invalid";
+        return false;
+    }
+    // 结构性完整性；不代表可发布/已认证，最终由 daemon guard 判定。
+    identity_.ecu_uid = cloud_.ecu_uid;
+    identity_.device_identity_digest = cloud_.device_identity_digest;
+    identity_.certificate_ref = cloud_.certificate_ref;
+    identity_.session = cloud_.session;
+    std::string identity_reason;
+    if (!keyprov_validate_identity(identity_, identity_reason)) {
+        identity_ = KeyprovSessionIdentity{};
+        reason = identity_reason;
+        return false;
+    }
+    identity_valid_ = true;
     return true;
 }
 
@@ -418,7 +509,11 @@ void V2cKeyProvisioningCoordinator::tick_locked() {
     gate_reason_ = gate ? "" : reason;
 
     if (!gate) {
-        // 网络操作暂停，保留非敏感流程状态与原 requestId
+        // 网络操作暂停，保留非敏感流程状态与原 requestId。
+        // 但若身份已不再有效（或门禁原因属身份/代际类），则同时失效未发送任务。
+        if (identity_valid_) {
+            invalidate_identity_locked(reason.c_str());
+        }
         if (state_ == V2cKeyProvState::REQUESTING ||
             state_ == V2cKeyProvState::WAIT_RESPONSE ||
             state_ == V2cKeyProvState::IMPORTING ||
@@ -550,9 +645,8 @@ void V2cKeyProvisioningCoordinator::do_request_locked() {
         int v = keyprov_purpose_from_string(p);
         if (v != 0) req.purposes.push_back(v);
     }
-    normalize_digest(identity_digest_raw_, req.device_identity_digest);
+    // CR-011 §4: 身份摘要/引用由 builder 从同一 identity 派生，不在此拼接。
     req.certificate_ref.certificate_profile = config_.certificate_profile;
-    normalize_digest(certificate_ref_raw_, req.certificate_ref.certificate_digest);
     req.supported_wrapping_suites = {
         keyprov_wrapping_suite_from_string(kKeyprovSuiteHpkeBaseX25519),
         keyprov_wrapping_suite_from_string(kKeyprovSuiteEcdhEsP256)};
@@ -567,7 +661,7 @@ void V2cKeyProvisioningCoordinator::do_request_locked() {
     req.expire_at_ms = now + static_cast<int64_t>(config_.request_timeout_ms) + 1000;
 
     std::string message_id = generate_id("msg");
-    auto enc = build_keyprov_request_envelope(req, message_id, "");
+    auto enc = build_keyprov_request_envelope(identity_, req, message_id, "");
     if (enc.status != KeyProvCodecStatus::Ok) {
         state_ = V2cKeyProvState::RETRY_WAIT;
         record_.last_error = "request_encode_failed";
@@ -575,19 +669,13 @@ void V2cKeyProvisioningCoordinator::do_request_locked() {
         persist_locked();
         return;
     }
-    MqttPublishResult pr = mqtt_->publishRoute(
-        "tsp", config_.route_up, message_id, enc.envelope_bytes, 1,
-        "application/x-protobuf", "", record_.request_id);
-    if (pr.accepted || pr.outcome == MqttDeliveryOutcome::Unknown) {
+    if (publish_keyprov_locked(message_id, enc.envelope_bytes, record_.request_id)) {
         state_ = V2cKeyProvState::WAIT_RESPONSE;
         deadline_ms_ = now + config_.request_timeout_ms;
         record_.attempt_count++;
         counters_.requests_published++;
         persist_locked();
     } else {
-        state_ = V2cKeyProvState::RETRY_WAIT;
-        record_.last_error = "route_publish_rejected";
-        schedule_retry_locked();
         persist_locked();
     }
 }
@@ -714,22 +802,24 @@ void V2cKeyProvisioningCoordinator::do_ack_locked() {
         if (record_.attempt_count >= config_.max_attempts_before_alert && !status_sent_) {
             std::string message_id = generate_id("msg");
             auto enc = build_keyprov_status_request_envelope(
-                record_.request_id, now, message_id, "");
+                identity_, record_.request_id, now, message_id, "");
             if (enc.status == KeyProvCodecStatus::Ok) {
-                mqtt_->publishRoute("tsp", config_.route_up, message_id,
-                                    enc.envelope_bytes, 1,
-                                    "application/x-protobuf", "", record_.request_id);
-                counters_.status_requests_sent++;
-                status_sent_ = true;
+                if (publish_keyprov_locked(message_id, enc.envelope_bytes,
+                                           record_.request_id)) {
+                    counters_.status_requests_sent++;
+                    status_sent_ = true;
+                    deadline_ms_ = now + config_.ack_timeout_ms;
+                }
+                persist_locked();
             }
-            deadline_ms_ = now + config_.ack_timeout_ms;
             return;
         }
     }
 
     std::string message_id = generate_id("msg");
     auto enc = build_keyprov_ack_envelope(
-        record_.request_id, ack_items_, now, message_id, last_response_message_id_);
+        identity_, record_.request_id, ack_items_, now, message_id,
+        last_response_message_id_);
     if (enc.status != KeyProvCodecStatus::Ok) {
         state_ = V2cKeyProvState::RETRY_WAIT;
         record_.last_error = "ack_encode_failed";
@@ -737,19 +827,13 @@ void V2cKeyProvisioningCoordinator::do_ack_locked() {
         persist_locked();
         return;
     }
-    MqttPublishResult pr = mqtt_->publishRoute(
-        "tsp", config_.route_up, message_id, enc.envelope_bytes, 1,
-        "application/x-protobuf", "", record_.request_id);
-    if (pr.accepted || pr.outcome == MqttDeliveryOutcome::Unknown) {
+    if (publish_keyprov_locked(message_id, enc.envelope_bytes, record_.request_id)) {
         ack_sent_ = true;
         record_.attempt_count++;
         deadline_ms_ = now + config_.ack_timeout_ms;
         counters_.acks_sent++;
         persist_locked();
     } else {
-        state_ = V2cKeyProvState::RETRY_WAIT;
-        record_.last_error = "ack_publish_rejected";
-        schedule_retry_locked();
         persist_locked();
     }
 }
@@ -840,23 +924,80 @@ bool V2cKeyProvisioningCoordinator::keyprov_response_valid_locked(
     return true;
 }
 
-bool V2cKeyProvisioningCoordinator::normalize_digest(
-    const std::string& in, std::vector<uint8_t>& out) const {
-    std::string s = in;
-    const std::string prefix = "sha256:";
-    if (s.rfind(prefix, 0) == 0) {
-        s = s.substr(prefix.size());
-    }
-    if (is_hex(s)) {
-        out = hex_to_bytes(s);
-        return !out.empty() && out.size() <= kKeyprovMaxDigestBytes;
-    }
-    if (s.size() > kKeyprovMaxDigestBytes) {
-        out.clear();
+// CR-011 §5.2/§6: 携 expected_session 发布 keyprov 上行并按 reason 分流。
+// 返回 true 表示 daemon 已接管或结果未知（需用原 requestId 对账）。
+bool V2cKeyProvisioningCoordinator::publish_keyprov_locked(
+    const std::string& message_id,
+    const std::vector<uint8_t>& envelope_bytes,
+    const std::string& request_id) {
+    if (!identity_valid_) {
+        state_ = V2cKeyProvState::WAIT_CLOUD;
+        record_.last_error = "identity_unavailable";
         return false;
     }
-    out.assign(s.begin(), s.end());
-    return true;
+    // keyprov 必须携带同一快照的 session context；不得走无上下文重载降级。
+    MqttPublishOptions options;
+    options.qos = 1;
+    options.content_type = "application/x-protobuf";
+    options.request_id = request_id;
+    options.expected_session = identity_.session;
+
+    MqttPublishResult pr = mqtt_->publishRoute(
+        "tsp", config_.route_up, message_id, envelope_bytes, options);
+    if (pr.accepted || pr.outcome == MqttDeliveryOutcome::Unknown) {
+        return true;
+    }
+
+    // CR-011 §6: 保留数字码 + reason，输出脱敏诊断（不含身份/payload）。
+    LogAdapter::keyprov().warn(
+        "tsp.keyprov.publish_rejected",
+        "keyprov 上行被 MQTT 拒绝", {
+            {"reason", tbox::fw::log::FieldValue::makeString(pr.reason_code)},
+            {"error_code", tbox::fw::log::FieldValue::makeInt(
+                static_cast<int64_t>(pr.error_code))},
+            {"retryable", tbox::fw::log::FieldValue::makeBool(pr.retryable)}
+        });
+
+    const std::string& reason = pr.reason_code;
+    if (reason == session_reason::kPublishContextStale) {
+        // 构造/发送间切换：失效本地身份、暂停 deadline，刷新快照后先对账再重构。
+        invalidate_identity_locked("publish_session_stale");
+        state_ = V2cKeyProvState::WAIT_CLOUD;
+        record_.last_error = "publish_session_stale";
+        refresh_readiness_locked();
+        return false;
+    }
+    if (reason == session_reason::kPublishContextRequired) {
+        // 本地调用缺陷：阻断 keyprov 并告警，不改用 legacy。
+        state_ = V2cKeyProvState::BLOCKED;
+        record_.last_error = "publish_session_required";
+        LogAdapter::keyprov().error(
+            "tsp.keyprov.publish_session_required",
+            "keyprov 发布未携会话上下文，阻断流程");
+        return false;
+    }
+    if (reason == session_reason::kPublishContextUnsupported) {
+        // 版本门禁失败：NOT_READY，不放宽 guard。
+        publish_session_supported_ = false;
+        state_ = V2cKeyProvState::WAIT_CLOUD;
+        record_.last_error = "publish_session_unsupported";
+        return false;
+    }
+    if (reason == session_reason::kSessionIdentityInvalid ||
+        reason == session_reason::kSessionIdentityConflict ||
+        reason == session_reason::kSessionIdentityMissing) {
+        // 身份安全问题：阻断，不无限重发。
+        invalidate_identity_locked("session_identity_invalid");
+        state_ = V2cKeyProvState::BLOCKED;
+        record_.last_error = "session_identity_invalid";
+        return false;
+    }
+
+    state_ = V2cKeyProvState::RETRY_WAIT;
+    record_.last_error = pr.retryable ? "route_publish_rejected"
+                                      : "route_publish_rejected_fatal";
+    schedule_retry_locked();
+    return false;
 }
 
 int64_t V2cKeyProvisioningCoordinator::now_ms() {

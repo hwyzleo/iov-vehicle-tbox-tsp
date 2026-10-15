@@ -38,6 +38,14 @@ public:
                                    const std::string& trace_id = "",
                                    const std::string& request_id = "") override;
 
+    // CR-011 §5.2: 携 expected_session 的发布重载；直接映射到支持会话绑定的
+    // tbox::mqtt::publishRoute(..., PublishOptions)，不忽略也不转发到旧接口。
+    MqttPublishResult publishRoute(const std::string& owner,
+                                   const std::string& route_id,
+                                   const std::string& msg_id,
+                                   const std::vector<uint8_t>& payload,
+                                   const MqttPublishOptions& options) override;
+
     bool subscribeRoutedDownlink(const std::string& owner,
                                  RoutedDownlinkCallback callback) override;
 

@@ -47,6 +47,22 @@ bool MqttClientAdapter::is_connected() const {
     return client_->getConnectionState() == ::tbox::mqtt::ConnectionState::CONNECTED;
 }
 
+namespace {
+
+MqttPublishResult map_publish_result(const ::tbox::mqtt::PublishResult& pr) {
+    MqttPublishResult out;
+    out.accepted = pr.accepted;
+    out.outcome = (pr.outcome == ::tbox::mqtt::PublishOutcome::UNKNOWN)
+        ? MqttDeliveryOutcome::Unknown : MqttDeliveryOutcome::Accepted;
+    out.reason_code = pr.reason_code;
+    out.retryable = pr.retryable;
+    out.error_code = pr.error.has_value()
+        ? static_cast<uint32_t>(*pr.error) : 0u;
+    return out;
+}
+
+} // namespace
+
 MqttPublishResult MqttClientAdapter::publishRoute(const std::string& owner,
                                                    const std::string& route_id,
                                                    const std::string& msg_id,
@@ -61,12 +77,32 @@ MqttPublishResult MqttClientAdapter::publishRoute(const std::string& owner,
         static_cast<::tbox::mqtt::QoS>(qos),
         ::tbox::mqtt::Priority::NORMAL,
         content_type, trace_id, request_id);
+    return map_publish_result(pr);
+}
 
-    MqttPublishResult out;
-    out.accepted = pr.accepted;
-    out.outcome = (pr.outcome == ::tbox::mqtt::PublishOutcome::UNKNOWN)
-        ? MqttDeliveryOutcome::Unknown : MqttDeliveryOutcome::Accepted;
-    return out;
+MqttPublishResult MqttClientAdapter::publishRoute(
+    const std::string& owner,
+    const std::string& route_id,
+    const std::string& msg_id,
+    const std::vector<uint8_t>& payload,
+    const MqttPublishOptions& options) {
+    // CR-011 §5.2: keyprov 走本重载，session context 直接映射到 MQTT SDK 的
+    // PublishOptions.expected_session；不忽略、不转发到无上下文旧重载。
+    ::tbox::mqtt::PublishOptions wire;
+    wire.qos = static_cast<::tbox::mqtt::QoS>(options.qos);
+    wire.priority = ::tbox::mqtt::Priority::NORMAL;
+    wire.content_type = options.content_type;
+    wire.trace_id = options.trace_id;
+    wire.request_id = options.request_id;
+    if (options.expected_session.has_value()) {
+        ::tbox::mqtt::SessionContext sc;
+        sc.daemon_epoch = options.expected_session->daemon_epoch;
+        sc.connection_generation = options.expected_session->connection_generation;
+        sc.cert_session_generation = options.expected_session->cert_session_generation;
+        wire.expected_session = sc;
+    }
+    auto pr = client_->publishRoute(owner, route_id, msg_id, payload, wire);
+    return map_publish_result(pr);
 }
 
 bool MqttClientAdapter::subscribeRoutedDownlink(const std::string& owner,
@@ -203,6 +239,13 @@ CloudReadiness MqttClientAdapter::getCloudReadiness() {
     out.reason_code = wr.reason_code;
     out.contract_version = wr.contract_version;
     out.contract_supported = wr.contract_supported;
+    // CR-011 §3: v3 会话身份投影，与上面摘要/引用来自同一快照。
+    out.ecu_uid = wr.ecu_uid;
+    out.session.daemon_epoch = wr.session_context.daemon_epoch;
+    out.session.connection_generation = wr.session_context.connection_generation;
+    out.session.cert_session_generation = wr.session_context.cert_session_generation;
+    out.publish_contract_version = wr.publish_contract_version;
+    out.event_sequence = wr.event_sequence;
     return out;
 }
 
@@ -223,6 +266,12 @@ bool MqttClientAdapter::subscribeCloudReadinessChanged(
             out.reason_code = ev.reason_code;
             out.contract_version = ev.contract_version;
             out.contract_supported = ev.contract_supported;
+            out.ecu_uid = ev.ecu_uid;
+            out.session.daemon_epoch = ev.session_context.daemon_epoch;
+            out.session.connection_generation = ev.session_context.connection_generation;
+            out.session.cert_session_generation = ev.session_context.cert_session_generation;
+            out.publish_contract_version = ev.publish_contract_version;
+            out.event_sequence = ev.event_sequence;
             cb(out);
         };
     cloud_ready_sub_ = client_->subscribeCloudReadinessChanged(std::move(wrapped));

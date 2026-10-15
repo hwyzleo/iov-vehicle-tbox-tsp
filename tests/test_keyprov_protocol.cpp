@@ -17,6 +17,17 @@ std::vector<uint8_t> to_bytes(const std::string& s) {
     return std::vector<uint8_t>(s.begin(), s.end());
 }
 
+KeyprovSessionIdentity make_identity(const std::string& uid = "ECU-1") {
+    KeyprovSessionIdentity id;
+    id.ecu_uid = uid;
+    id.device_identity_digest = std::string(64, 'a');
+    id.certificate_ref = "sha256:" + std::string(64, 'b');
+    id.session.daemon_epoch = "epoch-1";
+    id.session.connection_generation = 1;
+    id.session.cert_session_generation = 1;
+    return id;
+}
+
 std::vector<uint8_t> make_response_envelope(bool good_purposes = true) {
     KeyProvisioningResponse resp;
     resp.set_request_id("req-1");
@@ -59,15 +70,13 @@ TEST(KeyProvProtocolTest, RequestEnvelopeCarriesExpectedFields) {
     req.idempotency_key = "req-1";
     req.business_domain = "V2C_COMM";
     req.purposes = {kKeyProvPurposeUplinkValue, kKeyProvPurposeDownlinkValue};
-    req.device_identity_digest = std::vector<uint8_t>(32, 0xAB);
     req.certificate_ref.certificate_profile = "mqtt";
-    req.certificate_ref.certificate_digest = std::vector<uint8_t>(32, 0xCD);
     req.supported_wrapping_suites = {
         keyprov_wrapping_suite_from_string(kKeyprovSuiteEcdhEsP256)};
     req.timestamp_ms = 1000;
     req.expire_at_ms = 2000;
 
-    auto out = build_keyprov_request_envelope(req, "msg-1", "trace-1");
+    auto out = build_keyprov_request_envelope(make_identity(), req, "msg-1", "trace-1");
     ASSERT_EQ(out.status, KeyProvCodecStatus::Ok);
     ASSERT_FALSE(out.envelope_bytes.empty());
 
@@ -78,6 +87,8 @@ TEST(KeyProvProtocolTest, RequestEnvelopeCarriesExpectedFields) {
     EXPECT_EQ(env.protocol_version(), "keyprov-v1");
     EXPECT_EQ(env.payload_type(), kKeyprovPayloadRequest);
     EXPECT_EQ(env.message_id(), "msg-1");
+    // CR-011 §4: 公共 Envelope.device_id 由身份必填填写。
+    EXPECT_EQ(env.device_id(), "ECU-1");
 
     KeyProvisioningRequest parsed;
     ASSERT_TRUE(parsed.ParseFromString(env.payload()));
@@ -86,7 +97,9 @@ TEST(KeyProvProtocolTest, RequestEnvelopeCarriesExpectedFields) {
     ASSERT_EQ(parsed.purposes_size(), 2);
     EXPECT_EQ(parsed.purposes(0), KEY_PURPOSE_UPLINK_AEAD);
     EXPECT_EQ(parsed.purposes(1), KEY_PURPOSE_DOWNLINK_AEAD);
+    // 64 hex -> 32 bytes，且证书摘要与 UID 同源（同一 identity）。
     EXPECT_EQ(parsed.device_identity_digest().size(), 32u);
+    EXPECT_EQ(parsed.certificate_ref().certificate_digest().size(), 32u);
 }
 
 TEST(KeyProvProtocolTest, RequestRejectsOversizeFields) {
@@ -95,8 +108,98 @@ TEST(KeyProvProtocolTest, RequestRejectsOversizeFields) {
     req.idempotency_key = "idem";
     req.business_domain = "V2C_COMM";
     req.purposes = {1, 2};
-    auto out = build_keyprov_request_envelope(req, "m", "");
+    auto out = build_keyprov_request_envelope(make_identity(), req, "m", "");
     EXPECT_EQ(out.status, KeyProvCodecStatus::FieldInvalid);
+}
+
+TEST(KeyProvProtocolTest, AllUplinkBuildersFillDeviceId) {
+    KeyProvRequestData req;
+    req.request_id = "req-1";
+    req.idempotency_key = "req-1";
+    req.business_domain = "V2C_COMM";
+    req.purposes = {kKeyProvPurposeUplinkValue};
+    auto id = make_identity();
+
+    auto req_out = build_keyprov_request_envelope(id, req, "m1", "");
+    ASSERT_EQ(req_out.status, KeyProvCodecStatus::Ok);
+    VehicleMessageEnvelope env1;
+    ASSERT_TRUE(env1.ParseFromArray(req_out.envelope_bytes.data(),
+                                    (int)req_out.envelope_bytes.size()));
+    EXPECT_EQ(env1.device_id(), "ECU-1");
+
+    KeyProvImportItemResult a;
+    a.purpose = kKeyProvPurposeUplinkValue;
+    a.key_id = "kid-up";
+    a.business_key_version = 1;
+    a.result = kKeyProvImportImported;
+    auto ack_out = build_keyprov_ack_envelope(id, "req-1", {a}, 1, "m2", "");
+    ASSERT_EQ(ack_out.status, KeyProvCodecStatus::Ok);
+    VehicleMessageEnvelope env2;
+    ASSERT_TRUE(env2.ParseFromArray(ack_out.envelope_bytes.data(),
+                                    (int)ack_out.envelope_bytes.size()));
+    EXPECT_EQ(env2.device_id(), "ECU-1");
+
+    auto st_out = build_keyprov_status_request_envelope(id, "req-1", 1, "m3", "");
+    ASSERT_EQ(st_out.status, KeyProvCodecStatus::Ok);
+    VehicleMessageEnvelope env3;
+    ASSERT_TRUE(env3.ParseFromArray(st_out.envelope_bytes.data(),
+                                    (int)st_out.envelope_bytes.size()));
+    EXPECT_EQ(env3.device_id(), "ECU-1");
+}
+
+TEST(KeyProvProtocolTest, BuildersRejectMissingOrInvalidIdentity) {
+    KeyProvRequestData req;
+    req.request_id = "req-1";
+    req.idempotency_key = "req-1";
+    req.business_domain = "V2C_COMM";
+    req.purposes = {kKeyProvPurposeUplinkValue};
+
+    // 空 UID
+    auto empty = make_identity();
+    empty.ecu_uid.clear();
+    EXPECT_EQ(build_keyprov_request_envelope(empty, req, "m", "").status,
+              KeyProvCodecStatus::FieldInvalid);
+
+    // 非规范 UID（小写/非法字符）
+    EXPECT_EQ(build_keyprov_request_envelope(make_identity("lower-uid"), req, "m", "").status,
+              KeyProvCodecStatus::FieldInvalid);
+    EXPECT_EQ(build_keyprov_request_envelope(make_identity("ECU_1"), req, "m", "").status,
+              KeyProvCodecStatus::FieldInvalid);
+
+    // 证书身份缺失
+    auto no_cert = make_identity();
+    no_cert.certificate_ref.clear();
+    EXPECT_EQ(build_keyprov_request_envelope(no_cert, req, "m", "").status,
+              KeyProvCodecStatus::FieldInvalid);
+
+    // session 不完整
+    auto no_session = make_identity();
+    no_session.session.daemon_epoch.clear();
+    EXPECT_EQ(build_keyprov_request_envelope(no_session, req, "m", "").status,
+              KeyProvCodecStatus::FieldInvalid);
+    auto no_gen = make_identity();
+    no_gen.session.cert_session_generation = 0;
+    EXPECT_EQ(build_keyprov_request_envelope(no_gen, req, "m", "").status,
+              KeyProvCodecStatus::FieldInvalid);
+
+    // ACK/StatusRequest 同样拒绝无身份（不产生可发送 Envelope）
+    auto bad = make_identity();
+    bad.ecu_uid.clear();
+    EXPECT_EQ(build_keyprov_ack_envelope(bad, "req-1", {}, 1, "m", "").status,
+              KeyProvCodecStatus::FieldInvalid);
+    EXPECT_EQ(build_keyprov_status_request_envelope(bad, "req-1", 1, "m", "").status,
+              KeyProvCodecStatus::FieldInvalid);
+}
+
+TEST(KeyProvProtocolTest, CanonicalUidRules) {
+    EXPECT_TRUE(keyprov_is_canonical_uid("ECU-1"));
+    EXPECT_TRUE(keyprov_is_canonical_uid("A"));
+    EXPECT_TRUE(keyprov_is_canonical_uid(std::string(64, 'A')));
+    EXPECT_FALSE(keyprov_is_canonical_uid(""));
+    EXPECT_FALSE(keyprov_is_canonical_uid(std::string(65, 'A')));
+    EXPECT_FALSE(keyprov_is_canonical_uid("lower"));
+    EXPECT_FALSE(keyprov_is_canonical_uid("ECU_1"));
+    EXPECT_FALSE(keyprov_is_canonical_uid("ECU 1"));
 }
 
 TEST(KeyProvProtocolTest, DecodeResponseProducesSecureItems) {
@@ -176,7 +279,7 @@ TEST(KeyProvProtocolTest, AckEnvelopeHasNoWrappedKey) {
     a.result = kKeyProvImportImported;
     a.import_proof = std::vector<uint8_t>(16, 0x01);
     a.proof_algorithm = "hmac-sha256";
-    auto out = build_keyprov_ack_envelope("req-1", {a}, 1234, "msg-ack", "msg-resp");
+    auto out = build_keyprov_ack_envelope(make_identity(), "req-1", {a}, 1234, "msg-ack", "msg-resp");
     ASSERT_EQ(out.status, KeyProvCodecStatus::Ok);
     VehicleMessageEnvelope env;
     ASSERT_TRUE(env.ParseFromArray(out.envelope_bytes.data(),

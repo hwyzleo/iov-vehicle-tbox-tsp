@@ -131,12 +131,22 @@ FakeSecClient::StatusItem active(const std::string& p) {
 }
 
 void make_ready(const std::shared_ptr<MockMqttFacade>& mqtt, bool ready = true) {
+    static uint64_t seq = 0;
     CloudReadiness cr;
     cr.cloud_ready = ready;
     cr.cert_session_generation = 7;
+    cr.connection_generation = 7;
     cr.device_identity_digest = std::string(64, 'b');
     cr.certificate_ref = "sha256:" + std::string(64, 'b');
     cr.contract_supported = true;
+    cr.contract_version = 3;
+    cr.publish_contract_version = 1;
+    // CR-011 §3: v3 会话身份投影（同一快照）。
+    cr.ecu_uid = "ECU-INT-1";
+    cr.session.daemon_epoch = "epoch-int";
+    cr.session.connection_generation = 7;
+    cr.session.cert_session_generation = 7;
+    cr.event_sequence = ++seq;
     mqtt->deliver_cloud_readiness(cr);
     CapabilityReadiness cap;
     cap.capability = "security.keyprov";
@@ -146,6 +156,8 @@ void make_ready(const std::shared_ptr<MockMqttFacade>& mqtt, bool ready = true) 
     cap.snapshot_accepted = true;
     cap.uplink_ready = true;
     cap.downlink_suback_ready = true;
+    cap.connection_generation = 7;
+    cap.cert_session_generation = 7;
     mqtt->deliver_capability_readiness(cap);
 }
 
@@ -221,6 +233,24 @@ TEST(KeyProvisioningIntegrationTest, FullFlowAndCapabilityPauseResume) {
     sec->import_proof = {0x01};
     coord.tick();
     EXPECT_EQ(coord.snapshot().state, V2cKeyProvState::ACK_PENDING);
+
+    // CR-011 §4/§5.2: Request 与 ACK 上行都必须携 device_id 与 expected_session。
+    {
+        bool saw_request = false;
+        bool saw_ack = false;
+        for (const auto& c : mqtt->publish_route_calls()) {
+            if (c.route_id != "keyprov.uplink") continue;
+            EXPECT_TRUE(c.expected_session.has_value());
+            VehicleMessageEnvelope env;
+            if (!env.ParseFromArray(c.payload.data(), (int)c.payload.size())) continue;
+            EXPECT_EQ(env.device_id(), "ECU-INT-1");
+            if (env.payload_type() == kKeyprovPayloadRequest) saw_request = true;
+            if (env.payload_type() == kKeyprovPayloadAck) saw_ack = true;
+        }
+        EXPECT_TRUE(saw_request);
+        EXPECT_TRUE(saw_ack);
+    }
+
     coord.handle_routed_downlink(downlink(
         make_ack_result(rid, KEY_PROVISIONING_RESULT_SUCCEEDED)));
     EXPECT_EQ(coord.snapshot().state, V2cKeyProvState::ACTIVE);

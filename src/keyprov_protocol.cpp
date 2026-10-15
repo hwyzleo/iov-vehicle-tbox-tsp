@@ -4,6 +4,7 @@
 #include "security/keyprov/v1/key_provisioning.pb.h"
 #include "vehicle/common/v1/envelope.pb.h"
 
+#include <cctype>
 #include <cstring>
 #include <utility>
 
@@ -59,8 +60,11 @@ KeyProvEncodeOutcome serialize_envelope(
     return out;
 }
 
-// 公共 Envelope 字段填充
+// 公共 Envelope 字段填充（CR-011 §4）。
+// identity 为必填有效身份：统一 set_device_id(identity.ecu_uid)，保留原
+// request/message/correlation/service/timestamp/trace 语义；不修改字段号。
 void fill_common(::vehicle::common::v1::VehicleMessageEnvelope& env,
+                 const KeyprovSessionIdentity& identity,
                  const std::string& request_id,
                  const std::string& message_id,
                  const std::string& correlation_id,
@@ -72,6 +76,7 @@ void fill_common(::vehicle::common::v1::VehicleMessageEnvelope& env,
     env.set_protocol_version(kKeyprovProtocolVersion);
     env.set_payload_type(payload_type);
     env.set_message_id(message_id);
+    env.set_device_id(identity.ecu_uid);
     if (!correlation_id.empty()) {
         env.set_correlation_id(correlation_id);
     }
@@ -102,6 +107,66 @@ const char* keyprov_codec_status_to_string(KeyProvCodecStatus s) {
         case KeyProvCodecStatus::Internal:                return "INTERNAL";
         default: return "?";
     }
+}
+
+bool keyprov_is_canonical_uid(const std::string& uid) {
+    if (uid.empty() || uid.size() > 64) return false;
+    for (char c : uid) {
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                        (c == '-');
+        if (!ok) return false;
+    }
+    return true;
+}
+
+bool keyprov_normalize_digest(const std::string& in, std::vector<uint8_t>& out) {
+    out.clear();
+    std::string s = in;
+    const std::string prefix = "sha256:";
+    if (s.rfind(prefix, 0) == 0) {
+        s = s.substr(prefix.size());
+    }
+    if (!s.empty() && (s.size() % 2) == 0) {
+        bool hex = true;
+        for (char c : s) {
+            if (!std::isxdigit(static_cast<unsigned char>(c))) { hex = false; break; }
+        }
+        if (hex) {
+            auto nib = [](char c) -> uint8_t {
+                if (c >= '0' && c <= '9') return static_cast<uint8_t>(c - '0');
+                if (c >= 'a' && c <= 'f') return static_cast<uint8_t>(c - 'a' + 10);
+                return static_cast<uint8_t>(c - 'A' + 10);
+            };
+            out.reserve(s.size() / 2);
+            for (std::size_t i = 0; i + 1 < s.size(); i += 2) {
+                out.push_back(static_cast<uint8_t>((nib(s[i]) << 4) | nib(s[i + 1])));
+            }
+            return !out.empty() && out.size() <= kKeyprovMaxDigestBytes;
+        }
+    }
+    if (s.size() > kKeyprovMaxDigestBytes) return false;
+    out.assign(s.begin(), s.end());
+    return true;
+}
+
+bool keyprov_validate_identity(const KeyprovSessionIdentity& identity,
+                               std::string& reason) {
+    if (!keyprov_is_canonical_uid(identity.ecu_uid)) {
+        reason = "identity_uid_invalid";
+        return false;
+    }
+    if (identity.device_identity_digest.empty() ||
+        identity.certificate_ref.empty()) {
+        reason = "identity_certificate_incomplete";
+        return false;
+    }
+    if (identity.session.daemon_epoch.empty() ||
+        identity.session.connection_generation == 0 ||
+        identity.session.cert_session_generation == 0) {
+        reason = "identity_session_incomplete";
+        return false;
+    }
+    return true;
 }
 
 int keyprov_purpose_from_string(const std::string& name) {
@@ -153,13 +218,17 @@ const char* keyprov_import_result_to_string(int result) {
 // 编码
 // ============================================================
 KeyProvEncodeOutcome build_keyprov_request_envelope(
+    const KeyprovSessionIdentity& identity,
     const KeyProvRequestData& in,
     const std::string& message_id,
     const std::string& trace_id) {
+    std::string id_reason;
+    if (!keyprov_validate_identity(identity, id_reason)) {
+        return {KeyProvCodecStatus::FieldInvalid, {}, id_reason};
+    }
     if (!str_within(in.request_id, kKeyprovMaxStringBytes) ||
         !str_within(in.idempotency_key, kKeyprovMaxStringBytes) ||
-        !str_within(in.business_domain, kKeyprovMaxShortStringBytes) ||
-        in.device_identity_digest.size() > kKeyprovMaxDigestBytes) {
+        !str_within(in.business_domain, kKeyprovMaxShortStringBytes)) {
         return {KeyProvCodecStatus::FieldInvalid, {}, "request_field_too_large"};
     }
     if (in.request_id.empty() || in.idempotency_key.empty() ||
@@ -172,6 +241,19 @@ KeyProvEncodeOutcome build_keyprov_request_envelope(
         return {KeyProvCodecStatus::SizeExceeded, {}, "request_items_too_many"};
     }
 
+    // CR-011 §4: Request 的 deviceIdentityDigest/certificateRef 与该身份同源，
+    // 不从 in 拼接，也不混合不同事件/查询的字段。
+    std::vector<uint8_t> identity_digest;
+    std::vector<uint8_t> certificate_digest;
+    if (!keyprov_normalize_digest(identity.device_identity_digest, identity_digest) ||
+        identity_digest.empty()) {
+        return {KeyProvCodecStatus::FieldInvalid, {}, "identity_digest_invalid"};
+    }
+    if (!keyprov_normalize_digest(identity.certificate_ref, certificate_digest) ||
+        certificate_digest.empty()) {
+        return {KeyProvCodecStatus::FieldInvalid, {}, "identity_certificate_ref_invalid"};
+    }
+
     KeyProvisioningRequest req;
     req.set_request_id(in.request_id);
     req.set_idempotency_key(in.idempotency_key);
@@ -182,17 +264,10 @@ KeyProvEncodeOutcome build_keyprov_request_envelope(
         }
         req.add_purposes(static_cast<KeyPurpose>(p));
     }
-    if (!in.device_identity_digest.empty()) {
-        req.set_device_identity_digest(
-            in.device_identity_digest.data(), in.device_identity_digest.size());
-    }
+    req.set_device_identity_digest(identity_digest.data(), identity_digest.size());
     auto* cref = req.mutable_certificate_ref();
     cref->set_certificate_profile(in.certificate_ref.certificate_profile);
-    if (!in.certificate_ref.certificate_digest.empty()) {
-        cref->set_certificate_digest(
-            in.certificate_ref.certificate_digest.data(),
-            in.certificate_ref.certificate_digest.size());
-    }
+    cref->set_certificate_digest(certificate_digest.data(), certificate_digest.size());
     cref->set_key_encipherment_key_id(in.certificate_ref.key_encipherment_key_id);
     for (int s : in.supported_wrapping_suites) {
         req.add_supported_wrapping_suites(static_cast<WrappingSuite>(s));
@@ -211,7 +286,7 @@ KeyProvEncodeOutcome build_keyprov_request_envelope(
     }
 
     ::vehicle::common::v1::VehicleMessageEnvelope env;
-    fill_common(env, in.request_id, message_id, "", kKeyprovPayloadRequest,
+    fill_common(env, identity, in.request_id, message_id, "", kKeyprovPayloadRequest,
                 trace_id, in.timestamp_ms);
     env.set_message_kind(::vehicle::common::v1::MESSAGE_KIND_REQUEST);
     env.set_idempotency_key(in.idempotency_key);
@@ -223,11 +298,16 @@ KeyProvEncodeOutcome build_keyprov_request_envelope(
 }
 
 KeyProvEncodeOutcome build_keyprov_ack_envelope(
+    const KeyprovSessionIdentity& identity,
     const std::string& request_id,
     const std::vector<KeyProvImportItemResult>& items,
     int64_t timestamp_ms,
     const std::string& message_id,
     const std::string& correlation_id) {
+    std::string id_reason;
+    if (!keyprov_validate_identity(identity, id_reason)) {
+        return {KeyProvCodecStatus::FieldInvalid, {}, id_reason};
+    }
     if (request_id.empty()) {
         return {KeyProvCodecStatus::FieldInvalid, {}, "ack_request_id_missing"};
     }
@@ -259,18 +339,23 @@ KeyProvEncodeOutcome build_keyprov_ack_envelope(
         return {KeyProvCodecStatus::Internal, {}, "ack_serialize_failed"};
     }
     ::vehicle::common::v1::VehicleMessageEnvelope env;
-    fill_common(env, request_id, message_id, correlation_id, kKeyprovPayloadAck,
-                "", timestamp_ms);
+    fill_common(env, identity, request_id, message_id, correlation_id,
+                kKeyprovPayloadAck, "", timestamp_ms);
     env.set_message_kind(::vehicle::common::v1::MESSAGE_KIND_REQUEST);
     env.set_payload(std::move(payload));
     return serialize_envelope(env, KeyProvCodecStatus::Ok);
 }
 
 KeyProvEncodeOutcome build_keyprov_status_request_envelope(
+    const KeyprovSessionIdentity& identity,
     const std::string& request_id,
     int64_t timestamp_ms,
     const std::string& message_id,
     const std::string& trace_id) {
+    std::string id_reason;
+    if (!keyprov_validate_identity(identity, id_reason)) {
+        return {KeyProvCodecStatus::FieldInvalid, {}, id_reason};
+    }
     if (request_id.empty()) {
         return {KeyProvCodecStatus::FieldInvalid, {}, "status_request_id_missing"};
     }
@@ -283,8 +368,8 @@ KeyProvEncodeOutcome build_keyprov_status_request_envelope(
         return {KeyProvCodecStatus::Internal, {}, "status_request_serialize_failed"};
     }
     ::vehicle::common::v1::VehicleMessageEnvelope env;
-    fill_common(env, request_id, message_id, "", kKeyprovPayloadStatusRequest,
-                trace_id, timestamp_ms);
+    fill_common(env, identity, request_id, message_id, "",
+                kKeyprovPayloadStatusRequest, trace_id, timestamp_ms);
     env.set_message_kind(::vehicle::common::v1::MESSAGE_KIND_REQUEST);
     env.set_payload(std::move(payload));
     return serialize_envelope(env, KeyProvCodecStatus::Ok);

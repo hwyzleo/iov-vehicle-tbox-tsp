@@ -130,14 +130,24 @@ protected:
         if (coord_) coord_->stop();
     }
 
-    void make_ready(bool ready = true) {
+    void make_ready(bool ready = true, uint32_t contract_version = 3,
+                    uint32_t publish_contract_version = 1,
+                    const std::string& uid = "ECU-1") {
         CloudReadiness cr;
         cr.cloud_ready = ready;
         cr.cert_session_generation = 1;
+        cr.connection_generation = 1;
         cr.device_identity_digest = std::string(64, 'a');
         cr.certificate_ref = "sha256:" + std::string(64, 'a');
         cr.contract_supported = true;
-        cr.contract_version = 2;
+        cr.contract_version = contract_version;
+        cr.publish_contract_version = publish_contract_version;
+        // CR-011 §3: v3 会话身份投影（同一快照）。
+        cr.ecu_uid = uid;
+        cr.session.daemon_epoch = "epoch-1";
+        cr.session.connection_generation = 1;
+        cr.session.cert_session_generation = 1;
+        cr.event_sequence = ++cloud_seq_;
         mqtt_->deliver_cloud_readiness(cr);
 
         CapabilityReadiness cap;
@@ -148,7 +158,16 @@ protected:
         cap.snapshot_accepted = true;
         cap.uplink_ready = true;
         cap.downlink_suback_ready = true;
+        cap.connection_generation = 1;
+        cap.cert_session_generation = 1;
         mqtt_->deliver_capability_readiness(cap);
+    }
+
+    std::string make_first_request(bool ready = true) {
+        sec_->status_items.clear();
+        make_ready(ready);
+        coord_->tick();
+        return coord_->snapshot().request_id;
     }
 
     int publish_count_for(const std::string& route_id) const {
@@ -164,6 +183,7 @@ protected:
     std::shared_ptr<V2cKeyProvisioningStore> store_;
     V2cKeyProvisioningConfig cfg_;
     std::unique_ptr<V2cKeyProvisioningCoordinator> coord_;
+    uint64_t cloud_seq_ = 0;
 };
 
 TEST_F(V2cKeyProvisioningCoordinatorTest, DisabledWhenConfigOff) {
@@ -311,6 +331,126 @@ TEST_F(V2cKeyProvisioningCoordinatorTest, RestartRecoversAckPending) {
     EXPECT_EQ(coord_->snapshot().state, V2cKeyProvState::ACK_PENDING);
     EXPECT_EQ(sec_->import_calls, 0);  // 不重复导入
     EXPECT_GE(publish_count_for("keyprov.uplink"), 1);  // 发送 ACK
+}
+
+// ============================================================
+// CR-011 §5/§6: 身份门禁、expected_session 与按 reason 恢复
+// ============================================================
+TEST_F(V2cKeyProvisioningCoordinatorTest, GateRequiresReadinessV3) {
+    sec_->status_items.clear();
+    make_ready(true, /*contract_version=*/2, /*publish_contract=*/1);
+    coord_->tick();
+    EXPECT_EQ(coord_->snapshot().state, V2cKeyProvState::WAIT_CLOUD);
+    EXPECT_FALSE(coord_->snapshot().identity_valid);
+    EXPECT_EQ(publish_count_for("keyprov.uplink"), 0);
+}
+
+TEST_F(V2cKeyProvisioningCoordinatorTest, GateRequiresSessionBoundPublish) {
+    sec_->status_items.clear();
+    make_ready(true, 3, /*publish_contract=*/0);
+    coord_->tick();
+    EXPECT_EQ(coord_->snapshot().state, V2cKeyProvState::WAIT_CLOUD);
+    EXPECT_FALSE(coord_->snapshot().publish_session_supported);
+    EXPECT_EQ(publish_count_for("keyprov.uplink"), 0);
+}
+
+TEST_F(V2cKeyProvisioningCoordinatorTest, GateRequiresCanonicalUid) {
+    sec_->status_items.clear();
+    make_ready(true, 3, 1, "lower-uid");
+    coord_->tick();
+    EXPECT_EQ(coord_->snapshot().state, V2cKeyProvState::WAIT_CLOUD);
+    EXPECT_FALSE(coord_->snapshot().identity_valid);
+    EXPECT_EQ(publish_count_for("keyprov.uplink"), 0);
+}
+
+TEST_F(V2cKeyProvisioningCoordinatorTest, RequestCarriesDeviceIdAndExpectedSession) {
+    std::string rid = make_first_request();
+    ASSERT_FALSE(rid.empty());
+    auto calls = mqtt_->publish_route_calls();
+    ASSERT_EQ(calls.size(), 1u);
+    ASSERT_TRUE(calls[0].expected_session.has_value());
+    EXPECT_EQ(calls[0].expected_session->daemon_epoch, "epoch-1");
+    EXPECT_EQ(calls[0].expected_session->connection_generation, 1u);
+    EXPECT_EQ(calls[0].expected_session->cert_session_generation, 1u);
+    VehicleMessageEnvelope env;
+    ASSERT_TRUE(env.ParseFromArray(calls[0].payload.data(),
+                                   (int)calls[0].payload.size()));
+    EXPECT_EQ(env.device_id(), "ECU-1");
+}
+
+TEST_F(V2cKeyProvisioningCoordinatorTest, PublishStaleInvalidatesAndRetriesSameRequestId) {
+    sec_->status_items.clear();
+    make_ready();
+    mqtt_->publish_route_result = {false, MqttDeliveryOutcome::Accepted,
+                                   session_reason::kPublishContextStale, true};
+    coord_->tick();  // 构造并发布 -> STALE
+    EXPECT_EQ(coord_->snapshot().state, V2cKeyProvState::WAIT_CLOUD);
+    EXPECT_FALSE(coord_->snapshot().identity_valid);
+    std::string rid = coord_->snapshot().request_id;
+    ASSERT_FALSE(rid.empty());
+
+    // 刷新后就绪：重新构造发送，业务 requestId 不变
+    mqtt_->publish_route_result = {true, MqttDeliveryOutcome::Accepted, "", true};
+    coord_->tick();
+    auto calls = mqtt_->publish_route_calls();
+    ASSERT_GE(calls.size(), 2u);
+    EXPECT_EQ(calls.back().request_id, rid);
+    ASSERT_TRUE(calls.back().expected_session.has_value());
+}
+
+TEST_F(V2cKeyProvisioningCoordinatorTest, PublishContextRequiredBlocks) {
+    sec_->status_items.clear();
+    make_ready();
+    mqtt_->publish_route_result = {false, MqttDeliveryOutcome::Accepted,
+                                   session_reason::kPublishContextRequired, false};
+    coord_->tick();
+    EXPECT_EQ(coord_->snapshot().state, V2cKeyProvState::BLOCKED);
+}
+
+TEST_F(V2cKeyProvisioningCoordinatorTest, PublishContextUnsupportedNotReady) {
+    sec_->status_items.clear();
+    make_ready();
+    mqtt_->publish_route_result = {false, MqttDeliveryOutcome::Accepted,
+                                   session_reason::kPublishContextUnsupported, false};
+    coord_->tick();
+    EXPECT_EQ(coord_->snapshot().state, V2cKeyProvState::WAIT_CLOUD);
+    EXPECT_FALSE(coord_->snapshot().publish_session_supported);
+}
+
+TEST_F(V2cKeyProvisioningCoordinatorTest, SessionIdentityInvalidBlocks) {
+    sec_->status_items.clear();
+    make_ready();
+    mqtt_->publish_route_result = {false, MqttDeliveryOutcome::Accepted,
+                                   session_reason::kSessionIdentityInvalid, false};
+    coord_->tick();
+    EXPECT_EQ(coord_->snapshot().state, V2cKeyProvState::BLOCKED);
+    EXPECT_FALSE(coord_->snapshot().identity_valid);
+}
+
+TEST_F(V2cKeyProvisioningCoordinatorTest, DaemonEpochChangeRebuildsIdentity) {
+    make_first_request();
+    EXPECT_TRUE(coord_->snapshot().identity_valid);
+
+    // 同 ready 但 daemon epoch 更新：立即失效，不跨 epoch 复用身份
+    CloudReadiness cr = mqtt_->cloud_readiness;
+    cr.session.daemon_epoch = "epoch-2";
+    cr.event_sequence = 1;  // 新 epoch 内 sequence 重置
+    mqtt_->deliver_cloud_readiness(cr);
+    EXPECT_FALSE(coord_->snapshot().identity_valid);
+
+    // 重新门禁后从新快照重建身份
+    coord_->tick();
+    EXPECT_TRUE(coord_->snapshot().identity_valid);
+}
+
+TEST_F(V2cKeyProvisioningCoordinatorTest, EventSequenceGapInvalidatesIdentity) {
+    make_first_request();
+    EXPECT_TRUE(coord_->snapshot().identity_valid);
+
+    CloudReadiness cr = mqtt_->cloud_readiness;
+    cr.event_sequence = cloud_seq_ + 5;  // 缺口
+    mqtt_->deliver_cloud_readiness(cr);
+    EXPECT_FALSE(coord_->snapshot().identity_valid);
 }
 
 int main(int argc, char** argv) {

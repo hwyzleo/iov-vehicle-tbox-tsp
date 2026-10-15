@@ -5,7 +5,9 @@
 #include <vector>
 #include <functional>
 #include <cstdint>
+#include <optional>
 #include "subscription_types.h"
+#include "mqtt_session_context.h"
 
 namespace tbox {
 namespace tsp {
@@ -21,7 +23,38 @@ enum class MqttDeliveryOutcome : uint8_t {
 struct MqttPublishResult {
     bool accepted = false;                          // MQTT daemon 已接管
     MqttDeliveryOutcome outcome = MqttDeliveryOutcome::Accepted;
+    std::string reason_code;   // CR-011 §6: 稳定脱敏 reason（session_reason::*）
+    bool retryable = true;     // CR-011 §6: 是否可安全重试（契约/身份缺陷为 false）
+    // CR-011 §6: 保留 MQTT 数字错误码（如 1004/1009），0 表示无；
+    // 与 reason 分离，不把同号错误一律解释为同一种业务原因。
+    uint32_t error_code = 0;
 };
+
+// CR-011 §5.2: 携带会话绑定控制元数据的发布参数。
+// keyprov.uplink 必须携带 expected_session；普通业务（FOTA）可省略保持既有行为。
+struct MqttPublishOptions {
+    int qos = 1;
+    std::string content_type = "application/x-protobuf";
+    std::string trace_id;
+    std::string request_id;
+    std::optional<MqttSessionContext> expected_session;
+};
+
+// CR-011 §6: TSP↔MQTT 会话发布稳定 reason code（与 MQTT session_reason 同名）。
+// 调用方必须按 reason 分流，不能只看数字码：STALE 刷新快照对账；
+// REQUIRED 是本地调用缺陷；UNSUPPORTED 是版本缺失；INVALID/CONFLICT 是身份安全问题。
+namespace session_reason {
+constexpr const char* kSessionIdentityMissing    = "SESSION_IDENTITY_MISSING";
+constexpr const char* kSessionIdentityInvalid    = "SESSION_IDENTITY_INVALID";
+constexpr const char* kSessionIdentityConflict   = "SESSION_IDENTITY_CONFLICT";
+constexpr const char* kPublishContextRequired    = "PUBLISH_SESSION_CONTEXT_REQUIRED";
+constexpr const char* kPublishContextStale       = "PUBLISH_SESSION_CONTEXT_STALE";
+constexpr const char* kPublishContextUnsupported = "PUBLISH_SESSION_CONTEXT_UNSUPPORTED";
+} // namespace session_reason
+
+// CR-011 契约版本（与 MQTT DSN-CR-017 §4 对齐；缺失/不兼容时 keyprov not-ready）。
+constexpr uint32_t kMqttCloudReadinessContractVersionV3 = 3;
+constexpr uint32_t kMqttPublishSessionContractVersion = 1;
 
 // Routed downlink 事件 (CR-006 §6.1)
 // MQTT daemon 将 Broker 下行完整 Topic 映射为 owner/route_id/target 事件，
@@ -54,6 +87,11 @@ struct CloudReadiness {
     std::string reason_code;
     uint32_t contract_version = 0;
     bool contract_supported = true;
+    // ---- CR-011 §3: MQTT readiness v3 会话身份投影（只读，daemon 生成） ----
+    std::string ecu_uid;                     // 实际 TLS leaf CN 规范值；TSP 只读
+    MqttSessionContext session;              // daemon epoch + 两代际，与 UID 同源
+    uint32_t publish_contract_version = 0;   // 0=旧 daemon 未提供/不支持 guard
+    uint64_t event_sequence = 0;             // 同一 daemon epoch 内单调递增（缺口检测）
 };
 
 using CloudReadinessCallback = std::function<void(const CloudReadiness&)>;
@@ -106,6 +144,15 @@ public:
                                            const std::string& content_type = "application/x-protobuf",
                                            const std::string& trace_id = "",
                                            const std::string& request_id = "") = 0;
+
+    // CR-011 §5.2: 带会话绑定控制元数据的 route 发布。
+    // keyprov 必须走本重载并携带 expected_session，不得走无上下文重载降级；
+    // 本重载不得忽略 expected_session 或转发到旧接口。
+    virtual MqttPublishResult publishRoute(const std::string& owner,
+                                           const std::string& route_id,
+                                           const std::string& msg_id,
+                                           const std::vector<uint8_t>& payload,
+                                           const MqttPublishOptions& options) = 0;
 
     // 下行：订阅 routed downlink 事件，仅建立 IPC 事件通道，不触发 Broker SUBSCRIBE
     // (CR-006 §6)。Broker 订阅由 replaceSubscriptionSnapshot 的 route 投影驱动。

@@ -71,6 +71,8 @@ struct V2cKeyProvisioningSnapshot {
     V2cKeyProvState state = V2cKeyProvState::DISABLED;
     std::string request_id;
     bool capability_ready = false;
+    bool identity_valid = false;            // CR-011 §18.3: 当前是否有有效会话身份
+    bool publish_session_supported = false; // CR-011 §18.3: MQTT 支持 session-bound publish
     std::string reason_code;
     uint32_t attempt_count = 0;
     std::string last_error;
@@ -141,10 +143,20 @@ private:
     void worker_loop();
     void reset_to_checking_locked();
 
-    bool capability_gate_locked(std::string& reason) const;
+    bool capability_gate_locked(std::string& reason);
+    // CR-011 §5.1/§18.3: 失效缓存身份与未发送传输任务（保留业务 requestId）。
+    void invalidate_identity_locked(const char* reason);
+    // CR-011 §5.1: 对账并接受 readhip 快照（epoch/sequence/generation 变化处理）。
+    void apply_cloud_readiness_locked(const CloudReadiness& readiness);
+    void apply_capability_readiness_locked(const CapabilityReadiness& readiness);
+    // 主动重查 MQTT 当前快照（构造后切换/STALE 后对账）。
+    void refresh_readiness_locked();
+    // CR-011 §5.2: 携 expected_session 发布；按 reason 分流，成功返回 true。
+    bool publish_keyprov_locked(const std::string& message_id,
+                                const std::vector<uint8_t>& envelope_bytes,
+                                const std::string& request_id);
     bool keyprov_response_valid_locked(const KeyProvResponseData& resp,
                                        std::string& err) const;
-    bool normalize_digest(const std::string& in, std::vector<uint8_t>& out) const;
     uint32_t current_backoff_ms_locked() const;
     bool purposes_complete_locked(const std::vector<tbox::sec::BusinessKeyStatus>& items) const;
 
@@ -163,8 +175,10 @@ private:
     // readiness 缓存
     CloudReadiness cloud_;
     CapabilityReadiness capability_;
-    std::string identity_digest_raw_;
-    std::string certificate_ref_raw_;
+    KeyprovSessionIdentity identity_;   // 门禁通过后由同一快照生成的不可变身份
+    bool identity_valid_ = false;
+    bool publish_session_supported_ = false;
+    uint64_t last_cloud_sequence_ = 0;  // 同一 daemon epoch 内事件序列对账
     bool capability_ready_ = false;
     std::string gate_reason_;
 
