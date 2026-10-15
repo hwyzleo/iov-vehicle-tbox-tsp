@@ -37,7 +37,7 @@ tsp:
   # 量产默认 enabled=false：只有 release-set 显式开启且运行时 capability gate 全通过
   # 才创建有效开通流程。算法/keyId/业务版本/Wrapped Key 不进静态配置。
   key_provisioning:
-    enabled: false
+    enabled: true
     business_domain: V2C_COMM
     certificate_profile: mqtt
     purposes: [UPLINK_AEAD, DOWNLINK_AEAD]
