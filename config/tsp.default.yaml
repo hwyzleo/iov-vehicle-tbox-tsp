@@ -95,7 +95,7 @@ tsp:
       qos: 1
       target: tsp.keyprov
       mandatory: false
-      enabled: false
+      enabled: true
       readiness_scope: security.keyprov
       criticality: CAPABILITY_MANDATORY
     - route_id: keyprov.downlink
@@ -104,6 +104,6 @@ tsp:
       qos: 1
       target: tsp.keyprov
       mandatory: false
-      enabled: false
+      enabled: true
       readiness_scope: security.keyprov
       criticality: CAPABILITY_MANDATORY
