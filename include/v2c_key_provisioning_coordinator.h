@@ -25,6 +25,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -78,6 +79,7 @@ struct V2cKeyProvisioningSnapshot {
     std::string last_error;
     uint64_t cloud_session_generation = 0;
     bool sec_api_available = false;
+    bool clock_synced = false;               // 系统时钟是否已同步（时间敏感请求门禁）
     // 脱敏计数器
     uint64_t cloud_ready_events = 0;
     uint64_t requests_published = 0;
@@ -124,6 +126,11 @@ public:
 
     V2cKeyProvisioningSnapshot snapshot() const;
 
+    // 注入时钟同步判定（默认读 systemd-timesyncd 同步标记；测试可覆盖）。
+    // keyprov Request 携带绝对 expire_at_ms，冷启动早期时钟未同步时必须等待，
+    // 否则发送即被云端按过期拒绝（见 /run/systemd/timesync/synchronized）。
+    void set_clock_sync_check(std::function<bool()> check);
+
 private:
     // ---- readiness 回调（MQTT SDK 执行器线程） ----
     void on_cloud_readiness(const CloudReadiness& readiness);
@@ -144,6 +151,8 @@ private:
     void reset_to_checking_locked();
 
     bool capability_gate_locked(std::string& reason);
+    // 系统时钟是否已同步（未注入时读 systemd-timesyncd 标记）。
+    bool clock_check_ok() const;
     // CR-011 §5.1/§18.3: 失效缓存身份与未发送传输任务（保留业务 requestId）。
     void invalidate_identity_locked(const char* reason);
     // CR-011 §5.1: 对账并接受 readhip 快照（epoch/sequence/generation 变化处理）。
@@ -180,6 +189,8 @@ private:
     bool publish_session_supported_ = false;
     uint64_t last_cloud_sequence_ = 0;  // 同一 daemon epoch 内事件序列对账
     bool capability_ready_ = false;
+    bool clock_synced_ = false;
+    std::function<bool()> clock_sync_check_;
     std::string gate_reason_;
 
     // in-flight（内存态；pending_items_ 持有 move-only SecureBuffer）

@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdio>
 #include <random>
+#include <unistd.h>
 
 namespace tbox {
 namespace tsp {
@@ -19,6 +20,20 @@ using tbox::sec::ErrorCode;
 namespace {
 
 constexpr const char* kCapabilityKeyprov = "security.keyprov";
+
+// systemd-timesyncd 启动即创建目录，首次同步成功后才创建 synchronized 标记；
+// systemd-time-wait-sync 也以此标记为判据。
+constexpr const char* kTimesyncDir = "/run/systemd/timesync";
+constexpr const char* kTimesyncMarker = "/run/systemd/timesync/synchronized";
+
+// 默认时钟同步判定：仅在 systemd-timesyncd 存在的平台上启用门禁
+// （无该目录的开发机/CI 不阻塞 keyprov）。
+bool default_clock_synchronized() {
+    if (::access(kTimesyncDir, F_OK) != 0) {
+        return true;
+    }
+    return ::access(kTimesyncMarker, F_OK) == 0;
+}
 
 // 从 SEC ImportResult 构造 ACK items（仅非敏感字段 + import_proof）
 std::vector<KeyProvImportItemResult> build_ack_items(
@@ -315,7 +330,18 @@ V2cKeyProvisioningSnapshot V2cKeyProvisioningCoordinator::snapshot() const {
     s.attempt_count = record_.attempt_count;
     s.last_error = record_.last_error;
     s.cloud_session_generation = record_.cloud_session_generation;
+    s.clock_synced = clock_synced_;
     return s;
+}
+
+void V2cKeyProvisioningCoordinator::set_clock_sync_check(
+    std::function<bool()> check) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    clock_sync_check_ = std::move(check);
+}
+
+bool V2cKeyProvisioningCoordinator::clock_check_ok() const {
+    return clock_sync_check_ ? clock_sync_check_() : default_clock_synchronized();
 }
 
 void V2cKeyProvisioningCoordinator::handle_routed_downlink(
@@ -506,9 +532,10 @@ void V2cKeyProvisioningCoordinator::tick_locked() {
     std::string reason;
     bool gate = capability_gate_locked(reason);
     capability_ready_ = gate;
-    gate_reason_ = gate ? "" : reason;
+    clock_synced_ = clock_check_ok();
 
     if (!gate) {
+        gate_reason_ = reason;
         // 网络操作暂停，保留非敏感流程状态与原 requestId。
         // 但若身份已不再有效（或门禁原因属身份/代际类），则同时失效未发送任务。
         if (identity_valid_) {
@@ -527,6 +554,18 @@ void V2cKeyProvisioningCoordinator::tick_locked() {
         }
         return;
     }
+
+    // 时钟同步门禁：Request 携带绝对 expire_at_ms；冷启动早期系统时钟可能尚未
+    // 被 NTP 校正，此时发布必然被云端按过期拒绝。保持状态等待同步，不失效身份。
+    if (!clock_synced_) {
+        gate_reason_ = "clock_not_synced";
+        if (state_ == V2cKeyProvState::REQUESTING) {
+            state_ = V2cKeyProvState::WAIT_CLOUD;
+        }
+        return;
+    }
+
+    gate_reason_.clear();
 
     const int64_t now = now_ms();
     switch (state_) {

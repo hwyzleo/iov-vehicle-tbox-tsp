@@ -122,6 +122,7 @@ protected:
         cfg_.retry_max_ms = 40;
         cfg_.poll_interval_ms = 5;
         coord_ = std::make_unique<V2cKeyProvisioningCoordinator>(mqtt_, sec_, store_);
+        coord_->set_clock_sync_check([this] { return clock_synced_; });
         ASSERT_TRUE(coord_->initialize(cfg_));
         ASSERT_TRUE(coord_->start(false));
     }
@@ -185,12 +186,14 @@ protected:
     V2cKeyProvisioningConfig cfg_;
     std::unique_ptr<V2cKeyProvisioningCoordinator> coord_;
     uint64_t cloud_seq_ = 0;
+    bool clock_synced_ = true;
 };
 
 TEST_F(V2cKeyProvisioningCoordinatorTest, DisabledWhenConfigOff) {
     cfg_.enabled = false;
     coord_->stop();
     coord_ = std::make_unique<V2cKeyProvisioningCoordinator>(mqtt_, sec_, store_);
+    coord_->set_clock_sync_check([this] { return clock_synced_; });
     ASSERT_TRUE(coord_->initialize(cfg_));
     ASSERT_TRUE(coord_->start(false));
     make_ready();
@@ -214,6 +217,24 @@ TEST_F(V2cKeyProvisioningCoordinatorTest, ExistingActiveKeysSkipRequest) {
     coord_->tick();
     EXPECT_EQ(coord_->snapshot().state, V2cKeyProvState::ACTIVE);
     EXPECT_EQ(publish_count_for("keyprov.uplink"), 0);
+}
+
+TEST_F(V2cKeyProvisioningCoordinatorTest, ClockNotSyncedHoldsRequestUntilSynced) {
+    sec_->status_items.clear();  // 缺少业务密钥 -> 需要申请
+    make_ready();
+    clock_synced_ = false;       // 模拟冷启动早期 NTP 尚未校正
+    coord_->tick();
+    auto snap = coord_->snapshot();
+    EXPECT_FALSE(snap.clock_synced);
+    EXPECT_TRUE(snap.request_id.empty());
+    EXPECT_EQ(publish_count_for("keyprov.uplink"), 0);
+
+    clock_synced_ = true;        // NTP 校正完成
+    coord_->tick();
+    snap = coord_->snapshot();
+    EXPECT_TRUE(snap.clock_synced);
+    EXPECT_EQ(snap.state, V2cKeyProvState::WAIT_RESPONSE);
+    EXPECT_EQ(publish_count_for("keyprov.uplink"), 1);
 }
 
 TEST_F(V2cKeyProvisioningCoordinatorTest, FirstProvisioningFullFlow) {
@@ -318,6 +339,7 @@ TEST_F(V2cKeyProvisioningCoordinatorTest, RestartRecoversAckPending) {
 
     coord_->stop();
     coord_ = std::make_unique<V2cKeyProvisioningCoordinator>(mqtt_, sec_, store_);
+    coord_->set_clock_sync_check([this] { return clock_synced_; });
     ASSERT_TRUE(coord_->initialize(cfg_));
     ASSERT_TRUE(coord_->start(false));
 

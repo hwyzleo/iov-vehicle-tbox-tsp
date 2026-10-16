@@ -206,6 +206,7 @@ TEST(KeyProvisioningIntegrationTest, FullFlowAndCapabilityPauseResume) {
     cfg.retry_max_ms = 40;
 
     V2cKeyProvisioningCoordinator coord(mqtt, sec, store);
+    coord.set_clock_sync_check([] { return true; });
     ASSERT_TRUE(coord.initialize(cfg));
     ASSERT_TRUE(coord.start(false));
 
@@ -258,6 +259,7 @@ TEST(KeyProvisioningIntegrationTest, FullFlowAndCapabilityPauseResume) {
     // 已 ACTIVE 后重启不再申请
     coord.stop();
     V2cKeyProvisioningCoordinator coord2(mqtt, sec, store);
+    coord2.set_clock_sync_check([] { return true; });
     sec->status_items = {active("UPLINK_AEAD"), active("DOWNLINK_AEAD")};
     ASSERT_TRUE(coord2.initialize(cfg));
     ASSERT_TRUE(coord2.start(false));
