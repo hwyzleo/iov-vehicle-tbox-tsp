@@ -42,3 +42,4 @@ docs/superpowers/
 third_party/
 # 构建产物
 build-consumer/
+graphify-out/

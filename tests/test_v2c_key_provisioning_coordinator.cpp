@@ -132,11 +132,12 @@ protected:
 
     void make_ready(bool ready = true, uint32_t contract_version = 3,
                     uint32_t publish_contract_version = 1,
-                    const std::string& uid = "ECU-1") {
+                    const std::string& uid = "ECU-1",
+                    uint64_t connection_generation = 1) {
         CloudReadiness cr;
         cr.cloud_ready = ready;
         cr.cert_session_generation = 1;
-        cr.connection_generation = 1;
+        cr.connection_generation = connection_generation;
         cr.device_identity_digest = std::string(64, 'a');
         cr.certificate_ref = "sha256:" + std::string(64, 'a');
         cr.contract_supported = true;
@@ -145,7 +146,7 @@ protected:
         // CR-011 §3: v3 会话身份投影（同一快照）。
         cr.ecu_uid = uid;
         cr.session.daemon_epoch = "epoch-1";
-        cr.session.connection_generation = 1;
+        cr.session.connection_generation = connection_generation;
         cr.session.cert_session_generation = 1;
         cr.event_sequence = ++cloud_seq_;
         mqtt_->deliver_cloud_readiness(cr);
@@ -158,7 +159,7 @@ protected:
         cap.snapshot_accepted = true;
         cap.uplink_ready = true;
         cap.downlink_suback_ready = true;
-        cap.connection_generation = 1;
+        cap.connection_generation = connection_generation;
         cap.cert_session_generation = 1;
         mqtt_->deliver_capability_readiness(cap);
     }
@@ -357,6 +358,18 @@ TEST_F(V2cKeyProvisioningCoordinatorTest, GateRequiresSessionBoundPublish) {
 TEST_F(V2cKeyProvisioningCoordinatorTest, GateRequiresCanonicalUid) {
     sec_->status_items.clear();
     make_ready(true, 3, 1, "lower-uid");
+    coord_->tick();
+    EXPECT_EQ(coord_->snapshot().state, V2cKeyProvState::WAIT_CLOUD);
+    EXPECT_FALSE(coord_->snapshot().identity_valid);
+    EXPECT_EQ(publish_count_for("keyprov.uplink"), 0);
+}
+
+TEST_F(V2cKeyProvisioningCoordinatorTest, GateRequiresNonzeroConnectionGeneration) {
+    // CR-011 §5.1 / MQTT CR-017: daemon 未提交有效连接上下文（generation==0）时，
+    // 会话上下文不完整，必须判定身份不可用，不得发 keyprov。
+    sec_->status_items.clear();
+    make_ready(true, /*contract_version=*/3, /*publish_contract=*/1, "ECU-1",
+               /*connection_generation=*/0);
     coord_->tick();
     EXPECT_EQ(coord_->snapshot().state, V2cKeyProvState::WAIT_CLOUD);
     EXPECT_FALSE(coord_->snapshot().identity_valid);
