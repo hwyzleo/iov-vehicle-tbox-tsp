@@ -68,5 +68,12 @@ tbox::sec::ErrorCode SecClientBusinessKeyAdapter::get_business_key_import_result
     return client_->get_business_key_import_result(request_id, out);
 }
 
+tbox::sec::ErrorCode SecClientBusinessKeyAdapter::get_v2c_key_provisioning_capability(
+    tbox::sec::V2cKeyProvisioningCapability& out) {
+    if (!client_) return tbox::sec::ErrorCode::NOT_INITIALIZED;
+    connect();
+    return client_->get_v2c_key_provisioning_capability(out);
+}
+
 } // namespace tsp
 } // namespace tbox

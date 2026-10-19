@@ -16,7 +16,10 @@
 #include "vehicle/common/v1/envelope.pb.h"
 #include "yaml-cpp/yaml.h"
 
+#include <algorithm>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <thread>
 
@@ -74,9 +77,13 @@ std::vector<uint8_t> make_response(const std::string& rid) {
                                : KEY_PURPOSE_DOWNLINK_AEAD);
         it->set_key_id(i == 0 ? "kid-up" : "kid-down");
         it->set_business_key_version(1);
-        it->set_key_algorithm("AES-256-GCM");
+        it->set_key_algorithm("AES-256");
+        it->set_wrapping_suite(WRAPPING_SUITE_ECDH_ES_P256_HKDF_SHA256_AES256GCM);
         it->set_wrapped_key(std::string(32, 'W'));
         it->set_parameters(std::string(8, 'P'));
+        it->set_envelope_format(KEY_ENVELOPE_FORMAT_ECDH_ES_P256_V1);
+        it->set_envelope_digest(std::string(32, '\xD1'));
+        it->set_key_check_value(std::string(3, '\xC1'));
     }
     std::string payload;
     resp.SerializeToString(&payload);
@@ -127,7 +134,33 @@ FakeSecClient::StatusItem active(const std::string& p) {
     s.state = 2;  // ACTIVE
     s.business_key_version = 1;
     s.key_id_digest = "digest-" + p;
+    s.key_id = (p == "UPLINK_AEAD") ? "kid-up" : "kid-down";
+    s.envelope_format = static_cast<int>(tbox::sec::KeyEnvelopeFormat::ECDH_ES_P256_V1);
+    s.envelope_digest = std::vector<uint8_t>(32, 0xD1);
+    s.key_check_value = std::vector<uint8_t>(3, 0xC1);
+    s.import_proof = std::vector<uint8_t>(64, 0xE1);
+    s.proof_algorithm = tbox::sec::kImportProofAlgorithmP1363;
+    s.recipient_certificate_digest = std::vector<uint8_t>(32, 0xB1);
     return s;
+}
+
+// CR-012 §10.11：递归扫描 store 目录，确认无 wrappedKey/parameters/proof 泄漏。
+bool dir_contains_bytes(const std::string& root,
+                        const std::vector<uint8_t>& needle) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (!fs::exists(root, ec)) return false;
+    for (const auto& e : fs::recursive_directory_iterator(root, ec)) {
+        if (ec || !e.is_regular_file()) continue;
+        std::ifstream in(e.path(), std::ios::binary);
+        std::string data((std::istreambuf_iterator<char>(in)),
+                         std::istreambuf_iterator<char>());
+        if (std::search(data.begin(), data.end(), needle.begin(), needle.end()) !=
+            data.end()) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void make_ready(const std::shared_ptr<MockMqttFacade>& mqtt, bool ready = true) {
@@ -196,7 +229,8 @@ TEST(KeyProvisioningIntegrationTest, SnapshotCarriesCapabilityContract) {
 TEST(KeyProvisioningIntegrationTest, FullFlowAndCapabilityPauseResume) {
     auto mqtt = std::make_shared<MockMqttFacade>();
     auto sec = std::make_shared<FakeSecClient>();
-    auto store = std::make_shared<V2cKeyProvisioningStore>(temp_root("coord"));
+    std::string store_root = temp_root("coord");
+    auto store = std::make_shared<V2cKeyProvisioningStore>(store_root);
 
     V2cKeyProvisioningConfig cfg;
     cfg.enabled = true;
@@ -276,6 +310,14 @@ TEST(KeyProvisioningIntegrationTest, FullFlowAndCapabilityPauseResume) {
     EXPECT_EQ(coord2.snapshot().state, V2cKeyProvState::ACTIVE);
     EXPECT_EQ(before, after);  // 无新申请
     coord2.stop();
+
+    // CR-012 §10.11：Store 不得包含 wrappedKey/parameters/proof 原文。
+    EXPECT_FALSE(dir_contains_bytes(store_root,
+                                    std::vector<uint8_t>(32, 'W')));
+    EXPECT_FALSE(dir_contains_bytes(store_root,
+                                    std::vector<uint8_t>(8, 'P')));
+    EXPECT_FALSE(dir_contains_bytes(store_root,
+                                    std::vector<uint8_t>(64, 0xE1)));
 }
 
 int main(int argc, char** argv) {

@@ -80,6 +80,29 @@ constexpr const char* kKeyprovSuiteEcdhEsP256 =
     "WRAPPING_SUITE_ECDH_ES_P256_HKDF_SHA256_AES256GCM";
 
 // ============================================================
+// PAR-PROTO CR-007 / CR-008 增量常量（TBOX-TSP-DSN-CR-012）
+// ============================================================
+// canonical package / service / protocol：整串 allowlist 精确匹配，禁止别名/前缀。
+constexpr const char* kKeyprovPackage = "security.keyprov.v1";
+// 旧值必须被拒绝，不得形成双栈（CR-012 §3）。
+constexpr const char* kKeyprovLegacyService = "vehicle.security.keyprov";
+constexpr const char* kKeyprovLegacyPackage = "vehicle.security.keyprov.v1";
+
+// KeyEnvelopeFormat：首期唯一受支持格式。
+constexpr int kKeyProvEnvelopeFormatUnspecified = 0;
+constexpr int kKeyProvEnvelopeFormatEcdhEsP256V1 = 1;  // KEY_ENVELOPE_FORMAT_ECDH_ES_P256_V1
+
+// ImportProofAlgorithm：首期唯一生产算法。
+constexpr int kKeyProvImportProofAlgorithmUnspecified = 0;
+constexpr int kKeyProvImportProofAlgorithmEcdsaP256P1363 = 1;  // ECDSA_P256_SHA256_P1363
+
+// CR-007 §7 / CR-008 §3.1 成功项精确长度。
+constexpr std::size_t kKeyprovEnvelopeDigestBytes = 32;
+constexpr std::size_t kKeyprovKeyCheckValueBytes = 3;
+constexpr std::size_t kKeyprovRecipientCertDigestBytes = 32;
+constexpr std::size_t kKeyprovImportProofP1363Bytes = 64;
+
+// ============================================================
 // 会话身份（CR-011 §4）：三种上行身份必填，同源不可拼接
 // ============================================================
 //
@@ -146,6 +169,8 @@ struct KeyProvRequestData {
     // 不再由调用方填写，统一由 builder 从必填的 KeyprovSessionIdentity 派生。
     KeyProvCertificateRef certificate_ref;
     std::vector<int> supported_wrapping_suites;   // <=8
+    // CR-007 §3/§6.1: 显式声明可接受的 envelope 参数格式；缺失/UNSPECIFIED 时不得请求 v1。
+    std::vector<int> supported_envelope_formats;  // <=8
     std::vector<KeyProvCurrentVersion> current_versions;  // <=8
     int64_t timestamp_ms = 0;
     int64_t expire_at_ms = 0;
@@ -214,14 +239,22 @@ struct KeyProvDecodeOutcome {
     std::string reason;
 };
 
-// 上行 ACK 单项结果（来自 SEC ImportResult）
+// 上行 ACK 单项结果（来自 SEC ImportResult；CR-008 §3 每用途 Import Attestation）
 struct KeyProvImportItemResult {
     int purpose = 0;
-    std::string key_id;      // <=128
+    std::string key_id;      // <=128；绑定原 Response keyId（OperationalMetadata）
     uint64_t business_key_version = 0;
     int result = 0;          // security.keyprov.v1.KeyImportResult
-    std::vector<uint8_t> import_proof;   // <=1024
-    std::string proof_algorithm;         // <=128
+    // CR-007 §3/§5：成功 ACK 必须精确回传本次 Response 的 format/digest/KCV。
+    int envelope_format = 0;             // KeyEnvelopeFormat
+    std::vector<uint8_t> envelope_digest;  // 恰好 32B
+    std::vector<uint8_t> key_check_value;  // 恰好 3B
+    // CR-008 §3：逐 item Import Attestation（字段 10/11）。
+    int import_proof_algorithm = 0;      // ImportProofAlgorithm；成功项固定 1
+    std::vector<uint8_t> import_proof;   // 成功项恰好 64B；遗留上限 <=1024
+    std::vector<uint8_t> recipient_certificate_digest;  // 成功项恰好 32B
+    // 遗留字段 6：新生产流必须留空，不得作为第二算法事实源。
+    std::string proof_algorithm;
 };
 
 struct KeyProvEncodeOutcome {
@@ -274,6 +307,19 @@ std::string keyprov_purpose_to_string(int purpose);
 int keyprov_wrapping_suite_from_string(const std::string& name);
 std::string keyprov_wrapping_suite_to_string(int suite);
 const char* keyprov_import_result_to_string(int result);
+
+// CR-007/CR-008: envelope format / import proof algorithm 名称映射。
+int keyprov_envelope_format_from_string(const std::string& name);
+std::string keyprov_envelope_format_to_string(int format);
+const char* keyprov_import_proof_algorithm_to_string(int algorithm);
+
+// ============================================================
+// 确定性 Protobuf runtime 启动自检（CR-012 §8 / Q2）
+// ============================================================
+// 校验 compiled-in keyprov descriptor 与固定 golden 输入在此 runtime 下产生稳定、
+// 确定的序列化字节。返回 false 时 KeyprovReadiness.deterministic_proto_runtime_ready
+// 必须为 false，从而 KEYPROV_READY=false。
+bool keyprov_deterministic_proto_runtime_check();
 
 } // namespace tsp
 } // namespace tbox

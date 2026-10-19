@@ -18,10 +18,12 @@
 #pragma once
 
 #include "keyprov_protocol.h"
+#include "keyprov_readiness.h"
 #include "mqtt_facade.h"
 #include "sec_business_key_facade.h"
 #include "v2c_key_provisioning_store.h"
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -80,6 +82,8 @@ struct V2cKeyProvisioningSnapshot {
     uint64_t cloud_session_generation = 0;
     bool sec_api_available = false;
     bool clock_synced = false;               // 系统时钟是否已同步（时间敏感请求门禁）
+    // CR-012 §8：9 项协议/SEC 前置门禁快照（脱敏，不含 proof/密钥）
+    KeyprovReadiness readiness;
     // 脱敏计数器
     uint64_t cloud_ready_events = 0;
     uint64_t requests_published = 0;
@@ -166,6 +170,11 @@ private:
                                 const std::string& request_id);
     bool keyprov_response_valid_locked(const KeyProvResponseData& resp,
                                        std::string& err) const;
+    // CR-012 §8：查询并合并 build-lock + SEC capability，结果缓存在 readiness_。
+    void refresh_sec_readiness_locked();
+    // CR-012 §5/§6：校验 SEC 导入结果与原 Response 绑定，且具备完整 Import Attestation。
+    bool import_result_bindable_locked(const tbox::sec::ImportResult& result,
+                                       std::string& err) const;
     uint32_t current_backoff_ms_locked() const;
     bool purposes_complete_locked(const std::vector<tbox::sec::BusinessKeyStatus>& items) const;
 
@@ -195,6 +204,18 @@ private:
 
     // in-flight（内存态；pending_items_ 持有 move-only SecureBuffer）
     std::vector<tbox::sec::WrappedKeyItem> pending_items_;
+    // 原 Response 的非敏感 ACK 绑定材料（仅内存；重启后由 SEC journal 裁决）。
+    struct AckBinding {
+        std::string purpose;
+        std::string key_id;
+        uint64_t business_key_version = 0;
+        int envelope_format = 0;
+        std::vector<uint8_t> envelope_digest;
+        std::array<uint8_t, 3> key_check_value{};
+        bool key_check_value_present = false;
+    };
+    std::vector<AckBinding> response_binding_;
+    KeyprovReadiness readiness_;
     bool import_attempted_ = false;
     std::vector<KeyProvImportItemResult> ack_items_;
     bool ack_sent_ = false;

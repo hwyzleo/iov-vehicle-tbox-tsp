@@ -40,9 +40,13 @@ std::vector<uint8_t> make_response_envelope(const std::string& request_id,
                                : KEY_PURPOSE_DOWNLINK_AEAD);
         it->set_key_id(i == 0 ? "kid-up" : "kid-down");
         it->set_business_key_version(version);
-        it->set_key_algorithm("AES-256-GCM");
+        it->set_key_algorithm("AES-256");
+        it->set_wrapping_suite(WRAPPING_SUITE_ECDH_ES_P256_HKDF_SHA256_AES256GCM);
         it->set_wrapped_key(std::string(32, 'W'));
         it->set_parameters(std::string(8, 'P'));
+        it->set_envelope_format(KEY_ENVELOPE_FORMAT_ECDH_ES_P256_V1);
+        it->set_envelope_digest(std::string(32, '\xD1'));
+        it->set_key_check_value(std::string(3, '\xC1'));
     }
     std::string payload;
     resp.SerializeToString(&payload);
@@ -87,6 +91,14 @@ FakeSecClient::StatusItem status_item(const std::string& purpose, int state,
     s.state = state;
     s.business_key_version = version;
     s.key_id_digest = "digest-" + purpose;
+    // CR-012 Q3 / CR-008：journal 返回原 ACK 绑定材料（与原 Response 一致）。
+    s.key_id = (purpose == kKeyprovPurposeUplink) ? "kid-up" : "kid-down";
+    s.envelope_format = static_cast<int>(tbox::sec::KeyEnvelopeFormat::ECDH_ES_P256_V1);
+    s.envelope_digest = std::vector<uint8_t>(32, 0xD1);
+    s.key_check_value = std::vector<uint8_t>(3, 0xC1);
+    s.import_proof = std::vector<uint8_t>(64, 0xE1);
+    s.proof_algorithm = tbox::sec::kImportProofAlgorithmP1363;
+    s.recipient_certificate_digest = std::vector<uint8_t>(32, 0xB1);
     return s;
 }
 
@@ -486,6 +498,177 @@ TEST_F(V2cKeyProvisioningCoordinatorTest, EventSequenceGapInvalidatesIdentity) {
     cr.event_sequence = cloud_seq_ + 5;  // 缺口
     mqtt_->deliver_cloud_readiness(cr);
     EXPECT_FALSE(coord_->snapshot().identity_valid);
+}
+
+// ============================================================
+// CR-012 §8: readiness 门禁（build-lock 由生成清单保证，SEC 能力逐项可关闭）
+// ============================================================
+TEST_F(V2cKeyProvisioningCoordinatorTest, SecCapabilityDownBlocksRequest) {
+    sec_->status_items.clear();
+    sec_->capability.secure_journal_replay_ready = false;
+    make_ready();
+    coord_->tick();
+    EXPECT_EQ(coord_->snapshot().state, V2cKeyProvState::WAIT_CLOUD);
+    EXPECT_FALSE(coord_->snapshot().readiness.all());
+    EXPECT_EQ(coord_->snapshot().readiness.first_missing_reason(),
+              "sec_journal_replay_not_ready");
+    EXPECT_EQ(publish_count_for("keyprov.uplink"), 0);
+}
+
+TEST_F(V2cKeyProvisioningCoordinatorTest, SecCapabilityContractMismatchBlocksRequest) {
+    sec_->status_items.clear();
+    sec_->capability.capability_contract_version = 999;
+    make_ready();
+    coord_->tick();
+    EXPECT_EQ(coord_->snapshot().state, V2cKeyProvState::WAIT_CLOUD);
+    EXPECT_FALSE(coord_->snapshot().readiness.sec_envelope_v1_import_ready);
+    EXPECT_EQ(publish_count_for("keyprov.uplink"), 0);
+}
+
+TEST_F(V2cKeyProvisioningCoordinatorTest, ReadyDownReadyResumesSameRequestId) {
+    std::string rid = make_first_request();
+    ASSERT_FALSE(rid.empty());
+    EXPECT_EQ(coord_->snapshot().state, V2cKeyProvState::WAIT_RESPONSE);
+
+    // SEC 能力 DOWN：暂停，不重发；保留业务 requestId。
+    sec_->capability.atomic_dual_purpose_commit_ready = false;
+    coord_->tick();
+    EXPECT_EQ(coord_->snapshot().state, V2cKeyProvState::WAIT_CLOUD);
+    EXPECT_EQ(coord_->snapshot().request_id, rid);
+    int paused = publish_count_for("keyprov.uplink");
+
+    // 恢复：同 requestId 继续（不生成新业务版本）。
+    sec_->capability.atomic_dual_purpose_commit_ready = true;
+    coord_->tick();
+    EXPECT_EQ(coord_->snapshot().request_id, rid);
+    EXPECT_GE(publish_count_for("keyprov.uplink"), paused);
+}
+
+// ============================================================
+// CR-012 §5: Response 完整转交 SEC（format/digest/KCV/suite）
+// ============================================================
+TEST_F(V2cKeyProvisioningCoordinatorTest, RequestDeclaresCanonicalSuiteAndEnvelopeFormat) {
+    std::string rid = make_first_request();
+    ASSERT_FALSE(rid.empty());
+    auto calls = mqtt_->publish_route_calls();
+    ASSERT_FALSE(calls.empty());
+    VehicleMessageEnvelope env;
+    ASSERT_TRUE(env.ParseFromArray(calls[0].payload.data(),
+                                   (int)calls[0].payload.size()));
+    KeyProvisioningRequest req;
+    ASSERT_TRUE(req.ParseFromString(env.payload()));
+    EXPECT_EQ(req.business_domain(), "V2C_COMM");
+    ASSERT_EQ(req.purposes_size(), 2);
+    EXPECT_EQ(req.purposes(0), KEY_PURPOSE_UPLINK_AEAD);
+    EXPECT_EQ(req.purposes(1), KEY_PURPOSE_DOWNLINK_AEAD);
+    // CR-012 §4：显式 ECDH suite + envelope v1，不声明未实现套件。
+    ASSERT_EQ(req.supported_wrapping_suites_size(), 1);
+    EXPECT_EQ(req.supported_wrapping_suites(0),
+              WRAPPING_SUITE_ECDH_ES_P256_HKDF_SHA256_AES256GCM);
+    ASSERT_EQ(req.supported_envelope_formats_size(), 1);
+    EXPECT_EQ(req.supported_envelope_formats(0),
+              KEY_ENVELOPE_FORMAT_ECDH_ES_P256_V1);
+}
+
+TEST_F(V2cKeyProvisioningCoordinatorTest, FullHandoverPassesEnvelopeBindingToSec) {
+    sec_->status_items.clear();
+    make_ready();
+    coord_->tick();
+    std::string rid = coord_->snapshot().request_id;
+    coord_->handle_routed_downlink(downlink(make_response_envelope(rid)));
+    sec_->import_items = {status_item(kKeyprovPurposeUplink, kActive, 3),
+                          status_item(kKeyprovPurposeDownlink, kActive, 3)};
+    sec_->import_state = kCommitted;
+    coord_->tick();
+
+    ASSERT_EQ(sec_->last_import_items.size(), 2u);
+    for (const auto& it : sec_->last_import_items) {
+        EXPECT_EQ(it.wrapping_suite, tbox::sec::kWrappingSuiteEcdhEsP256);
+        EXPECT_EQ(it.envelope_format,
+                  static_cast<int>(tbox::sec::KeyEnvelopeFormat::ECDH_ES_P256_V1));
+        EXPECT_EQ(it.envelope_digest, std::vector<uint8_t>(32, 0xD1));
+        EXPECT_TRUE(it.key_check_value_present);
+        EXPECT_EQ(it.key_check_value, (std::array<uint8_t, 3>{0xC1, 0xC1, 0xC1}));
+        EXPECT_EQ(it.wrapped_key_size, 32u);
+        EXPECT_EQ(it.parameters_size, 8u);
+    }
+}
+
+// ============================================================
+// CR-012 §6: ACK 每用途 P1363 Import Attestation
+// ============================================================
+TEST_F(V2cKeyProvisioningCoordinatorTest, AckCarriesPerPurposeP1363Attestation) {
+    sec_->status_items.clear();
+    make_ready();
+    coord_->tick();
+    std::string rid = coord_->snapshot().request_id;
+    coord_->handle_routed_downlink(downlink(make_response_envelope(rid)));
+    sec_->import_items = {status_item(kKeyprovPurposeUplink, kActive, 3),
+                          status_item(kKeyprovPurposeDownlink, kActive, 3)};
+    sec_->import_state = kCommitted;
+    coord_->tick();
+    ASSERT_EQ(coord_->snapshot().state, V2cKeyProvState::ACK_PENDING);
+
+    // 取最后一条 ACK 上行 payload。
+    auto calls = mqtt_->publish_route_calls();
+    bool found = false;
+    KeyProvisioningAck ack;
+    for (auto it = calls.rbegin(); it != calls.rend(); ++it) {
+        if (it->route_id != "keyprov.uplink") continue;
+        VehicleMessageEnvelope env;
+        if (!env.ParseFromArray(it->payload.data(), (int)it->payload.size())) continue;
+        if (env.payload_type() != kKeyprovPayloadAck) continue;
+        ASSERT_TRUE(ack.ParseFromString(env.payload()));
+        found = true;
+        break;
+    }
+    ASSERT_TRUE(found);
+    ASSERT_EQ(ack.items_size(), 2);
+    for (const auto& item : ack.items()) {
+        EXPECT_EQ(item.import_proof_algorithm(),
+                  IMPORT_PROOF_ALGORITHM_ECDSA_P256_SHA256_P1363);
+        EXPECT_EQ(item.import_proof().size(), 64u);
+        EXPECT_EQ(item.recipient_certificate_digest().size(), 32u);
+        EXPECT_EQ(item.envelope_digest().size(), 32u);
+        EXPECT_EQ(item.key_check_value().size(), 3u);
+        EXPECT_EQ(item.envelope_format(), KEY_ENVELOPE_FORMAT_ECDH_ES_P256_V1);
+        EXPECT_TRUE(item.proof_algorithm().empty());  // 遗留字段不得形成第二事实源
+    }
+}
+
+TEST_F(V2cKeyProvisioningCoordinatorTest, PartialImportNeverSendsSuccessAck) {
+    sec_->status_items.clear();
+    make_ready();
+    coord_->tick();
+    std::string rid = coord_->snapshot().request_id;
+    coord_->handle_routed_downlink(downlink(make_response_envelope(rid)));
+    // 只有一个 purpose 返回 ACTIVE，不构成完整批次。
+    sec_->import_items = {status_item(kKeyprovPurposeUplink, kActive, 3)};
+    sec_->import_state = kCommitted;
+    coord_->tick();
+    EXPECT_EQ(coord_->snapshot().state, V2cKeyProvState::BLOCKED);
+    EXPECT_EQ(publish_count_for("keyprov.uplink"), 1);  // 仅 Request，无 ACK
+    for (const auto& c : mqtt_->publish_route_calls()) {
+        VehicleMessageEnvelope env;
+        if (!env.ParseFromArray(c.payload.data(), (int)c.payload.size())) continue;
+        EXPECT_NE(env.payload_type(), kKeyprovPayloadAck);
+    }
+}
+
+TEST_F(V2cKeyProvisioningCoordinatorTest, AckAttestationMissingBlocksAck) {
+    sec_->status_items.clear();
+    make_ready();
+    coord_->tick();
+    std::string rid = coord_->snapshot().request_id;
+    coord_->handle_routed_downlink(downlink(make_response_envelope(rid)));
+    auto up = status_item(kKeyprovPurposeUplink, kActive, 3);
+    auto down = status_item(kKeyprovPurposeDownlink, kActive, 3);
+    down.import_proof = std::vector<uint8_t>(63, 0xE1);  // 非 64B
+    sec_->import_items = {up, down};
+    sec_->import_state = kCommitted;
+    coord_->tick();
+    EXPECT_EQ(coord_->snapshot().state, V2cKeyProvState::BLOCKED);
+    EXPECT_EQ(publish_count_for("keyprov.uplink"), 1);
 }
 
 int main(int argc, char** argv) {

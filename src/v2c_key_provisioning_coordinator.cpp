@@ -35,7 +35,10 @@ bool default_clock_synchronized() {
     return ::access(kTimesyncMarker, F_OK) == 0;
 }
 
-// 从 SEC ImportResult 构造 ACK items（仅非敏感字段 + import_proof）
+// 从 SEC ImportResult 构造 ACK items（CR-012 §6 机械映射）。
+// - key_id/version/format/digest/KCV/proof/certDigest 均取 SEC journal 返回值；
+// - TSP 不构造 proofInput、不签名/验签、不修改 proof bytes；
+// - 遗留 string proof_algorithm 留空，算法只由 import_proof_algorithm 承载。
 std::vector<KeyProvImportItemResult> build_ack_items(
     const tbox::sec::ImportResult& result) {
     std::vector<KeyProvImportItemResult> out;
@@ -43,12 +46,22 @@ std::vector<KeyProvImportItemResult> build_ack_items(
     for (const auto& it : result.items) {
         KeyProvImportItemResult a;
         a.purpose = keyprov_purpose_from_string(it.purpose);
-        a.key_id = it.key_id_digest;   // SEC 只返回摘要；不可逆、非敏感
+        a.key_id = it.key_id;
         a.business_key_version = it.business_key_version;
         a.result = kKeyProvImportImported;
-        // 首期 SEC ImportResult 的 proof 为批次级；ACK 以同一 proof 覆盖两用途。
-        a.import_proof = result.import_proof.bytes();
-        a.proof_algorithm = result.proof_algorithm;
+        a.envelope_format = static_cast<int>(it.envelope_format);
+        a.envelope_digest = it.envelope_digest;
+        if (it.key_check_value_present) {
+            a.key_check_value.assign(it.key_check_value.begin(),
+                                     it.key_check_value.end());
+        }
+        a.import_proof_algorithm =
+            it.proof_algorithm == tbox::sec::kImportProofAlgorithmP1363
+                ? kKeyProvImportProofAlgorithmEcdsaP256P1363
+                : kKeyProvImportProofAlgorithmUnspecified;
+        a.import_proof = it.import_proof;
+        a.recipient_certificate_digest = it.recipient_certificate_digest;
+        a.proof_algorithm.clear();
         out.push_back(std::move(a));
     }
     return out;
@@ -243,6 +256,7 @@ void V2cKeyProvisioningCoordinator::invalidate_identity_locked(
     identity_ = KeyprovSessionIdentity{};
     // 旧传输态不得跨上下文重发；Cloud deadline 必须暂停。
     pending_items_.clear();
+    response_binding_.clear();
     last_response_message_id_.clear();
     deadline_ms_ = 0;
     // 业务 requestId 保留：网络代际不是业务幂等键（CR-011 §6）。
@@ -331,6 +345,7 @@ V2cKeyProvisioningSnapshot V2cKeyProvisioningCoordinator::snapshot() const {
     s.last_error = record_.last_error;
     s.cloud_session_generation = record_.cloud_session_generation;
     s.clock_synced = clock_synced_;
+    s.readiness = readiness_;
     return s;
 }
 
@@ -404,6 +419,20 @@ void V2cKeyProvisioningCoordinator::handle_routed_downlink(
                 persist_locked();
                 return;
             }
+            // 保存原 Response 的非敏感 ACK 绑定材料（用于 SEC 结果逐项绑定校验）。
+            response_binding_.clear();
+            response_binding_.reserve(resp.items.size());
+            for (const auto& it : resp.items) {
+                AckBinding b;
+                b.purpose = it.purpose;
+                b.key_id = it.key_id;
+                b.business_key_version = it.business_key_version;
+                b.envelope_format = static_cast<int>(it.envelope_format);
+                b.envelope_digest = it.envelope_digest;
+                b.key_check_value = it.key_check_value;
+                b.key_check_value_present = it.key_check_value_present;
+                response_binding_.push_back(std::move(b));
+            }
             pending_items_ = std::move(resp.items);  // move-only SecureBuffer
             last_response_message_id_ = decoded.decoded.message_id;
             import_attempted_ = false;
@@ -465,6 +494,18 @@ void V2cKeyProvisioningCoordinator::handle_routed_downlink(
 // ============================================================
 // 状态推进
 // ============================================================
+void V2cKeyProvisioningCoordinator::refresh_sec_readiness_locked() {
+    // build-lock 部分来自生成清单 + 启动自检；SEC 四项来自只读 capability 查询。
+    KeyprovReadiness r = keyprov_build_lock_readiness();
+    tbox::sec::V2cKeyProvisioningCapability cap;
+    ErrorCode ec = sec_->get_v2c_key_provisioning_capability(cap);
+    // 查询失败/未实现：SEC 四项保持 false（fail-closed），不得用 NOT_READY 归约。
+    if (ec == ErrorCode::SUCCESS) {
+        keyprov_apply_sec_capability(cap, r);
+    }
+    readiness_ = r;
+}
+
 bool V2cKeyProvisioningCoordinator::capability_gate_locked(
     std::string& reason) {
     if (!config_.enabled) {
@@ -473,6 +514,12 @@ bool V2cKeyProvisioningCoordinator::capability_gate_locked(
     }
     if (stopping_.load(std::memory_order_acquire)) {
         reason = "stopping";
+        return false;
+    }
+    // CR-012 §8：协议锁版 + SEC capability 未就绪时不得发起/提交/ACK。
+    refresh_sec_readiness_locked();
+    if (!readiness_.all()) {
+        reason = readiness_.first_missing_reason();
         return false;
     }
     // CR-011 §5.1: MQTT readiness v3 与 session-bound publish 能力必须分别确认。
@@ -686,9 +733,11 @@ void V2cKeyProvisioningCoordinator::do_request_locked() {
     }
     // CR-011 §4: 身份摘要/引用由 builder 从同一 identity 派生，不在此拼接。
     req.certificate_ref.certificate_profile = config_.certificate_profile;
+    // CR-012 §3：首期唯一受支持封装套件为 ECDH-ES P-256；不得声明未实现套件。
     req.supported_wrapping_suites = {
-        keyprov_wrapping_suite_from_string(kKeyprovSuiteHpkeBaseX25519),
         keyprov_wrapping_suite_from_string(kKeyprovSuiteEcdhEsP256)};
+    // CR-012 §4 / CR-007 §6.1：显式声明 envelope v1；缺失则云端不得下发该格式。
+    req.supported_envelope_formats = {kKeyProvEnvelopeFormatEcdhEsP256V1};
     for (const auto& kv : record_.business_key_versions) {
         KeyProvCurrentVersion cv;
         cv.purpose = keyprov_purpose_from_string(kv.first);
@@ -749,6 +798,57 @@ void V2cKeyProvisioningCoordinator::do_import_locked() {
     handle_import_result_locked(ec, res);
 }
 
+bool V2cKeyProvisioningCoordinator::import_result_bindable_locked(
+    const tbox::sec::ImportResult& result, std::string& err) const {
+    if (result.items.size() != config_.purposes.size()) {
+        err = "import_purpose_count_mismatch";
+        return false;
+    }
+    for (const auto& p : config_.purposes) {
+        bool found = false;
+        for (const auto& it : result.items) {
+            if (it.purpose != p) continue;
+            if (found) {  // 重复 purpose
+                err = "import_purpose_duplicate";
+                return false;
+            }
+            found = true;
+            // 只有两用途均 IMPORTED(ACTIVE) 且 attestation 完整才允许成功 ACK。
+            if (it.state != BusinessKeyState::ACTIVE ||
+                it.business_key_version == 0 || it.key_id.empty() ||
+                it.envelope_format != tbox::sec::KeyEnvelopeFormat::ECDH_ES_P256_V1 ||
+                it.envelope_digest.size() != kKeyprovEnvelopeDigestBytes ||
+                !it.key_check_value_present ||
+                it.import_proof.size() != kKeyprovImportProofP1363Bytes ||
+                it.recipient_certificate_digest.size() !=
+                    kKeyprovRecipientCertDigestBytes ||
+                it.proof_algorithm != tbox::sec::kImportProofAlgorithmP1363) {
+                err = "import_attestation_invalid";
+                return false;
+            }
+            // 与原 Response 逐项绑定（若本进程仍持有绑定材料）。
+            for (const auto& b : response_binding_) {
+                if (b.purpose != p) continue;
+                if (b.key_id != it.key_id ||
+                    b.business_key_version != it.business_key_version ||
+                    b.envelope_format != static_cast<int>(it.envelope_format) ||
+                    b.envelope_digest != it.envelope_digest ||
+                    b.key_check_value != it.key_check_value) {
+                    err = "import_response_binding_conflict";
+                    return false;
+                }
+                break;
+            }
+            break;
+        }
+        if (!found) {
+            err = "import_purpose_missing";
+            return false;
+        }
+    }
+    return true;
+}
+
 void V2cKeyProvisioningCoordinator::handle_import_result_locked(
     ErrorCode ec, const tbox::sec::ImportResult& result) {
     // 无论结果如何，导入调用返回后立即清理临时 Wrapped Key 缓冲
@@ -756,6 +856,15 @@ void V2cKeyProvisioningCoordinator::handle_import_result_locked(
 
     if (ec == ErrorCode::SUCCESS &&
         result.state == BusinessKeyImportState::COMMITTED) {
+        std::string bind_err;
+        if (!import_result_bindable_locked(result, bind_err)) {
+            // 结构性/绑定拒绝：不得发送成功 ACK，也不得盲目重试。
+            counters_.imports_failed++;
+            state_ = V2cKeyProvState::BLOCKED;
+            record_.last_error = bind_err;
+            persist_locked();
+            return;
+        }
         ack_items_ = build_ack_items(result);
         if (ack_items_.size() != config_.purposes.size()) {
             state_ = V2cKeyProvState::RETRY_WAIT;
@@ -949,7 +1058,11 @@ bool V2cKeyProvisioningCoordinator::keyprov_response_valid_locked(
             if (it.business_key_version == 0 || it.key_id.empty() ||
                 it.wrapped_key.empty() ||
                 it.wrapped_key.size() > kKeyprovMaxWrappedKeyBytes ||
-                it.parameters.size() > kKeyprovMaxParametersBytes) {
+                it.parameters.size() > kKeyprovMaxParametersBytes ||
+                it.envelope_format !=
+                    tbox::sec::KeyEnvelopeFormat::ECDH_ES_P256_V1 ||
+                it.envelope_digest.size() != kKeyprovEnvelopeDigestBytes ||
+                !it.key_check_value_present) {
                 err = "response_item_invalid";
                 return false;
             }

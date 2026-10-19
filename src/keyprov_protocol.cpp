@@ -4,6 +4,8 @@
 #include "security/keyprov/v1/key_provisioning.pb.h"
 #include "vehicle/common/v1/envelope.pb.h"
 
+#include <google/protobuf/descriptor.h>
+
 #include <cctype>
 #include <cstring>
 #include <utility>
@@ -13,6 +15,9 @@ namespace tsp {
 
 namespace {
 
+using security::keyprov::v1::EcdhEsP256EnvelopeParametersV1;
+using security::keyprov::v1::ImportProofAlgorithm;
+using security::keyprov::v1::KeyEnvelopeFormat;
 using security::keyprov::v1::KeyImportItemResult;
 using security::keyprov::v1::KeyImportResult;
 using security::keyprov::v1::KeyPurpose;
@@ -204,6 +209,36 @@ std::string keyprov_wrapping_suite_to_string(int suite) {
     }
 }
 
+int keyprov_envelope_format_from_string(const std::string& name) {
+    if (name == "ECDH_ES_P256_V1" || name == "KEY_ENVELOPE_FORMAT_ECDH_ES_P256_V1") {
+        return static_cast<int>(KeyEnvelopeFormat::KEY_ENVELOPE_FORMAT_ECDH_ES_P256_V1);
+    }
+    if (name == "UNSPECIFIED" || name == "KEY_ENVELOPE_FORMAT_UNSPECIFIED") {
+        return static_cast<int>(KeyEnvelopeFormat::KEY_ENVELOPE_FORMAT_UNSPECIFIED);
+    }
+    return -1;  // 未知值 fail-closed
+}
+
+std::string keyprov_envelope_format_to_string(int format) {
+    switch (static_cast<KeyEnvelopeFormat>(format)) {
+        case KeyEnvelopeFormat::KEY_ENVELOPE_FORMAT_ECDH_ES_P256_V1:
+            return "ECDH_ES_P256_V1";
+        case KeyEnvelopeFormat::KEY_ENVELOPE_FORMAT_UNSPECIFIED:
+        default:
+            return "UNSPECIFIED";
+    }
+}
+
+const char* keyprov_import_proof_algorithm_to_string(int algorithm) {
+    switch (static_cast<ImportProofAlgorithm>(algorithm)) {
+        case ImportProofAlgorithm::IMPORT_PROOF_ALGORITHM_ECDSA_P256_SHA256_P1363:
+            return "ECDSA_P256_SHA256_P1363";
+        case ImportProofAlgorithm::IMPORT_PROOF_ALGORITHM_UNSPECIFIED:
+        default:
+            return "UNSPECIFIED";
+    }
+}
+
 const char* keyprov_import_result_to_string(int result) {
     switch (static_cast<KeyImportResult>(result)) {
         case KeyImportResult::KEY_IMPORT_RESULT_IMPORTED: return "IMPORTED";
@@ -235,10 +270,29 @@ KeyProvEncodeOutcome build_keyprov_request_envelope(
         in.business_domain.empty()) {
         return {KeyProvCodecStatus::FieldInvalid, {}, "request_field_missing"};
     }
+    // CR-012 §3：businessDomain 严格等于 V2C_COMM（区分大小写，禁止 trim/alias/fallback）。
+    if (in.business_domain != kKeyprovBusinessDomainV2c) {
+        return {KeyProvCodecStatus::FieldInvalid, {}, "business_domain_invalid"};
+    }
     if (in.purposes.size() > kKeyprovMaxItems ||
         in.supported_wrapping_suites.size() > kKeyprovMaxItems ||
+        in.supported_envelope_formats.size() > kKeyprovMaxItems ||
         in.current_versions.size() > kKeyprovMaxItems) {
         return {KeyProvCodecStatus::SizeExceeded, {}, "request_items_too_many"};
+    }
+    // CR-007 §6.1：必须显式声明非 UNSPECIFIED 的 envelope 格式，否则不得请求该格式。
+    bool envelope_format_declared = false;
+    for (int f : in.supported_envelope_formats) {
+        if (f == kKeyProvEnvelopeFormatEcdhEsP256V1) {
+            envelope_format_declared = true;
+        } else if (f == kKeyProvEnvelopeFormatUnspecified) {
+            return {KeyProvCodecStatus::FieldInvalid, {}, "envelope_format_unspecified"};
+        } else {
+            return {KeyProvCodecStatus::FieldInvalid, {}, "envelope_format_unknown"};
+        }
+    }
+    if (!envelope_format_declared) {
+        return {KeyProvCodecStatus::FieldInvalid, {}, "envelope_format_missing"};
     }
 
     // CR-011 §4: Request 的 deviceIdentityDigest/certificateRef 与该身份同源，
@@ -271,6 +325,9 @@ KeyProvEncodeOutcome build_keyprov_request_envelope(
     cref->set_key_encipherment_key_id(in.certificate_ref.key_encipherment_key_id);
     for (int s : in.supported_wrapping_suites) {
         req.add_supported_wrapping_suites(static_cast<WrappingSuite>(s));
+    }
+    for (int f : in.supported_envelope_formats) {
+        req.add_supported_envelope_formats(static_cast<KeyEnvelopeFormat>(f));
     }
     for (const auto& cv : in.current_versions) {
         auto* e = req.add_current_versions();
@@ -318,19 +375,49 @@ KeyProvEncodeOutcome build_keyprov_ack_envelope(
     ack.set_request_id(request_id);
     for (const auto& it : items) {
         if (!str_within(it.key_id, kKeyprovMaxStringBytes) ||
-            !str_within(it.proof_algorithm, kKeyprovMaxStringBytes) ||
             it.import_proof.size() > kKeyprovMaxImportProofBytes) {
             return {KeyProvCodecStatus::SizeExceeded, {}, "ack_item_too_large"};
+        }
+        // CR-007 §5 / CR-008 §3.1：成功 IMPORTED 项必须满足精确的 format/长度/算法组合。
+        // TSP 只做枚举/长度/结构检查，绝不构造 proofInput、签名或验签。
+        if (it.envelope_format == kKeyProvEnvelopeFormatEcdhEsP256V1) {
+            if (it.import_proof_algorithm !=
+                    kKeyProvImportProofAlgorithmEcdsaP256P1363 ||
+                it.import_proof.size() != kKeyprovImportProofP1363Bytes ||
+                it.recipient_certificate_digest.size() !=
+                    kKeyprovRecipientCertDigestBytes ||
+                it.envelope_digest.size() != kKeyprovEnvelopeDigestBytes ||
+                it.key_check_value.size() != kKeyprovKeyCheckValueBytes) {
+                return {KeyProvCodecStatus::FieldInvalid, {},
+                        "ack_attestation_invalid"};
+            }
+        } else if (it.envelope_format == kKeyProvEnvelopeFormatUnspecified) {
+            return {KeyProvCodecStatus::FieldInvalid, {},
+                    "ack_envelope_format_unspecified"};
+        } else {
+            return {KeyProvCodecStatus::FieldInvalid, {},
+                    "ack_envelope_format_unknown"};
         }
         auto* e = ack.add_items();
         e->set_purpose(static_cast<KeyPurpose>(it.purpose));
         e->set_key_id(it.key_id);
         e->set_business_key_version(it.business_key_version);
         e->set_result(static_cast<KeyImportResult>(it.result));
+        e->set_envelope_format(static_cast<KeyEnvelopeFormat>(it.envelope_format));
+        e->set_envelope_digest(it.envelope_digest.data(), it.envelope_digest.size());
+        e->set_key_check_value(it.key_check_value.data(), it.key_check_value.size());
+        e->set_import_proof_algorithm(
+            static_cast<ImportProofAlgorithm>(it.import_proof_algorithm));
         if (!it.import_proof.empty()) {
             e->set_import_proof(it.import_proof.data(), it.import_proof.size());
         }
-        e->set_proof_algorithm(it.proof_algorithm);
+        if (!it.recipient_certificate_digest.empty()) {
+            e->set_recipient_certificate_digest(
+                it.recipient_certificate_digest.data(),
+                it.recipient_certificate_digest.size());
+        }
+        // CR-008 §3.1：遗留 string 字段必须留空，不得形成第二算法事实源。
+        // proto3 默认空串；不调用 deprecated setter（字段 6 保持未设置/空）。
     }
     ack.set_timestamp_ms(timestamp_ms);
 
@@ -431,6 +518,23 @@ KeyProvDecodeOutcome decode_keyprov_envelope(
                 !str_within(it.key_algorithm(), kKeyprovMaxShortStringBytes)) {
                 return decode_fail(KeyProvCodecStatus::FieldInvalid, "wrapped_item_field_invalid");
             }
+            // CR-012 §5/§9：TSP 只做外层枚举/长度校验（不是密码学验证）。
+            // format/suite 必须命中首期 allowlist，否则整批拒绝。
+            if (static_cast<int>(it.envelope_format()) !=
+                    kKeyProvEnvelopeFormatEcdhEsP256V1) {
+                return decode_fail(KeyProvCodecStatus::FieldInvalid,
+                                   "wrapped_envelope_format_unsupported");
+            }
+            if (static_cast<int>(it.wrapping_suite()) !=
+                keyprov_wrapping_suite_from_string(kKeyprovSuiteEcdhEsP256)) {
+                return decode_fail(KeyProvCodecStatus::FieldInvalid,
+                                   "wrapped_suite_unsupported");
+            }
+            if (it.envelope_digest().size() != kKeyprovEnvelopeDigestBytes ||
+                it.key_check_value().size() != kKeyprovKeyCheckValueBytes) {
+                return decode_fail(KeyProvCodecStatus::FieldInvalid,
+                                   "wrapped_digest_or_kcv_invalid");
+            }
             tbox::sec::WrappedKeyItem wi;
             wi.purpose = keyprov_purpose_to_string(static_cast<int>(it.purpose()));
             wi.key_id = it.key_id();
@@ -438,6 +542,16 @@ KeyProvDecodeOutcome decode_keyprov_envelope(
             wi.algorithm = it.key_algorithm();
             wi.valid_from_ms = it.valid_from_ms();
             wi.valid_to_ms = it.valid_to_ms();
+            // CR-012 §5：完整转交，不解析 parameters/不重算 digest/不检 KCV。
+            wi.wrapping_suite = tbox::sec::kWrappingSuiteEcdhEsP256;
+            wi.envelope_format = tbox::sec::KeyEnvelopeFormat::ECDH_ES_P256_V1;
+            wi.envelope_digest.assign(it.envelope_digest().begin(),
+                                      it.envelope_digest().end());
+            const std::string& kcv = it.key_check_value();
+            wi.key_check_value = {static_cast<uint8_t>(kcv[0]),
+                                  static_cast<uint8_t>(kcv[1]),
+                                  static_cast<uint8_t>(kcv[2])};
+            wi.key_check_value_present = true;
             wi.wrapped_key.assign(
                 reinterpret_cast<const uint8_t*>(it.wrapped_key().data()),
                 it.wrapped_key().size());
@@ -496,6 +610,60 @@ KeyProvDecodeOutcome decode_keyprov_envelope(
     }
 
     return decode_fail(KeyProvCodecStatus::UnsupportedPayloadType, "unsupported_payload_type");
+}
+
+// ============================================================
+// 确定性 Protobuf runtime 启动自检（CR-012 §8 / Q2）
+// ============================================================
+bool keyprov_deterministic_proto_runtime_check() {
+    // 1) 链接进来的 descriptor 必须与锁定的 canonical IDL 一致：
+    //    package/消息存在，且 CR-007/CR-008 追加字段号在编译期已生效。
+    const auto* req = KeyProvisioningRequest::descriptor();
+    if (req == nullptr) return false;
+    if (req->file() == nullptr ||
+        req->file()->package() != kKeyprovPackage) {
+        return false;
+    }
+    if (req->FindFieldByName("supported_envelope_formats") == nullptr) return false;
+
+    const auto* wrap = security::keyprov::v1::WrappedKeyItem::descriptor();
+    const auto* imp = KeyImportItemResult::descriptor();
+    if (wrap == nullptr || imp == nullptr) return false;
+    // WrappedKeyItem: envelope_digest=10, key_check_value=11, envelope_format=12
+    const auto* wrap_digest = wrap->FindFieldByName("envelope_digest");
+    const auto* wrap_kcv = wrap->FindFieldByName("key_check_value");
+    const auto* wrap_fmt = wrap->FindFieldByName("envelope_format");
+    if (!wrap_digest || wrap_digest->number() != 10 ||
+        !wrap_kcv || wrap_kcv->number() != 11 ||
+        !wrap_fmt || wrap_fmt->number() != 12) {
+        return false;
+    }
+    // KeyImportItemResult: import_proof_algorithm=10, recipient_certificate_digest=11
+    const auto* alg = imp->FindFieldByName("import_proof_algorithm");
+    const auto* cert = imp->FindFieldByName("recipient_certificate_digest");
+    if (!alg || alg->number() != 10 ||
+        !cert || cert->number() != 11) {
+        return false;
+    }
+
+    // 2) 确定性子消息在此 runtime 下重复序列化字节稳定。
+    EcdhEsP256EnvelopeParametersV1 p;
+    p.set_format_version(1);
+    p.set_server_ephemeral_public_key(std::string(65, '\x04'));
+    p.set_hkdf_salt(std::string(32, '\x01'));
+    p.set_hkdf_context_version("v1");
+    p.set_nonce(std::string(12, '\x02'));
+    p.set_authentication_tag(std::string(16, '\x03'));
+    p.set_canonical_aad("aad");
+    p.set_aad_digest(std::string(32, '\x04'));
+    p.set_root_key_version(1);
+    p.set_derivation_version("v1");
+    p.set_recipient_certificate_digest(std::string(32, '\x05'));
+    p.set_operation_id("op");
+    std::string a;
+    std::string b;
+    if (!p.SerializeToString(&a) || !p.SerializeToString(&b)) return false;
+    return a == b && !a.empty();
 }
 
 } // namespace tsp

@@ -44,6 +44,14 @@ public:
     virtual tbox::sec::ErrorCode get_business_key_import_result(
         const std::string& request_id,
         tbox::sec::ImportResult& out) = 0;
+
+    // TBOX-TSP-DSN-CR-012 §8 / Q1：只读 keyprov capability 查询。
+    // 默认 NOT_IMPLEMENTED（fail-closed），由真实适配器/Fake 覆盖。
+    virtual tbox::sec::ErrorCode get_v2c_key_provisioning_capability(
+        tbox::sec::V2cKeyProvisioningCapability& out) {
+        (void)out;
+        return tbox::sec::ErrorCode::NOT_IMPLEMENTED;
+    }
 };
 
 // MqttFacade 的 SEC 对应实现：包装 tbox::sec::SecClient。
@@ -73,6 +81,9 @@ public:
     tbox::sec::ErrorCode get_business_key_import_result(
         const std::string& request_id,
         tbox::sec::ImportResult& out) override;
+
+    tbox::sec::ErrorCode get_v2c_key_provisioning_capability(
+        tbox::sec::V2cKeyProvisioningCapability& out) override;
 
 private:
     std::string socket_path_;

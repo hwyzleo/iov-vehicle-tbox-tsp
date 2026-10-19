@@ -1,0 +1,21 @@
+# TBOX-TSP-DSN-CR-012 §8 / Q2：keyprov 协议锁版构建清单。
+#
+# 本文件是 BUILD / release 流水线的受控输出，纳入制品摘要；开发仓库中的值仅用于
+# 本地构建与测试。正式发布必须由流水线在 PAR-PROTO CR-008 release、DescriptorSet、
+# 跨语言 golden vector-set 全部通过后重新生成并签名。
+#
+# 键值均为 KEY=VALUE（# 起始为注释）。CMake 在配置阶段读取并生成
+# <build>/generated/proto/keyprov_release_lock.h。
+
+MANIFEST_VERSION=1
+PAR_PROTO_RELEASE=PAR-PROTO-DSN-CR-008
+DESCRIPTOR_SET_HASH=5e737477ddc1cae57a8ac2350870c7614f2b2f378e17a51db15a03321cd944dd
+PACKAGE=security.keyprov.v1
+SERVICE=security.keyprov
+PROTOCOL_VERSION=keyprov-v1
+CANONICAL_REGISTRY=openiov/par-proto/keyprov-v1
+PROTOC_VERSION=35.1
+PROTOBUF_RUNTIME_VERSION=35.1.0
+GOLDEN_VECTOR_SET_ID=keyprov-ecdh-es-v1-p1363
+GOLDEN_VECTOR_SET_HASH=62b07d1b760d2dcd1d1b1e581a887b47fabd17305f73bad490f88fbe59afa1db
+CROSS_LANGUAGE_GOLDEN_READY=true

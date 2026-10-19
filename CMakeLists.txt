@@ -133,6 +133,52 @@ if(TSP_PROTO_GEN_SOURCES)
 endif()
 
 # ============================================================
+# TBOX-TSP-DSN-CR-012 §8 / Q2: keyprov release lock manifest -> generated header
+#
+# 构建清单（PAR-PROTO release / DescriptorSet hash / package-service-protocol
+# registry tuple / protoc+runtime / golden vector-set）由 BUILD 流水线生成。
+# 本地未提供时 fail-closed（readiness=DOWN），不得由源码手写 true 绕过。
+# ============================================================
+set(TSP_KEYPROV_MANIFEST "${CMAKE_CURRENT_SOURCE_DIR}/config/keyprov_release_lock.manifest")
+set(TSP_KEYPROV_MANIFEST_VERSION "")
+set(TSP_KEYPROV_PAR_PROTO_RELEASE "")
+set(TSP_KEYPROV_DESCRIPTOR_SET_HASH "")
+set(TSP_KEYPROV_PACKAGE "")
+set(TSP_KEYPROV_SERVICE "")
+set(TSP_KEYPROV_PROTOCOL_VERSION "")
+set(TSP_KEYPROV_CANONICAL_REGISTRY "")
+set(TSP_KEYPROV_PROTOC_VERSION "")
+set(TSP_KEYPROV_PROTOBUF_RUNTIME_VERSION "")
+set(TSP_KEYPROV_GOLDEN_VECTOR_SET_ID "")
+set(TSP_KEYPROV_GOLDEN_VECTOR_SET_HASH "")
+set(TSP_KEYPROV_CROSS_LANGUAGE_GOLDEN_READY false)
+
+if(EXISTS "${TSP_KEYPROV_MANIFEST}")
+    file(STRINGS "${TSP_KEYPROV_MANIFEST}" _tsp_keyprov_manifest_lines)
+    foreach(_line IN LISTS _tsp_keyprov_manifest_lines)
+        string(STRIP "${_line}" _line)
+        if(_line STREQUAL "" OR _line MATCHES "^#")
+            continue()
+        endif()
+        if(_line MATCHES "^([A-Za-z0-9_]+)=(.*)$")
+            set("TSP_KEYPROV_${CMAKE_MATCH_1}" "${CMAKE_MATCH_2}")
+        endif()
+    endforeach()
+endif()
+
+# 未提供 runtime 版本时回退到当前 pkg-config protobuf（仍受构建锁定约束）。
+if(TSP_KEYPROV_PROTOBUF_RUNTIME_VERSION STREQUAL "")
+    set(TSP_KEYPROV_PROTOBUF_RUNTIME_VERSION "${PROTOBUF_VERSION}")
+endif()
+message(STATUS "TSP keyprov lock: release=${TSP_KEYPROV_PAR_PROTO_RELEASE} "
+               "golden_ready=${TSP_KEYPROV_CROSS_LANGUAGE_GOLDEN_READY}")
+
+file(MAKE_DIRECTORY "${TSP_PROTO_GEN_DIR}")
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cmake/keyprov_release_lock.h.in"
+               "${TSP_PROTO_GEN_DIR}/keyprov_release_lock.h"
+               @ONLY)
+
+# ============================================================
 # Client SDK 库 (tbox_tsp_client / tbox::tsp_client, CR-003 §7)
 # TSP daemon 不链接 tsp_client；双方共享 protocol contract/DTO。
 # ============================================================
@@ -178,6 +224,7 @@ set(TBOX_TSP_DAEMON_SOURCES
         src/tsp_framework_server.cpp
         src/vehicle_message_gateway.cpp   # CR-009 §16: 通用 VehicleMessage 网关
         src/keyprov_protocol.cpp         # CR-010 §4.2: keyprov wire codec
+        src/keyprov_readiness.cpp        # CR-012 §8: build-lock + SEC capability 门禁
         src/v2c_key_provisioning_store.cpp      # CR-010 §5: 非敏感流程状态持久化
         src/v2c_key_provisioning_coordinator.cpp # CR-010 §3.1: V2C keyprov 编排
         src/sec_business_key_adapter.cpp         # CR-010 §3.2: SEC 业务密钥适配器

@@ -40,11 +40,15 @@ std::vector<uint8_t> make_response_envelope(bool good_purposes = true) {
                             : KEY_PURPOSE_UNSPECIFIED);
         it->set_key_id(i == 0 ? "kid-up" : "kid-down");
         it->set_business_key_version(3);
-        it->set_key_algorithm("AES-256-GCM");
+        it->set_key_algorithm("AES-256");
         it->set_wrapping_suite(
             WRAPPING_SUITE_ECDH_ES_P256_HKDF_SHA256_AES256GCM);
         it->set_wrapped_key(std::string(48, 'W'));
         it->set_parameters(std::string(16, 'P'));
+        // CR-007/CR-008：完整信封绑定字段。
+        it->set_envelope_format(KEY_ENVELOPE_FORMAT_ECDH_ES_P256_V1);
+        it->set_envelope_digest(std::string(32, '\xD1'));
+        it->set_key_check_value(std::string(3, '\xC1'));
     }
     std::string payload;
     resp.SerializeToString(&payload);
@@ -73,6 +77,7 @@ TEST(KeyProvProtocolTest, RequestEnvelopeCarriesExpectedFields) {
     req.certificate_ref.certificate_profile = "mqtt";
     req.supported_wrapping_suites = {
         keyprov_wrapping_suite_from_string(kKeyprovSuiteEcdhEsP256)};
+    req.supported_envelope_formats = {kKeyProvEnvelopeFormatEcdhEsP256V1};
     req.timestamp_ms = 1000;
     req.expire_at_ms = 2000;
 
@@ -100,6 +105,44 @@ TEST(KeyProvProtocolTest, RequestEnvelopeCarriesExpectedFields) {
     // 64 hex -> 32 bytes，且证书摘要与 UID 同源（同一 identity）。
     EXPECT_EQ(parsed.device_identity_digest().size(), 32u);
     EXPECT_EQ(parsed.certificate_ref().certificate_digest().size(), 32u);
+    // CR-007 §6.1：显式声明 envelope v1。
+    ASSERT_EQ(parsed.supported_envelope_formats_size(), 1);
+    EXPECT_EQ(parsed.supported_envelope_formats(0),
+              KEY_ENVELOPE_FORMAT_ECDH_ES_P256_V1);
+}
+
+TEST(KeyProvProtocolTest, RequestRequiresExplicitEnvelopeFormat) {
+    KeyProvRequestData req;
+    req.request_id = "req-1";
+    req.idempotency_key = "req-1";
+    req.business_domain = "V2C_COMM";
+    req.purposes = {kKeyProvPurposeUplinkValue, kKeyProvPurposeDownlinkValue};
+    // 缺失
+    auto missing = build_keyprov_request_envelope(make_identity(), req, "m", "");
+    EXPECT_EQ(missing.status, KeyProvCodecStatus::FieldInvalid);
+    EXPECT_EQ(missing.reason, "envelope_format_missing");
+    // UNSPECIFIED
+    req.supported_envelope_formats = {kKeyProvEnvelopeFormatUnspecified};
+    auto unspec = build_keyprov_request_envelope(make_identity(), req, "m", "");
+    EXPECT_EQ(unspec.status, KeyProvCodecStatus::FieldInvalid);
+    EXPECT_EQ(unspec.reason, "envelope_format_unspecified");
+    // 未知值
+    req.supported_envelope_formats = {99};
+    auto unknown = build_keyprov_request_envelope(make_identity(), req, "m", "");
+    EXPECT_EQ(unknown.status, KeyProvCodecStatus::FieldInvalid);
+    EXPECT_EQ(unknown.reason, "envelope_format_unknown");
+}
+
+TEST(KeyProvProtocolTest, RequestRejectsNonCanonicalBusinessDomain) {
+    KeyProvRequestData req;
+    req.request_id = "req-1";
+    req.idempotency_key = "req-1";
+    req.business_domain = "v2c_comm";  // 小写/别名 fail-closed
+    req.purposes = {kKeyProvPurposeUplinkValue, kKeyProvPurposeDownlinkValue};
+    req.supported_envelope_formats = {kKeyProvEnvelopeFormatEcdhEsP256V1};
+    auto out = build_keyprov_request_envelope(make_identity(), req, "m", "");
+    EXPECT_EQ(out.status, KeyProvCodecStatus::FieldInvalid);
+    EXPECT_EQ(out.reason, "business_domain_invalid");
 }
 
 TEST(KeyProvProtocolTest, RequestRejectsOversizeFields) {
@@ -118,6 +161,7 @@ TEST(KeyProvProtocolTest, AllUplinkBuildersFillDeviceId) {
     req.idempotency_key = "req-1";
     req.business_domain = "V2C_COMM";
     req.purposes = {kKeyProvPurposeUplinkValue};
+    req.supported_envelope_formats = {kKeyProvEnvelopeFormatEcdhEsP256V1};
     auto id = make_identity();
 
     auto req_out = build_keyprov_request_envelope(id, req, "m1", "");
@@ -132,6 +176,12 @@ TEST(KeyProvProtocolTest, AllUplinkBuildersFillDeviceId) {
     a.key_id = "kid-up";
     a.business_key_version = 1;
     a.result = kKeyProvImportImported;
+    a.envelope_format = kKeyProvEnvelopeFormatEcdhEsP256V1;
+    a.envelope_digest = std::vector<uint8_t>(32, 0xD1);
+    a.key_check_value = std::vector<uint8_t>(3, 0xC1);
+    a.import_proof_algorithm = kKeyProvImportProofAlgorithmEcdsaP256P1363;
+    a.import_proof = std::vector<uint8_t>(64, 0xE1);
+    a.recipient_certificate_digest = std::vector<uint8_t>(32, 0xB1);
     auto ack_out = build_keyprov_ack_envelope(id, "req-1", {a}, 1, "m2", "");
     ASSERT_EQ(ack_out.status, KeyProvCodecStatus::Ok);
     VehicleMessageEnvelope env2;
@@ -212,6 +262,51 @@ TEST(KeyProvProtocolTest, DecodeResponseProducesSecureItems) {
     EXPECT_EQ(out.decoded.response.items[0].purpose, kKeyprovPurposeUplink);
     EXPECT_EQ(out.decoded.response.items[0].wrapped_key.size(), 48u);
     EXPECT_EQ(out.decoded.response.items[0].business_key_version, 3u);
+    // CR-012 §5：完整转交 format/digest/KCV，TSP 不解析/不重算。
+    EXPECT_EQ(out.decoded.response.items[0].envelope_format,
+              tbox::sec::KeyEnvelopeFormat::ECDH_ES_P256_V1);
+    EXPECT_EQ(out.decoded.response.items[0].envelope_digest.size(), 32u);
+    EXPECT_TRUE(out.decoded.response.items[0].key_check_value_present);
+}
+
+TEST(KeyProvProtocolTest, DecodeRejectsLegacyVehicleService) {
+    auto bytes = make_response_envelope();
+    VehicleMessageEnvelope env;
+    env.ParseFromArray(bytes.data(), (int)bytes.size());
+    env.set_service(kKeyprovLegacyService);  // vehicle.security.keyprov
+    std::string s;
+    env.SerializeToString(&s);
+    auto out = decode_keyprov_envelope(to_bytes(s));
+    EXPECT_EQ(out.status, KeyProvCodecStatus::ServiceMismatch);
+}
+
+TEST(KeyProvProtocolTest, DecodeRejectsUnsupportedEnvelopeFormat) {
+    KeyProvisioningResponse resp;
+    resp.set_request_id("req-1");
+    resp.set_result(KEY_PROVISIONING_RESULT_SUCCEEDED);
+    auto* it = resp.add_items();
+    it->set_purpose(KEY_PURPOSE_UPLINK_AEAD);
+    it->set_key_id("kid");
+    it->set_business_key_version(1);
+    it->set_key_algorithm("AES-256");
+    it->set_wrapping_suite(WRAPPING_SUITE_ECDH_ES_P256_HKDF_SHA256_AES256GCM);
+    it->set_wrapped_key(std::string(32, 'W'));
+    it->set_parameters(std::string(8, 'P'));
+    it->set_envelope_format(KEY_ENVELOPE_FORMAT_UNSPECIFIED);
+    it->set_envelope_digest(std::string(32, '\xD1'));
+    it->set_key_check_value(std::string(3, '\xC1'));
+    std::string payload;
+    resp.SerializeToString(&payload);
+    VehicleMessageEnvelope env;
+    env.set_protocol_version("keyprov-v1");
+    env.set_service("security.keyprov");
+    env.set_payload_type(kKeyprovPayloadResponse);
+    env.set_message_kind(MESSAGE_KIND_RESPONSE);
+    env.set_payload(payload);
+    std::string s;
+    env.SerializeToString(&s);
+    auto out = decode_keyprov_envelope(to_bytes(s));
+    EXPECT_EQ(out.status, KeyProvCodecStatus::FieldInvalid);
 }
 
 TEST(KeyProvProtocolTest, DecodeRejectsWrongProtocolVersion) {
@@ -271,14 +366,18 @@ TEST(KeyProvProtocolTest, DecodeRejectsOversizeWrappedKey) {
     EXPECT_EQ(out.status, KeyProvCodecStatus::SizeExceeded);
 }
 
-TEST(KeyProvProtocolTest, AckEnvelopeHasNoWrappedKey) {
+TEST(KeyProvProtocolTest, AckEnvelopeCarriesImportAttestation) {
     KeyProvImportItemResult a;
     a.purpose = kKeyProvPurposeUplinkValue;
     a.key_id = "kid-up";
     a.business_key_version = 3;
     a.result = kKeyProvImportImported;
-    a.import_proof = std::vector<uint8_t>(16, 0x01);
-    a.proof_algorithm = "hmac-sha256";
+    a.envelope_format = kKeyProvEnvelopeFormatEcdhEsP256V1;
+    a.envelope_digest = std::vector<uint8_t>(32, 0xD1);
+    a.key_check_value = std::vector<uint8_t>(3, 0xC1);
+    a.import_proof_algorithm = kKeyProvImportProofAlgorithmEcdsaP256P1363;
+    a.import_proof = std::vector<uint8_t>(64, 0xE1);
+    a.recipient_certificate_digest = std::vector<uint8_t>(32, 0xB1);
     auto out = build_keyprov_ack_envelope(make_identity(), "req-1", {a}, 1234, "msg-ack", "msg-resp");
     ASSERT_EQ(out.status, KeyProvCodecStatus::Ok);
     VehicleMessageEnvelope env;
@@ -288,8 +387,51 @@ TEST(KeyProvProtocolTest, AckEnvelopeHasNoWrappedKey) {
     EXPECT_EQ(env.correlation_id(), "msg-resp");
     KeyProvisioningAck ack;
     ASSERT_TRUE(ack.ParseFromString(env.payload()));
-    EXPECT_EQ(ack.items_size(), 1);
-    EXPECT_EQ(ack.items(0).import_proof().size(), 16u);
+    ASSERT_EQ(ack.items_size(), 1);
+    const auto& item = ack.items(0);
+    // CR-008 §3.1：算法 enum=1、64B proof、32B certDigest、legacy string 留空。
+    EXPECT_EQ(item.import_proof_algorithm(),
+              IMPORT_PROOF_ALGORITHM_ECDSA_P256_SHA256_P1363);
+    EXPECT_EQ(item.import_proof().size(), 64u);
+    EXPECT_EQ(item.recipient_certificate_digest().size(), 32u);
+    EXPECT_EQ(item.envelope_digest().size(), 32u);
+    EXPECT_EQ(item.key_check_value().size(), 3u);
+    EXPECT_TRUE(item.proof_algorithm().empty());
+}
+
+TEST(KeyProvProtocolTest, AckRejectsIncompleteAttestation) {
+    KeyProvImportItemResult a;
+    a.purpose = kKeyProvPurposeUplinkValue;
+    a.key_id = "kid-up";
+    a.business_key_version = 3;
+    a.result = kKeyProvImportImported;
+    a.envelope_format = kKeyProvEnvelopeFormatEcdhEsP256V1;
+    a.envelope_digest = std::vector<uint8_t>(32, 0xD1);
+    a.key_check_value = std::vector<uint8_t>(3, 0xC1);
+    a.import_proof_algorithm = kKeyProvImportProofAlgorithmEcdsaP256P1363;
+    a.recipient_certificate_digest = std::vector<uint8_t>(32, 0xB1);
+    // 63B proof
+    a.import_proof = std::vector<uint8_t>(63, 0xE1);
+    EXPECT_EQ(build_keyprov_ack_envelope(make_identity(), "req-1", {a}, 1, "m", "").status,
+              KeyProvCodecStatus::FieldInvalid);
+    // 65B proof
+    a.import_proof = std::vector<uint8_t>(65, 0xE1);
+    EXPECT_EQ(build_keyprov_ack_envelope(make_identity(), "req-1", {a}, 1, "m", "").status,
+              KeyProvCodecStatus::FieldInvalid);
+    // 算法 0
+    a.import_proof = std::vector<uint8_t>(64, 0xE1);
+    a.import_proof_algorithm = kKeyProvImportProofAlgorithmUnspecified;
+    EXPECT_EQ(build_keyprov_ack_envelope(make_identity(), "req-1", {a}, 1, "m", "").status,
+              KeyProvCodecStatus::FieldInvalid);
+    // 证书摘要非 32B
+    a.import_proof_algorithm = kKeyProvImportProofAlgorithmEcdsaP256P1363;
+    a.recipient_certificate_digest = std::vector<uint8_t>(31, 0xB1);
+    EXPECT_EQ(build_keyprov_ack_envelope(make_identity(), "req-1", {a}, 1, "m", "").status,
+              KeyProvCodecStatus::FieldInvalid);
+}
+
+TEST(KeyProvProtocolTest, DeterministicProtoRuntimeSelfCheckPasses) {
+    EXPECT_TRUE(keyprov_deterministic_proto_runtime_check());
 }
 
 TEST(KeyProvProtocolTest, PurposeMappingRoundTrip) {

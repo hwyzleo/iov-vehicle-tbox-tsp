@@ -205,6 +205,15 @@ public:
         int state = 0;  // tbox::sec::BusinessKeyState
         uint64_t business_key_version = 0;
         std::string key_id_digest;
+        // CR-012 Q3 / CR-020：journal 返回的原 ACK Operational Metadata。
+        std::string key_id;
+        int envelope_format = 1;  // tbox::sec::KeyEnvelopeFormat::ECDH_ES_P256_V1
+        std::vector<uint8_t> envelope_digest = std::vector<uint8_t>(32, 0xD1);
+        std::vector<uint8_t> key_check_value = std::vector<uint8_t>(3, 0xC1);
+        std::vector<uint8_t> import_proof = std::vector<uint8_t>(64, 0xE1);
+        std::string proof_algorithm = "ECDSA_P256_SHA256_P1363";
+        std::vector<uint8_t> recipient_certificate_digest =
+            std::vector<uint8_t>(32, 0xB1);
     };
 
     // 状态查询
@@ -221,12 +230,41 @@ public:
     int import_calls = 0;
     std::vector<std::string> imported_request_ids;
     std::size_t last_import_item_count = 0;
+    // CR-012 §5：捕获 TSP 转交 SEC 的非敏感 ENVELOPE 绑定字段（验证完整转交）。
+    struct ImportCallItem {
+        std::string purpose;
+        std::string key_id;
+        uint64_t business_key_version = 0;
+        std::string wrapping_suite;
+        int envelope_format = 0;
+        std::vector<uint8_t> envelope_digest;
+        std::array<uint8_t, 3> key_check_value{};
+        bool key_check_value_present = false;
+        std::size_t wrapped_key_size = 0;
+        std::size_t parameters_size = 0;
+    };
+    std::vector<ImportCallItem> last_import_items;
 
     // 结果查询
     int query_error_code = 0;
     int query_state = 2;
     std::vector<StatusItem> query_items;
     int query_calls = 0;
+
+    // TBOX-TSP-DSN-CR-012 §8 / Q1：capability 查询。
+    // 默认返回 READY（模拟 SEC CR-020 已就绪），测试可覆写为 DOWN/契约不匹配。
+    int capability_error_code = 0;
+    int capability_calls = 0;
+    tbox::sec::V2cKeyProvisioningCapability capability = [] {
+        tbox::sec::V2cKeyProvisioningCapability c;
+        c.capability_contract_version =
+            tbox::sec::V2cKeyProvisioningCapability::kContractVersion;
+        c.envelope_v1_import_ready = true;
+        c.atomic_dual_purpose_commit_ready = true;
+        c.import_proof_sign_ecdsa_p256_v1_ready = true;
+        c.secure_journal_replay_ready = true;
+        return c;
+    }();
 
     tbox::sec::ErrorCode get_business_key_status(
         const std::string& /*domain*/,
@@ -240,6 +278,7 @@ public:
             s.state = static_cast<tbox::sec::BusinessKeyState>(si.state);
             s.business_key_version = si.business_key_version;
             s.key_id_digest = si.key_id_digest;
+            fill_ack_fields(si, s);
             out.items.push_back(std::move(s));
         }
         (void)purposes;
@@ -254,6 +293,21 @@ public:
         ++import_calls;
         imported_request_ids.push_back(request_id);
         last_import_item_count = items.size();
+        last_import_items.clear();
+        for (const auto& it : items) {
+            ImportCallItem c;
+            c.purpose = it.purpose;
+            c.key_id = it.key_id;
+            c.business_key_version = it.business_key_version;
+            c.wrapping_suite = it.wrapping_suite;
+            c.envelope_format = static_cast<int>(it.envelope_format);
+            c.envelope_digest = it.envelope_digest;
+            c.key_check_value = it.key_check_value;
+            c.key_check_value_present = it.key_check_value_present;
+            c.wrapped_key_size = it.wrapped_key.size();
+            c.parameters_size = it.parameters.size();
+            last_import_items.push_back(std::move(c));
+        }
         out = tbox::sec::ImportResult{};
         out.request_id = request_id;
         out.business_domain = business_domain;
@@ -264,6 +318,7 @@ public:
             s.state = static_cast<tbox::sec::BusinessKeyState>(si.state);
             s.business_key_version = si.business_key_version;
             s.key_id_digest = si.key_id_digest;
+            fill_ack_fields(si, s);
             out.items.push_back(std::move(s));
         }
         out.import_proof.assign(import_proof);
@@ -284,11 +339,36 @@ public:
             s.state = static_cast<tbox::sec::BusinessKeyState>(si.state);
             s.business_key_version = si.business_key_version;
             s.key_id_digest = si.key_id_digest;
+            fill_ack_fields(si, s);
             out.items.push_back(std::move(s));
         }
         out.import_proof.assign(import_proof);
         out.proof_algorithm = proof_algorithm;
         return static_cast<tbox::sec::ErrorCode>(query_error_code);
+    }
+
+    tbox::sec::ErrorCode get_v2c_key_provisioning_capability(
+        tbox::sec::V2cKeyProvisioningCapability& out) override {
+        ++capability_calls;
+        out = capability;
+        return static_cast<tbox::sec::ErrorCode>(capability_error_code);
+    }
+
+private:
+    static void fill_ack_fields(const StatusItem& si,
+                                tbox::sec::BusinessKeyStatus& s) {
+        s.key_id = si.key_id;
+        s.envelope_format =
+            static_cast<tbox::sec::KeyEnvelopeFormat>(si.envelope_format);
+        s.envelope_digest = si.envelope_digest;
+        if (si.key_check_value.size() == 3) {
+            s.key_check_value = {si.key_check_value[0], si.key_check_value[1],
+                                 si.key_check_value[2]};
+            s.key_check_value_present = true;
+        }
+        s.import_proof = si.import_proof;
+        s.proof_algorithm = si.proof_algorithm;
+        s.recipient_certificate_digest = si.recipient_certificate_digest;
     }
 };
 

@@ -164,13 +164,21 @@ tsp_add_test(V2cKeyProvisioningCoordinatorTest
     test_v2c_key_provisioning_coordinator.cpp
     ${PROJECT_SOURCE_DIR}/src/v2c_key_provisioning_coordinator.cpp
     ${PROJECT_SOURCE_DIR}/src/keyprov_protocol.cpp
+    ${PROJECT_SOURCE_DIR}/src/keyprov_readiness.cpp
     ${PROJECT_SOURCE_DIR}/src/v2c_key_provisioning_store.cpp
     ${PROJECT_SOURCE_DIR}/src/log_adapter.cpp)
+
+# CR-012 §8：build-lock 清单 + 启动自检单元测试
+tsp_add_test(KeyprovReadinessTest
+    test_keyprov_readiness.cpp
+    ${PROJECT_SOURCE_DIR}/src/keyprov_readiness.cpp
+    ${PROJECT_SOURCE_DIR}/src/keyprov_protocol.cpp)
 
 tsp_add_test(KeyProvisioningIntegrationTest
     test_key_provisioning_integration.cpp
     ${PROJECT_SOURCE_DIR}/src/v2c_key_provisioning_coordinator.cpp
     ${PROJECT_SOURCE_DIR}/src/keyprov_protocol.cpp
+    ${PROJECT_SOURCE_DIR}/src/keyprov_readiness.cpp
     ${PROJECT_SOURCE_DIR}/src/v2c_key_provisioning_store.cpp
     ${PROJECT_SOURCE_DIR}/src/subscription_catalog.cpp
     ${PROJECT_SOURCE_DIR}/src/snapshot_builder.cpp
