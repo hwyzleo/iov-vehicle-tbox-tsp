@@ -225,8 +225,9 @@ set(TBOX_TSP_DAEMON_SOURCES
         src/vehicle_message_gateway.cpp   # CR-009 §16: 通用 VehicleMessage 网关
         src/keyprov_protocol.cpp         # CR-010 §4.2: keyprov wire codec
         src/keyprov_readiness.cpp        # CR-012 §8: build-lock + SEC capability 门禁
-        src/v2c_key_provisioning_store.cpp      # CR-010 §5: 非敏感流程状态持久化
-        src/v2c_key_provisioning_coordinator.cpp # CR-010 §3.1: V2C keyprov 编排
+        src/keyprov_attempt.cpp          # CR-013 §3/§4: attempt snapshot + fingerprint
+        src/v2c_key_provisioning_store.cpp      # CR-010 §5 / CR-013 §10: 非敏感状态持久化
+        src/v2c_key_provisioning_coordinator.cpp # CR-010 §3.1 / CR-013 §20: V2C keyprov 编排
         src/sec_business_key_adapter.cpp         # CR-010 §3.2: SEC 业务密钥适配器
         src/tsp_error_codes.cpp
         src/net_status_provider.cpp

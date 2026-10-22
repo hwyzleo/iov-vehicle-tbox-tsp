@@ -28,6 +28,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -64,7 +65,13 @@ enum class V2cKeyProvState : uint8_t {
     ACK_PENDING,
     ACTIVE,
     RETRY_WAIT,
-    BLOCKED
+    BLOCKED,
+    // ---- TBOX-TSP-DSN-CR-013：不可变 attempt 与 requestId 幂等 ----------------
+    RECONCILE_OLD_ATTEMPT,              // 业务输入变化/806095：先对账 VMD Status + SEC journal
+    SUPERSEDED_LOCAL,                   // 可证明从未提交且 VMD 无批次：旧 record 终态化，建新 attempt
+    SUPERSEDED_REMOTE,                  // VMD 已终结旧批次且 SEC 无副作用：终态化，建新 attempt
+    BLOCKED_AWAIT_CLOUD_TERMINATION,    // VMD 有未终结旧批次/无法证明：等待受控终结
+    LEGACY_SNAPSHOT_UNKNOWN             // 旧 Store 无 snapshot/fingerprint：默认阻断，先对账
 };
 
 const char* v2c_key_prov_state_to_string(V2cKeyProvState s);
@@ -84,6 +91,12 @@ struct V2cKeyProvisioningSnapshot {
     bool clock_synced = false;               // 系统时钟是否已同步（时间敏感请求门禁）
     // CR-012 §8：9 项协议/SEC 前置门禁快照（脱敏，不含 proof/密钥）
     KeyprovReadiness readiness;
+    // CR-013 可观测字段（有限枚举；无敏感值）
+    std::string blocked_reason;          // keyprov_blocked_reason::*
+    uint32_t fingerprint_version = 0;    // 0=legacy/未冻结
+    bool legacy_snapshot_unknown = false;
+    uint64_t blocked_attempts_current = 0;  // 当前是否处于阻断态（0/1）
+    std::string conflict_vmd_code;       // 脱敏冲突 VMD code（如 806095，空=无）
     // 脱敏计数器
     uint64_t cloud_ready_events = 0;
     uint64_t requests_published = 0;
@@ -96,6 +109,16 @@ struct V2cKeyProvisioningSnapshot {
     uint64_t ack_results_received = 0;
     uint64_t active_transitions = 0;
     uint64_t status_requests_sent = 0;
+    // ---- CR-013 指标（有限枚举，不以 requestId/VIN/UID/证书摘要/fingerprint 为维度） ----
+    uint64_t attempts_created = 0;
+    uint64_t superseded_local = 0;
+    uint64_t superseded_remote = 0;
+    uint64_t idempotency_conflicts_total = 0;
+    uint64_t blocked_attempts_total = 0;
+    uint64_t legacy_store_records = 0;
+    std::map<std::string, uint64_t> fingerprint_changes_total;   // AttemptChangeDimension 名
+    std::map<std::string, uint64_t> blocked_reasons_total;       // keyprov_blocked_reason::*
+    std::map<std::string, uint64_t> attempt_transitions_total;   // "FROM->TO"
 };
 
 class V2cKeyProvisioningCoordinator {
@@ -154,6 +177,39 @@ private:
     void worker_loop();
     void reset_to_checking_locked();
 
+    // ---- CR-013：不可变 attempt / fingerprint / 对账 ----------------
+    // 从当前输入构造 candidate snapshot + fingerprint（SEC 版本/身份/capability 同代际）。
+    bool build_candidate_locked(KeyprovAttemptSnapshot& cand,
+                                KeyprovFingerprint& fp,
+                                std::string& err);
+    // 创建新 attempt：生成 requestId/idempotency、冻结 snapshot+fingerprint、
+    // 原子持久化后再允许发送。
+    void create_new_attempt_locked();
+    // 冻结当前输入为新 attempt（首次创建），供 create_new_attempt 复用。
+    void freeze_current_input_locked();
+    // 进入对账：停止原 Request 自动重试，记录脱敏冲突事实。
+    void enter_reconcile_old_attempt_locked(const char* reason,
+                                            const char* vmd_code);
+    void do_reconcile_locked();
+    // 处理 RECONCILE/LEGACY/待终结态收到的 StatusResponse 对账结果。
+    void handle_reconcile_status_locked(const KeyProvStatusResponseData& status);
+    // 是否有 accepted/PUBACK/timeout/崩溃等"可能已提交"证据。
+    bool submission_evidence_locked() const;
+    // SEC journal 对账：COMMITTED -> 恢复 ACK；UNKNOWN -> 保持对账；clean -> 继续。
+    // 返回 true 表示本次对账已消费（状态已改），false 表示需要继续 VMD 对账。
+    bool reconcile_sec_journal_locked();
+    // 以原 requestId 发送 StatusRequest（对账/待终结观察）。
+    void send_status_request_locked();
+    // 记录幂等冲突脱敏事实并计数。
+    void record_conflict_facts_locked(const char* vmd_code);
+    // 状态迁移 + 计数（指标，仅可观测性）。
+    void transition_to_locked(V2cKeyProvState next);
+    void count_blocked_reason_locked(const char* reason);
+    // 标记提交证据（persist 前调用）。
+    void mark_submitted_locked();
+    void mark_confirmed_locked();
+    void bump_store_generation_locked();
+
     bool capability_gate_locked(std::string& reason);
     // 系统时钟是否已同步（未注入时读 systemd-timesyncd 标记）。
     bool clock_check_ok() const;
@@ -201,6 +257,24 @@ private:
     bool clock_synced_ = false;
     std::function<bool()> clock_sync_check_;
     std::string gate_reason_;
+
+    // ---- CR-013 attempt 冻结状态 ----
+    KeyprovAttemptSnapshot frozen_snapshot_;
+    KeyprovFingerprint frozen_fingerprint_{};
+    uint32_t fingerprint_version_ = 0;
+    std::string submission_ = keyprov_submission::kNone;
+    std::string supersedes_request_id_;
+    std::string superseded_by_request_id_;
+    std::string blocked_reason_;
+    uint64_t store_generation_ = 0;
+    bool legacy_snapshot_unknown_ = false;
+    bool reconcile_status_sent_ = false;   // 对账中已发 StatusRequest（等待响应）
+    std::string conflict_vmd_code_;        // 脱敏冲突 VMD code（如 806095）
+    // 发送时快照，用于异步结果迟到隔离（requestId+generation+fingerprint）。
+    bool awaiting_active_ = false;
+    std::string awaiting_request_id_;
+    uint64_t awaiting_generation_ = 0;
+    KeyprovFingerprint awaiting_fingerprint_{};
 
     // in-flight（内存态；pending_items_ 持有 move-only SecureBuffer）
     std::vector<tbox::sec::WrappedKeyItem> pending_items_;

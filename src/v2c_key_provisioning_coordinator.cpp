@@ -1,12 +1,14 @@
-// TBOX-TSP-DSN-CR-010 §3.1/§5/§7: V2cKeyProvisioningCoordinator 实现。
+// TBOX-TSP-DSN-CR-010 §3.1/§5/§7 / CR-013 §20: V2cKeyProvisioningCoordinator 实现。
 #include "v2c_key_provisioning_coordinator.h"
 
 #include "hash.h"
+#include "keyprov_attempt.h"
 #include "log_adapter.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <unistd.h>
 
@@ -26,6 +28,12 @@ constexpr const char* kCapabilityKeyprov = "security.keyprov";
 constexpr const char* kTimesyncDir = "/run/systemd/timesync";
 constexpr const char* kTimesyncMarker = "/run/systemd/timesync/synchronized";
 
+constexpr int kKeyProvStatusFailed = 5;   // KEY_PROVISIONING_STATUS_FAILED
+constexpr int kKeyProvStatusUnspecified = 0;  // KEY_PROVISIONING_STATUS_UNSPECIFIED
+constexpr int kKeyProvStatusRequested = 1;
+constexpr int kKeyProvStatusIssued = 2;
+constexpr int kKeyProvStatusAckPending = 3;
+
 // 默认时钟同步判定：仅在 systemd-timesyncd 存在的平台上启用门禁
 // （无该目录的开发机/CI 不阻塞 keyprov）。
 bool default_clock_synchronized() {
@@ -33,6 +41,24 @@ bool default_clock_synchronized() {
         return true;
     }
     return ::access(kTimesyncMarker, F_OK) == 0;
+}
+
+// 64 小写 hex -> 32B fingerprint（失败返回 false）。
+bool hex_to_fingerprint(const std::string& hex, KeyprovFingerprint& out) {
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    if (hex.size() != 64) return false;
+    for (size_t i = 0; i < 32; ++i) {
+        int hi = nib(hex[2 * i]);
+        int lo = nib(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = static_cast<uint8_t>((hi << 4) | lo);
+    }
+    return true;
 }
 
 // 从 SEC ImportResult 构造 ACK items（CR-012 §6 机械映射）。
@@ -84,6 +110,13 @@ const char* v2c_key_prov_state_to_string(V2cKeyProvState s) {
         case V2cKeyProvState::ACTIVE:        return "ACTIVE";
         case V2cKeyProvState::RETRY_WAIT:    return "RETRY_WAIT";
         case V2cKeyProvState::BLOCKED:       return "BLOCKED";
+        case V2cKeyProvState::RECONCILE_OLD_ATTEMPT: return "RECONCILE_OLD_ATTEMPT";
+        case V2cKeyProvState::SUPERSEDED_LOCAL:      return "SUPERSEDED_LOCAL";
+        case V2cKeyProvState::SUPERSEDED_REMOTE:     return "SUPERSEDED_REMOTE";
+        case V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION:
+            return "BLOCKED_AWAIT_CLOUD_TERMINATION";
+        case V2cKeyProvState::LEGACY_SNAPSHOT_UNKNOWN:
+            return "LEGACY_SNAPSHOT_UNKNOWN";
         default: return "?";
     }
 }
@@ -94,7 +127,11 @@ bool v2c_key_prov_state_from_string(const std::string& s, V2cKeyProvState& out) 
         V2cKeyProvState::CHECKING, V2cKeyProvState::REQUESTING,
         V2cKeyProvState::WAIT_RESPONSE, V2cKeyProvState::IMPORTING,
         V2cKeyProvState::ACK_PENDING, V2cKeyProvState::ACTIVE,
-        V2cKeyProvState::RETRY_WAIT, V2cKeyProvState::BLOCKED};
+        V2cKeyProvState::RETRY_WAIT, V2cKeyProvState::BLOCKED,
+        V2cKeyProvState::RECONCILE_OLD_ATTEMPT, V2cKeyProvState::SUPERSEDED_LOCAL,
+        V2cKeyProvState::SUPERSEDED_REMOTE,
+        V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION,
+        V2cKeyProvState::LEGACY_SNAPSHOT_UNKNOWN};
     for (auto s2 : all) {
         if (s == v2c_key_prov_state_to_string(s2)) {
             out = s2;
@@ -131,18 +168,44 @@ bool V2cKeyProvisioningCoordinator::initialize(
 
     record_ = store_->load();
     if (config_.enabled) {
-        V2cKeyProvState restored = V2cKeyProvState::WAIT_CLOUD;
-        if (record_.valid && !record_.state.empty()) {
-            v2c_key_prov_state_from_string(record_.state, restored);
+        // CR-013：恢复 attempt 冻结状态（snapshot/fingerprint/submission/supersede/generation）。
+        if (record_.valid) {
+            frozen_snapshot_ = record_.snapshot;
+            fingerprint_version_ = record_.fingerprint_version;
+            if (!record_.attempt_fingerprint.empty()) {
+                hex_to_fingerprint(record_.attempt_fingerprint,
+                                   frozen_fingerprint_);
+            }
+            submission_ = record_.submission.empty()
+                              ? keyprov_submission::kNone
+                              : record_.submission;
+            supersedes_request_id_ = record_.supersedes_request_id;
+            superseded_by_request_id_ = record_.superseded_by_request_id;
+            blocked_reason_ = record_.blocked_reason;
+            store_generation_ = record_.store_generation;
         }
-        // 恢复时不以 Store 覆盖 SEC/HSM 事实：先回 CHECKING，由 SEC 状态裁决。
-        if (restored == V2cKeyProvState::ACTIVE) {
-            state_ = V2cKeyProvState::WAIT_CLOUD;
-        } else if (restored == V2cKeyProvState::ACK_PENDING) {
-            state_ = V2cKeyProvState::WAIT_CLOUD;
-            recovering_ack_ = true;  // SEC 已导入、云端未确认：恢复 ACK
+        if (record_.legacy_snapshot_unknown) {
+            // CR-013 §10：旧 Store 缺 snapshot/fingerprint，默认阻断发送；
+            // 进入 LEGACY_SNAPSHOT_UNKNOWN，先查 SEC journal + VMD Status。
+            legacy_snapshot_unknown_ = true;
+            counters_.legacy_store_records++;
+            blocked_reason_ = keyprov_blocked_reason::kLegacySnapshotUnknown;
+            count_blocked_reason_locked(keyprov_blocked_reason::kLegacySnapshotUnknown);
+            state_ = V2cKeyProvState::LEGACY_SNAPSHOT_UNKNOWN;
         } else {
-            state_ = V2cKeyProvState::WAIT_CLOUD;
+            V2cKeyProvState restored = V2cKeyProvState::WAIT_CLOUD;
+            if (record_.valid && !record_.state.empty()) {
+                v2c_key_prov_state_from_string(record_.state, restored);
+            }
+            // 恢复时不以 Store 覆盖 SEC/HSM 事实：先回 CHECKING，由 SEC 状态裁决。
+            if (restored == V2cKeyProvState::ACTIVE) {
+                state_ = V2cKeyProvState::WAIT_CLOUD;
+            } else if (restored == V2cKeyProvState::ACK_PENDING) {
+                state_ = V2cKeyProvState::WAIT_CLOUD;
+                recovering_ack_ = true;  // SEC 已导入、云端未确认：恢复 ACK
+            } else {
+                state_ = V2cKeyProvState::WAIT_CLOUD;
+            }
         }
     } else {
         state_ = V2cKeyProvState::DISABLED;
@@ -151,7 +214,11 @@ bool V2cKeyProvisioningCoordinator::initialize(
         "tsp.keyprov.initialized", "V2cKeyProvisioningCoordinator 初始化", {
             {"enabled", tbox::fw::log::FieldValue::makeBool(config_.enabled)},
             {"state", tbox::fw::log::FieldValue::makeString(
-                v2c_key_prov_state_to_string(state_))}
+                v2c_key_prov_state_to_string(state_))},
+            {"fingerprint_version", tbox::fw::log::FieldValue::makeInt(
+                static_cast<int64_t>(fingerprint_version_))},
+            {"legacy", tbox::fw::log::FieldValue::makeBool(
+                legacy_snapshot_unknown_)}
         });
     return true;
 }
@@ -259,7 +326,7 @@ void V2cKeyProvisioningCoordinator::invalidate_identity_locked(
     response_binding_.clear();
     last_response_message_id_.clear();
     deadline_ms_ = 0;
-    // 业务 requestId 保留：网络代际不是业务幂等键（CR-011 §6）。
+    // 业务 requestId 保留：网络代际不是业务幂等键（CR-011 §6 / CR-013 §20.3）。
 }
 
 void V2cKeyProvisioningCoordinator::apply_cloud_readiness_locked(
@@ -346,6 +413,16 @@ V2cKeyProvisioningSnapshot V2cKeyProvisioningCoordinator::snapshot() const {
     s.cloud_session_generation = record_.cloud_session_generation;
     s.clock_synced = clock_synced_;
     s.readiness = readiness_;
+    // CR-013 可观测字段
+    s.blocked_reason = blocked_reason_;
+    s.fingerprint_version = fingerprint_version_;
+    s.legacy_snapshot_unknown = legacy_snapshot_unknown_;
+    s.conflict_vmd_code = conflict_vmd_code_;
+    s.blocked_attempts_current =
+        (state_ == V2cKeyProvState::BLOCKED ||
+         state_ == V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION ||
+         state_ == V2cKeyProvState::LEGACY_SNAPSHOT_UNKNOWN)
+            ? 1u : 0u;
     return s;
 }
 
@@ -387,6 +464,18 @@ void V2cKeyProvisioningCoordinator::handle_routed_downlink(
         return;
     }
 
+    // CR-013 §11：迟到异步结果隔离（requestId + store_generation + fingerprint
+    // 任一不匹配即丢弃/审计，不得推进当前 attempt）。
+    if (awaiting_active_ &&
+        (record_.store_generation != awaiting_generation_ ||
+         !keyprov_fingerprint_equal(frozen_fingerprint_, awaiting_fingerprint_))) {
+        counters_.responses_rejected++;
+        LogAdapter::keyprov().warn(
+            "tsp.keyprov.late_result_isolated",
+            "keyprov 迟到异步结果被隔离（generation/fingerprint 不匹配）");
+        return;
+    }
+
     counters_.responses_received++;
 
     switch (decoded.decoded.kind) {
@@ -400,6 +489,14 @@ void V2cKeyProvisioningCoordinator::handle_routed_downlink(
             if (resp.result != succeeded) {
                 counters_.responses_rejected++;
                 record_.last_error = "response_not_succeeded";
+                // CR-013：806095 等幂等冲突 -> 停止自动重试，进入对账。
+                if (keyprov_is_idempotency_conflict(resp.error)) {
+                    counters_.idempotency_conflicts_total++;
+                    record_conflict_facts_locked(resp.error.code.c_str());
+                    enter_reconcile_old_attempt_locked(
+                        "idempotency_conflict", resp.error.code.c_str());
+                    return;
+                }
                 if (resp.error.retryable) {
                     state_ = V2cKeyProvState::RETRY_WAIT;
                     schedule_retry_locked();
@@ -443,6 +540,16 @@ void V2cKeyProvisioningCoordinator::handle_routed_downlink(
         }
         case KeyProvMessageKind::AckResult: {
             counters_.ack_results_received++;
+            // CR-013：AckResult 幂等冲突 -> 停止重试，进入对账。
+            if (keyprov_is_idempotency_conflict(decoded.decoded.ack_result.error)) {
+                counters_.idempotency_conflicts_total++;
+                record_conflict_facts_locked(
+                    decoded.decoded.ack_result.error.code.c_str());
+                enter_reconcile_old_attempt_locked(
+                    "ack_result_idempotency_conflict",
+                    decoded.decoded.ack_result.error.code.c_str());
+                return;
+            }
             bool ok = false;
             if (state_ == V2cKeyProvState::ACK_PENDING) {
                 ok = decoded.decoded.ack_result.result == kKeyProvResultSucceeded;
@@ -452,6 +559,7 @@ void V2cKeyProvisioningCoordinator::handle_routed_downlink(
                     recovering_ack_ = false;
                     record_.last_error.clear();
                     counters_.active_transitions++;
+                    mark_confirmed_locked();
                 } else {
                     record_.last_error = "ack_result_rejected";
                     state_ = V2cKeyProvState::RETRY_WAIT;
@@ -462,19 +570,37 @@ void V2cKeyProvisioningCoordinator::handle_routed_downlink(
             return;
         }
         case KeyProvMessageKind::StatusResponse: {
+            const auto& st = decoded.decoded.status_response;
+            // CR-013：对账态（RECONCILE / LEGACY / 待云端终结）统一走终态对账。
+            if (state_ == V2cKeyProvState::RECONCILE_OLD_ATTEMPT ||
+                state_ == V2cKeyProvState::LEGACY_SNAPSHOT_UNKNOWN ||
+                state_ == V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION) {
+                reconcile_status_sent_ = false;
+                handle_reconcile_status_locked(st);
+                return;
+            }
             if (state_ != V2cKeyProvState::ACK_PENDING &&
                 state_ != V2cKeyProvState::WAIT_RESPONSE &&
                 state_ != V2cKeyProvState::CHECKING) {
                 return;
             }
+            // CR-013：主动 Status 对账期间收到幂等冲突同样进入对账。
+            if (keyprov_is_idempotency_conflict(st.error)) {
+                counters_.idempotency_conflicts_total++;
+                record_conflict_facts_locked(st.error.code.c_str());
+                enter_reconcile_old_attempt_locked(
+                    "status_idempotency_conflict", st.error.code.c_str());
+                return;
+            }
             const int active = kKeyProvStatusActive;
-            if (decoded.decoded.status_response.status == active) {
+            if (st.status == active) {
                 if (!ack_items_.empty() || import_attempted_) {
                     state_ = V2cKeyProvState::ACK_PENDING;
                     ack_sent_ = false;
                 } else {
                     state_ = V2cKeyProvState::ACTIVE;
                     counters_.active_transitions++;
+                    mark_confirmed_locked();
                 }
                 persist_locked();
                 cv_.notify_all();
@@ -489,6 +615,363 @@ void V2cKeyProvisioningCoordinator::handle_routed_downlink(
             counters_.responses_rejected++;
             return;
     }
+}
+
+// ============================================================
+// CR-013：不可变 attempt / fingerprint / 对账
+// ============================================================
+bool V2cKeyProvisioningCoordinator::build_candidate_locked(
+    KeyprovAttemptSnapshot& cand, KeyprovFingerprint& fp, std::string& err) {
+    // 同一执行域内读取 SEC 版本 + 当前身份 + 协议锁版（CR-013 §5.1）。
+    std::vector<std::string> purposes = config_.purposes;
+    tbox::sec::BusinessKeyStatusSet set;
+    ErrorCode ec = sec_->get_business_key_status(
+        config_.business_domain, purposes, set);
+    if (ec != ErrorCode::SUCCESS) {
+        err = "sec_status_unavailable";
+        return false;
+    }
+    if (!identity_valid_ ||
+        !keyprov_validate_identity(identity_, err)) {
+        if (err.empty()) err = "identity_unavailable";
+        return false;
+    }
+    KeyprovFingerprint lock = keyprov_protocol_lock_digest_v1();
+    if (!keyprov_build_attempt_snapshot(
+            config_.business_domain, purposes, identity_, set.items, lock,
+            cand, err)) {
+        return false;
+    }
+    if (!keyprov_compute_attempt_fingerprint_v1(cand, fp, err)) {
+        return false;
+    }
+    return true;
+}
+
+void V2cKeyProvisioningCoordinator::freeze_current_input_locked() {
+    KeyprovAttemptSnapshot cand;
+    KeyprovFingerprint fp;
+    std::string err;
+    if (!build_candidate_locked(cand, fp, err)) {
+        // 构造失败：不产生可发送 attempt（由调用方转 RETRY_WAIT 处理）。
+        return;
+    }
+    frozen_snapshot_ = std::move(cand);
+    frozen_fingerprint_ = fp;
+    fingerprint_version_ = kAttemptFingerprintVersionV1;
+}
+
+void V2cKeyProvisioningCoordinator::create_new_attempt_locked() {
+    KeyprovAttemptSnapshot cand;
+    KeyprovFingerprint fp;
+    std::string err;
+    if (!build_candidate_locked(cand, fp, err)) {
+        state_ = V2cKeyProvState::RETRY_WAIT;
+        record_.last_error = err.empty() ? "attempt_snapshot_failed" : err;
+        schedule_retry_locked();
+        persist_locked();
+        return;
+    }
+
+    // 旧 attempt 终态化（append-only audit，有界），保留 supersede 关联。
+    if (!record_.request_id.empty()) {
+        if (supersedes_request_id_.empty()) {
+            supersedes_request_id_ = record_.request_id;
+        }
+        if (record_.terminalized_request_ids.empty() ||
+            record_.terminalized_request_ids.back() != record_.request_id) {
+            record_.terminalized_request_ids.push_back(record_.request_id);
+        }
+        if (record_.terminalized_request_ids.size() > 16) {
+            record_.terminalized_request_ids.erase(
+                record_.terminalized_request_ids.begin(),
+                record_.terminalized_request_ids.end() - 16);
+        }
+    }
+
+    // 新 requestId + idempotency（wire 兼容）。
+    record_.request_id = generate_id("kp");
+    record_.idempotency_digest =
+        tbox::fw::hash::sha256_hex(std::string_view(
+            record_.request_id + "|" + config_.business_domain));
+    record_.purposes = config_.purposes;
+
+    // 冻结当前输入。
+    frozen_snapshot_ = std::move(cand);
+    frozen_fingerprint_ = fp;
+    fingerprint_version_ = kAttemptFingerprintVersionV1;
+    record_.snapshot = frozen_snapshot_;
+    record_.attempt_fingerprint = keyprov_fingerprint_to_hex(frozen_fingerprint_);
+    record_.fingerprint_version = fingerprint_version_;
+
+    // 重置本 attempt 状态。
+    import_attempted_ = false;
+    ack_sent_ = false;
+    status_sent_ = false;
+    recovering_ack_ = false;
+    pending_items_.clear();
+    response_binding_.clear();
+    ack_items_.clear();
+    record_.attempt_count = 0;
+    record_.last_error.clear();
+    blocked_reason_.clear();
+    conflict_vmd_code_.clear();
+    submission_ = keyprov_submission::kNone;
+    legacy_snapshot_unknown_ = false;
+    counters_.attempts_created++;
+    bump_store_generation_locked();
+    awaiting_active_ = false;
+
+    state_ = V2cKeyProvState::REQUESTING;
+    persist_locked();
+    do_request_locked();
+}
+
+void V2cKeyProvisioningCoordinator::enter_reconcile_old_attempt_locked(
+    const char* reason, const char* vmd_code) {
+    // 停止原 Request 自动重试，保留原 requestId 与提交事实。
+    deadline_ms_ = 0;
+    reconcile_status_sent_ = false;
+    awaiting_active_ = false;
+    if (vmd_code && *vmd_code) conflict_vmd_code_ = vmd_code;
+    if (reason && *reason) record_.last_error = reason;
+    transition_to_locked(V2cKeyProvState::RECONCILE_OLD_ATTEMPT);
+    persist_locked();
+}
+
+void V2cKeyProvisioningCoordinator::record_conflict_facts_locked(
+    const char* vmd_code) {
+    if (vmd_code && *vmd_code) conflict_vmd_code_ = vmd_code;
+    counters_.blocked_attempts_total++;
+    count_blocked_reason_locked(keyprov_blocked_reason::kIdempotencyConflict);
+    LogAdapter::keyprov().warn(
+        "tsp.keyprov.idempotency_conflict",
+        "keyprov 幂等冲突，进入对账", {
+            {"vmd_code", tbox::fw::log::FieldValue::makeString(conflict_vmd_code_)},
+            {"fingerprint_version", tbox::fw::log::FieldValue::makeInt(
+                static_cast<int64_t>(fingerprint_version_))}
+        });
+}
+
+bool V2cKeyProvisioningCoordinator::submission_evidence_locked() const {
+    return submission_ != keyprov_submission::kNone ||
+           record_.attempt_count > 0 ||
+           import_attempted_ || ack_sent_ || status_sent_;
+}
+
+bool V2cKeyProvisioningCoordinator::reconcile_sec_journal_locked() {
+    const std::string rid = record_.request_id;
+    if (rid.empty()) return false;
+    tbox::sec::ImportResult res;
+    ErrorCode ec = sec_->get_business_key_import_result(rid, res);
+    if (ec == ErrorCode::SUCCESS &&
+        res.state == BusinessKeyImportState::COMMITTED) {
+        // 原 requestId 已完成双用途原子导入：恢复原 ACK（CR-012 journal proof 复用，
+        // 不重复导入、不建新 attempt）。
+        ack_items_ = build_ack_items(res);
+        if (ack_items_.size() == config_.purposes.size()) {
+            blocked_reason_.clear();
+            state_ = V2cKeyProvState::ACK_PENDING;
+            ack_sent_ = false;
+            status_sent_ = false;
+            recovering_ack_ = false;
+            persist_locked();
+            do_ack_locked();
+        } else {
+            // items 不完整：安全异常 -> 保持阻断/对账，不发伪成功 ACK。
+            blocked_reason_ = keyprov_blocked_reason::kSecOutcomeUnknown;
+            count_blocked_reason_locked(keyprov_blocked_reason::kSecOutcomeUnknown);
+            state_ = V2cKeyProvState::RECONCILE_OLD_ATTEMPT;
+            schedule_retry_locked();
+            persist_locked();
+        }
+        return true;
+    }
+    if (ec == ErrorCode::BUSINESS_KEY_IMPORT_UNKNOWN ||
+        ec == ErrorCode::BUSINESS_KEY_OUTCOME_UNKNOWN ||
+        (ec == ErrorCode::SUCCESS &&
+         res.state == BusinessKeyImportState::UNKNOWN)) {
+        // outcome unknown：保持原 requestId 对账，禁止新 attempt。
+        blocked_reason_ = keyprov_blocked_reason::kSecOutcomeUnknown;
+        count_blocked_reason_locked(keyprov_blocked_reason::kSecOutcomeUnknown);
+        state_ = V2cKeyProvState::RECONCILE_OLD_ATTEMPT;
+        schedule_retry_locked();
+        persist_locked();
+        return true;
+    }
+    // 其余（FAILED / REQUESTED / STAGED / 查询不可用）视为无已提交副作用，
+    // 交由调用方继续 VMD 终态判定。
+    return false;
+}
+
+void V2cKeyProvisioningCoordinator::send_status_request_locked() {
+    if (!identity_valid_) {
+        // 无有效身份（如 legacy 恢复早期）：等待 gate 恢复后重试。
+        schedule_retry_locked();
+        persist_locked();
+        return;
+    }
+    std::string message_id = generate_id("msg");
+    auto enc = build_keyprov_status_request_envelope(
+        identity_, record_.request_id, now_ms(), message_id, "");
+    if (enc.status != KeyProvCodecStatus::Ok) {
+        schedule_retry_locked();
+        persist_locked();
+        return;
+    }
+    if (publish_keyprov_locked(message_id, enc.envelope_bytes,
+                               record_.request_id)) {
+        reconcile_status_sent_ = true;
+        counters_.status_requests_sent++;
+        deadline_ms_ = now_ms() + config_.ack_timeout_ms;
+        awaiting_active_ = true;
+        awaiting_request_id_ = record_.request_id;
+        awaiting_generation_ = store_generation_;
+        awaiting_fingerprint_ = frozen_fingerprint_;
+        persist_locked();
+    } else {
+        // publish 被拒：由 publish_keyprov_locked 已分流（STALE/REQUIRED/UNSUPPORTED/
+        // INVALID/BLOCKED）；对账保留，退避后重试。
+        persist_locked();
+    }
+}
+
+void V2cKeyProvisioningCoordinator::do_reconcile_locked() {
+    // 1) SEC journal 事实优先（原 requestId / operation 绑定）。
+    if (reconcile_sec_journal_locked()) return;
+    // 2) 无已提交副作用：以原 requestId 查 VMD Status 确认批次事实。
+    if (!reconcile_status_sent_) {
+        send_status_request_locked();
+        return;
+    }
+    if (deadline_ms_ > 0 && now_ms() >= deadline_ms_) {
+        // 响应丢失：退避后重试（保留原 requestId）。
+        reconcile_status_sent_ = false;
+        schedule_retry_locked();
+        persist_locked();
+        return;
+    }
+    // 等待 StatusResponse（由 handle_reconcile_status_locked 收敛）。
+}
+
+void V2cKeyProvisioningCoordinator::handle_reconcile_status_locked(
+    const KeyProvStatusResponseData& status) {
+    // CR-013 §8：806095 等幂等冲突 -> VMD 存在旧批次且摘要失效 -> 待云端终结。
+    if (keyprov_is_idempotency_conflict(status.error)) {
+        counters_.idempotency_conflicts_total++;
+        record_conflict_facts_locked(status.error.code.c_str());
+        blocked_reason_ = keyprov_blocked_reason::kAwaitCloudTermination;
+        count_blocked_reason_locked(keyprov_blocked_reason::kAwaitCloudTermination);
+        state_ = V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION;
+        schedule_retry_locked();
+        persist_locked();
+        return;
+    }
+
+    switch (status.status) {
+        case kKeyProvStatusActive: {
+            // 云端已有 ACTIVE 批次：若 SEC 已导入 -> 恢复 ACK；否则等待受控终结。
+            if (reconcile_sec_journal_locked()) return;
+            blocked_reason_ = keyprov_blocked_reason::kAwaitCloudTermination;
+            count_blocked_reason_locked(keyprov_blocked_reason::kAwaitCloudTermination);
+            state_ = V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION;
+            schedule_retry_locked();
+            persist_locked();
+            return;
+        }
+        case kKeyProvStatusFailed: {
+            // VMD 已终结（FAILED）：SEC 无副作用 -> SUPERSEDED_REMOTE -> 新 attempt。
+            if (reconcile_sec_journal_locked()) return;
+            counters_.superseded_remote++;
+            record_.last_error = "vmd_batch_terminated";
+            state_ = V2cKeyProvState::SUPERSEDED_REMOTE;
+            persist_locked();
+            create_new_attempt_locked();
+            return;
+        }
+        case kKeyProvStatusUnspecified: {
+            // VMD 无批次：仅当可证明从未提交且 SEC 无副作用时 SUPERSEDED_LOCAL。
+            if (reconcile_sec_journal_locked()) return;
+            if (!submission_evidence_locked()) {
+                counters_.superseded_local++;
+                record_.last_error = "never_submitted";
+                state_ = V2cKeyProvState::SUPERSEDED_LOCAL;
+                persist_locked();
+                create_new_attempt_locked();
+                return;
+            }
+            // 有提交证据但 VMD 无批次：outcome unknown，不得断言云端不存在。
+            blocked_reason_ = keyprov_blocked_reason::kVmdOutcomeUnknown;
+            count_blocked_reason_locked(keyprov_blocked_reason::kVmdOutcomeUnknown);
+            state_ = V2cKeyProvState::RECONCILE_OLD_ATTEMPT;
+            schedule_retry_locked();
+            persist_locked();
+            return;
+        }
+        case kKeyProvStatusRequested:
+        case kKeyProvStatusIssued:
+        case kKeyProvStatusAckPending: {
+            // VMD 有未终结批次：等待受控终结（不调用 MPT 治理接口）。
+            if (reconcile_sec_journal_locked()) return;
+            blocked_reason_ = keyprov_blocked_reason::kAwaitCloudTermination;
+            count_blocked_reason_locked(keyprov_blocked_reason::kAwaitCloudTermination);
+            state_ = V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION;
+            schedule_retry_locked();
+            persist_locked();
+            return;
+        }
+        case 6:  // KEY_PROVISIONING_STATUS_UNKNOWN
+        default: {
+            if (reconcile_sec_journal_locked()) return;
+            blocked_reason_ = keyprov_blocked_reason::kVmdOutcomeUnknown;
+            count_blocked_reason_locked(keyprov_blocked_reason::kVmdOutcomeUnknown);
+            state_ = V2cKeyProvState::RECONCILE_OLD_ATTEMPT;
+            schedule_retry_locked();
+            persist_locked();
+            return;
+        }
+    }
+}
+
+void V2cKeyProvisioningCoordinator::transition_to_locked(
+    V2cKeyProvState next) {
+    if (state_ == next) return;
+    std::string key = std::string(v2c_key_prov_state_to_string(state_)) +
+                      "->" + v2c_key_prov_state_to_string(next);
+    counters_.attempt_transitions_total[key]++;
+    state_ = next;
+}
+
+void V2cKeyProvisioningCoordinator::count_blocked_reason_locked(
+    const char* reason) {
+    const char* r = (reason && *reason) ? reason
+                                        : keyprov_blocked_reason::kUnknown;
+    static const char* const kKnown[] = {
+        keyprov_blocked_reason::kLegacySnapshotUnknown,
+        keyprov_blocked_reason::kIdempotencyConflict,
+        keyprov_blocked_reason::kAwaitCloudTermination,
+        keyprov_blocked_reason::kSecOutcomeUnknown,
+        keyprov_blocked_reason::kVmdOutcomeUnknown};
+    const char* key = keyprov_blocked_reason::kUnknown;
+    for (const char* k : kKnown) {
+        if (std::strcmp(k, r) == 0) {
+            key = k;
+            break;
+        }
+    }
+    counters_.blocked_reasons_total[key]++;
+}
+
+void V2cKeyProvisioningCoordinator::mark_submitted_locked() {
+    submission_ = keyprov_submission::kSubmitted;
+}
+
+void V2cKeyProvisioningCoordinator::mark_confirmed_locked() {
+    submission_ = keyprov_submission::kConfirmed;
+}
+
+void V2cKeyProvisioningCoordinator::bump_store_generation_locked() {
+    store_generation_++;
 }
 
 // ============================================================
@@ -599,6 +1082,7 @@ void V2cKeyProvisioningCoordinator::tick_locked() {
                    state_ == V2cKeyProvState::RETRY_WAIT) {
             state_ = V2cKeyProvState::WAIT_CLOUD;
         }
+        // RECONCILE / LEGACY / BLOCKED_AWAIT / SUPERSEDED 保留，待 gate 恢复后继续。
         return;
     }
 
@@ -631,7 +1115,13 @@ void V2cKeyProvisioningCoordinator::tick_locked() {
             do_request_locked();
             break;
         case V2cKeyProvState::WAIT_RESPONSE:
-            if (deadline_ms_ > 0 && now >= deadline_ms_) {
+            if (deadline_ms_ == 0) {
+                // CR-011 §5.1：身份/上下文失效暂停了网络 deadline；重读完整快照并
+                // 重新评估（CR-013：candidate==frozen 则复用 requestId 重发，
+                // !=frozen 则进入 RECONCILE_OLD_ATTEMPT）。
+                state_ = V2cKeyProvState::CHECKING;
+                do_check_locked();
+            } else if (now >= deadline_ms_) {
                 on_response_timeout_locked();
             }
             break;
@@ -653,6 +1143,27 @@ void V2cKeyProvisioningCoordinator::tick_locked() {
                 do_check_locked();
             }
             break;
+        case V2cKeyProvState::RECONCILE_OLD_ATTEMPT:
+            do_reconcile_locked();
+            break;
+        case V2cKeyProvState::LEGACY_SNAPSHOT_UNKNOWN:
+            do_reconcile_locked();
+            break;
+        case V2cKeyProvState::SUPERSEDED_LOCAL:
+        case V2cKeyProvState::SUPERSEDED_REMOTE:
+            create_new_attempt_locked();
+            break;
+        case V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION:
+            // 周期观察 VMD 终态（CR-065 受控终结后由 StatusResponse -> SUPERSEDED_REMOTE）。
+            if (next_retry_ms_ > now) return;
+            if (!reconcile_status_sent_) {
+                send_status_request_locked();
+            } else if (deadline_ms_ > 0 && now >= deadline_ms_) {
+                reconcile_status_sent_ = false;
+                schedule_retry_locked();
+                persist_locked();
+            }
+            break;
         case V2cKeyProvState::ACTIVE:
             break;
     }
@@ -665,14 +1176,10 @@ void V2cKeyProvisioningCoordinator::do_check_locked() {
         config_.business_domain, purposes, set);
     if (ec == ErrorCode::SUCCESS) {
         bool all_active = purposes_complete_locked(set.items);
-        record_.business_key_versions.clear();
-        for (const auto& it : set.items) {
-            record_.business_key_versions.emplace_back(
-                it.purpose, it.business_key_version);
-        }
         if (all_active) {
+            // 两用途均已 ACTIVE：开通目标已达（无论来源：本 attempt 导入/既有）。
+            // 若存在待确认 ACK/导入，优先恢复原 ACK（SEC journal 事实优先）。
             if (recovering_ack_ || import_attempted_) {
-                // SEC 已导入但云端未确认（或导入结果刚变未知后收敛）：恢复 ACK，不重复导入
                 recovering_ack_ = false;
                 state_ = V2cKeyProvState::ACK_PENDING;
                 ack_sent_ = false;
@@ -681,20 +1188,38 @@ void V2cKeyProvisioningCoordinator::do_check_locked() {
             } else {
                 state_ = V2cKeyProvState::ACTIVE;
                 record_.last_error.clear();
+                mark_confirmed_locked();
                 counters_.active_transitions++;
                 persist_locked();
             }
             return;
         }
-        // 缺失/过期：申请（复用稳定 requestId）
-        if (record_.request_id.empty()) {
-            record_.request_id = generate_id("kp");
-            record_.purposes = purposes;
-            record_.idempotency_digest =
-                tbox::fw::hash::sha256_hex(std::string_view(
-                    record_.request_id + "|" + config_.business_domain));
-            import_attempted_ = false;
+        // 缺失/过期：需要申请。CR-013 §5.2 发送前校验 candidate fingerprint。
+        KeyprovAttemptSnapshot cand;
+        KeyprovFingerprint cand_fp;
+        std::string err;
+        if (!build_candidate_locked(cand, cand_fp, err)) {
+            state_ = V2cKeyProvState::RETRY_WAIT;
+            record_.last_error = err.empty() ? "attempt_snapshot_failed" : err;
+            schedule_retry_locked();
+            persist_locked();
+            return;
         }
+        if (fingerprint_version_ == 0 || record_.request_id.empty()) {
+            // 首次创建 attempt：冻结 snapshot/fingerprint + requestId，原子持久化。
+            create_new_attempt_locked();
+            return;
+        }
+        if (!keyprov_fingerprint_equal(frozen_fingerprint_, cand_fp)) {
+            // 业务输入变化：禁止复用原 requestId 发送变化后的 Request。
+            AttemptChangeDimension d =
+                keyprov_attempt_change_dimension(frozen_snapshot_, cand);
+            counters_.fingerprint_changes_total[
+                keyprov_attempt_change_dimension_to_string(d)]++;
+            enter_reconcile_old_attempt_locked("fingerprint_changed", nullptr);
+            return;
+        }
+        // candidate == frozen：沿原 requestId 申请（冻结内容构造，不动态覆盖）。
         state_ = V2cKeyProvState::REQUESTING;
         persist_locked();
         do_request_locked();
@@ -721,26 +1246,46 @@ void V2cKeyProvisioningCoordinator::do_check_locked() {
 }
 
 void V2cKeyProvisioningCoordinator::do_request_locked() {
+    // CR-013 §5.2：发送前重新读取当前输入计算 candidate；仅 candidate==frozen 才
+    // 沿原 requestId 发送，且用 frozen snapshot 构造（不得动态覆盖业务字段）。
+    KeyprovAttemptSnapshot cand;
+    KeyprovFingerprint cand_fp;
+    std::string err;
+    if (!build_candidate_locked(cand, cand_fp, err)) {
+        state_ = V2cKeyProvState::RETRY_WAIT;
+        record_.last_error = err.empty() ? "attempt_snapshot_failed" : err;
+        schedule_retry_locked();
+        persist_locked();
+        return;
+    }
+    if (fingerprint_version_ > 0 &&
+        !keyprov_fingerprint_equal(frozen_fingerprint_, cand_fp)) {
+        AttemptChangeDimension d =
+            keyprov_attempt_change_dimension(frozen_snapshot_, cand);
+        counters_.fingerprint_changes_total[
+            keyprov_attempt_change_dimension_to_string(d)]++;
+        enter_reconcile_old_attempt_locked("fingerprint_changed_before_send", nullptr);
+        return;
+    }
+
+    // 用 frozen snapshot 构造 Request（内容不变）。
     KeyProvRequestData req;
     req.request_id = record_.request_id;
     req.idempotency_key = record_.idempotency_digest.empty()
                               ? record_.request_id
                               : record_.idempotency_digest;
-    req.business_domain = config_.business_domain;
-    for (const auto& p : config_.purposes) {
-        int v = keyprov_purpose_from_string(p);
-        if (v != 0) req.purposes.push_back(v);
+    req.business_domain = frozen_snapshot_.business_domain.empty()
+                              ? config_.business_domain
+                              : frozen_snapshot_.business_domain;
+    for (int p : frozen_snapshot_.purposes) {
+        req.purposes.push_back(p);
     }
-    // CR-011 §4: 身份摘要/引用由 builder 从同一 identity 派生，不在此拼接。
     req.certificate_ref.certificate_profile = config_.certificate_profile;
-    // CR-012 §3：首期唯一受支持封装套件为 ECDH-ES P-256；不得声明未实现套件。
-    req.supported_wrapping_suites = {
-        keyprov_wrapping_suite_from_string(kKeyprovSuiteEcdhEsP256)};
-    // CR-012 §4 / CR-007 §6.1：显式声明 envelope v1；缺失则云端不得下发该格式。
-    req.supported_envelope_formats = {kKeyProvEnvelopeFormatEcdhEsP256V1};
-    for (const auto& kv : record_.business_key_versions) {
+    req.supported_wrapping_suites = frozen_snapshot_.wrapping_suites;
+    req.supported_envelope_formats = frozen_snapshot_.envelope_formats;
+    for (const auto& kv : frozen_snapshot_.current_versions) {
         KeyProvCurrentVersion cv;
-        cv.purpose = keyprov_purpose_from_string(kv.first);
+        cv.purpose = kv.first;
         cv.business_key_version = kv.second;
         req.current_versions.push_back(cv);
     }
@@ -762,6 +1307,12 @@ void V2cKeyProvisioningCoordinator::do_request_locked() {
         deadline_ms_ = now + config_.request_timeout_ms;
         record_.attempt_count++;
         counters_.requests_published++;
+        mark_submitted_locked();
+        // 发送时快照（迟到结果隔离：requestId + generation + fingerprint）。
+        awaiting_active_ = true;
+        awaiting_request_id_ = record_.request_id;
+        awaiting_generation_ = store_generation_;
+        awaiting_fingerprint_ = frozen_fingerprint_;
         persist_locked();
     } else {
         persist_locked();
@@ -1016,6 +1567,30 @@ void V2cKeyProvisioningCoordinator::persist_locked() {
     record_.updated_at_ms = now_ms();
     record_.deadline_ms = deadline_ms_;
     record_.cloud_session_generation = cloud_.cert_session_generation;
+    // CR-013 attempt 冻结状态（单聚合键原子持久化）。
+    record_.schema_version = kV2cStoreSchemaVersion;
+    record_.fingerprint_version = fingerprint_version_;
+    record_.attempt_fingerprint =
+        fingerprint_version_ > 0
+            ? keyprov_fingerprint_to_hex(frozen_fingerprint_)
+            : "";
+    record_.snapshot = frozen_snapshot_;
+    record_.submission = submission_;
+    record_.supersedes_request_id = supersedes_request_id_;
+    record_.superseded_by_request_id = superseded_by_request_id_;
+    record_.blocked_reason = blocked_reason_;
+    record_.store_generation = store_generation_;
+    if (!frozen_snapshot_.purposes.empty()) {
+        record_.purposes.clear();
+        for (int p : frozen_snapshot_.purposes) {
+            record_.purposes.push_back(keyprov_purpose_to_string(p));
+        }
+        record_.business_key_versions.clear();
+        for (const auto& kv : frozen_snapshot_.current_versions) {
+            record_.business_key_versions.emplace_back(
+                keyprov_purpose_to_string(kv.first), kv.second);
+        }
+    }
     if (store_) store_->save(record_);
 }
 

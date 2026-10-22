@@ -158,11 +158,20 @@ tsp_add_test(KeyProvProtocolTest
 tsp_add_test(V2cKeyProvisioningStoreTest
     test_v2c_key_provisioning_store.cpp
     ${PROJECT_SOURCE_DIR}/src/v2c_key_provisioning_store.cpp
+    ${PROJECT_SOURCE_DIR}/src/keyprov_attempt.cpp
+    ${PROJECT_SOURCE_DIR}/src/keyprov_protocol.cpp
     ${PROJECT_SOURCE_DIR}/src/log_adapter.cpp)
+
+# CR-013: attempt fingerprint / protocol lock digest / 幂等冲突分类器单元测试
+tsp_add_test(KeyprovAttemptTest
+    test_keyprov_attempt.cpp
+    ${PROJECT_SOURCE_DIR}/src/keyprov_attempt.cpp
+    ${PROJECT_SOURCE_DIR}/src/keyprov_protocol.cpp)
 
 tsp_add_test(V2cKeyProvisioningCoordinatorTest
     test_v2c_key_provisioning_coordinator.cpp
     ${PROJECT_SOURCE_DIR}/src/v2c_key_provisioning_coordinator.cpp
+    ${PROJECT_SOURCE_DIR}/src/keyprov_attempt.cpp
     ${PROJECT_SOURCE_DIR}/src/keyprov_protocol.cpp
     ${PROJECT_SOURCE_DIR}/src/keyprov_readiness.cpp
     ${PROJECT_SOURCE_DIR}/src/v2c_key_provisioning_store.cpp
@@ -177,6 +186,7 @@ tsp_add_test(KeyprovReadinessTest
 tsp_add_test(KeyProvisioningIntegrationTest
     test_key_provisioning_integration.cpp
     ${PROJECT_SOURCE_DIR}/src/v2c_key_provisioning_coordinator.cpp
+    ${PROJECT_SOURCE_DIR}/src/keyprov_attempt.cpp
     ${PROJECT_SOURCE_DIR}/src/keyprov_protocol.cpp
     ${PROJECT_SOURCE_DIR}/src/keyprov_readiness.cpp
     ${PROJECT_SOURCE_DIR}/src/v2c_key_provisioning_store.cpp

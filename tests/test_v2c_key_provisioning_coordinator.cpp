@@ -4,6 +4,8 @@
 #include "v2c_key_provisioning_coordinator.h"
 #include "mocks.h"
 
+#include "store.h"
+
 #include "security/keyprov/v1/key_provisioning.pb.h"
 #include "vehicle/common/v1/envelope.pb.h"
 
@@ -84,6 +86,60 @@ std::vector<uint8_t> make_ack_result_envelope(const std::string& request_id,
     return to_bytes(s);
 }
 
+// CR-013：带 error（幂等冲突等）的 Response 下行。
+std::vector<uint8_t> make_response_error_envelope(
+    const std::string& request_id, int result, const std::string& code,
+    const std::string& action = "", bool retryable = false) {
+    KeyProvisioningResponse resp;
+    resp.set_request_id(request_id);
+    resp.set_result(static_cast<KeyProvisioningResult>(result));
+    auto* e = resp.mutable_error();
+    e->set_code(code);
+    e->set_retryable(retryable);
+    e->set_action(action);
+    std::string payload;
+    resp.SerializeToString(&payload);
+    VehicleMessageEnvelope env;
+    env.set_request_id(request_id);
+    env.set_protocol_version("keyprov-v1");
+    env.set_service("security.keyprov");
+    env.set_payload_type(kKeyprovPayloadResponse);
+    env.set_message_kind(MESSAGE_KIND_RESPONSE);
+    env.set_message_id("msg-resp-err");
+    env.set_payload(payload);
+    std::string s;
+    env.SerializeToString(&s);
+    return to_bytes(s);
+}
+
+// CR-013：StatusResponse 下行（状态对账）。
+std::vector<uint8_t> make_status_response_envelope(
+    const std::string& request_id, int status, const std::string& code = "",
+    const std::string& action = "") {
+    KeyProvisioningStatusResponse msg;
+    msg.set_request_id(request_id);
+    msg.set_status(static_cast<KeyProvisioningStatus>(status));
+    msg.set_occurred_at_ms(1);
+    if (!code.empty()) {
+        auto* e = msg.mutable_error();
+        e->set_code(code);
+        e->set_action(action);
+    }
+    std::string payload;
+    msg.SerializeToString(&payload);
+    VehicleMessageEnvelope env;
+    env.set_request_id(request_id);
+    env.set_protocol_version("keyprov-v1");
+    env.set_service("security.keyprov");
+    env.set_payload_type(kKeyprovPayloadStatusResponse);
+    env.set_message_kind(MESSAGE_KIND_RESPONSE);
+    env.set_message_id("msg-status");
+    env.set_payload(payload);
+    std::string s;
+    env.SerializeToString(&s);
+    return to_bytes(s);
+}
+
 FakeSecClient::StatusItem status_item(const std::string& purpose, int state,
                                       uint64_t version) {
     FakeSecClient::StatusItem s;
@@ -119,6 +175,10 @@ constexpr int kCommitted = 2;
 constexpr int kImportUnknown = 4;
 constexpr int kUnknownErr = 1024;  // ErrorCode::BUSINESS_KEY_IMPORT_UNKNOWN
 
+constexpr int kStatusActive = 4;
+constexpr int kStatusFailed = 5;
+constexpr int kStatusUnspecified = 0;
+
 } // namespace
 
 class V2cKeyProvisioningCoordinatorTest : public ::testing::Test {
@@ -126,7 +186,8 @@ protected:
     void SetUp() override {
         mqtt_ = std::make_shared<MockMqttFacade>();
         sec_ = std::make_shared<FakeSecClient>();
-        store_ = std::make_shared<V2cKeyProvisioningStore>(temp_root());
+        store_root_ = temp_root();
+        store_ = std::make_shared<V2cKeyProvisioningStore>(store_root_);
         cfg_.enabled = true;
         cfg_.request_timeout_ms = 200;
         cfg_.ack_timeout_ms = 200;
@@ -195,10 +256,25 @@ protected:
     std::shared_ptr<MockMqttFacade> mqtt_;
     std::shared_ptr<FakeSecClient> sec_;
     std::shared_ptr<V2cKeyProvisioningStore> store_;
+    std::string store_root_;
     V2cKeyProvisioningConfig cfg_;
     std::unique_ptr<V2cKeyProvisioningCoordinator> coord_;
     uint64_t cloud_seq_ = 0;
     bool clock_synced_ = true;
+
+    // CR-013：同 UID 换证（接收证书摘要变化），同步更新 capability 代际以通过 gate。
+    void deliver_cert_change(const std::string& cert_hex, uint64_t session_gen) {
+        CloudReadiness cr = mqtt_->cloud_readiness;
+        cr.certificate_ref = "sha256:" + cert_hex;
+        cr.device_identity_digest = cert_hex;
+        cr.cert_session_generation = session_gen;
+        cr.session.cert_session_generation = session_gen;
+        cr.event_sequence = ++cloud_seq_;
+        mqtt_->deliver_cloud_readiness(cr);
+        CapabilityReadiness cap = mqtt_->capability_readiness;
+        cap.cert_session_generation = session_gen;
+        mqtt_->deliver_capability_readiness(cap);
+    }
 };
 
 TEST_F(V2cKeyProvisioningCoordinatorTest, DisabledWhenConfigOff) {
@@ -342,12 +418,21 @@ TEST_F(V2cKeyProvisioningCoordinatorTest, ImportUnknownConvergesToAck) {
 }
 
 TEST_F(V2cKeyProvisioningCoordinatorTest, RestartRecoversAckPending) {
-    V2cKeyProvisioningRecord rec;
-    rec.valid = true;
-    rec.request_id = "kp-recovered";
-    rec.state = "ACK_PENDING";
-    rec.purposes = {"UPLINK_AEAD", "DOWNLINK_AEAD"};
-    store_->save(rec);
+    // CR-013：走完整流程到 ACK_PENDING（冻结 snapshot/fingerprint 已持久化），
+    // 再重启验证 ACK 恢复（不重复导入）。
+    sec_->status_items.clear();  // missing
+    make_ready();
+    coord_->tick();
+    std::string rid = coord_->snapshot().request_id;
+    ASSERT_FALSE(rid.empty());
+    coord_->handle_routed_downlink(downlink(make_response_envelope(rid)));
+    sec_->import_state = kCommitted;
+    sec_->import_items = {status_item(kKeyprovPurposeUplink, kActive, 3),
+                          status_item(kKeyprovPurposeDownlink, kActive, 3)};
+    sec_->import_proof = {0x0B};
+    coord_->tick();
+    ASSERT_EQ(coord_->snapshot().state, V2cKeyProvState::ACK_PENDING);
+    const int import_before_restart = sec_->import_calls;  // 共享 FakeSecClient 累计
 
     coord_->stop();
     coord_ = std::make_unique<V2cKeyProvisioningCoordinator>(mqtt_, sec_, store_);
@@ -364,8 +449,11 @@ TEST_F(V2cKeyProvisioningCoordinatorTest, RestartRecoversAckPending) {
     coord_->tick();
 
     EXPECT_EQ(coord_->snapshot().state, V2cKeyProvState::ACK_PENDING);
-    EXPECT_EQ(sec_->import_calls, 0);  // 不重复导入
+    EXPECT_EQ(sec_->import_calls, import_before_restart);  // 不重复导入
     EXPECT_GE(publish_count_for("keyprov.uplink"), 1);  // 发送 ACK
+    // 重启后非 legacy：fingerprint 已冻结。
+    EXPECT_FALSE(coord_->snapshot().legacy_snapshot_unknown);
+    EXPECT_EQ(coord_->snapshot().fingerprint_version, 1u);
 }
 
 // ============================================================
@@ -669,6 +757,348 @@ TEST_F(V2cKeyProvisioningCoordinatorTest, AckAttestationMissingBlocksAck) {
     coord_->tick();
     EXPECT_EQ(coord_->snapshot().state, V2cKeyProvState::BLOCKED);
     EXPECT_EQ(publish_count_for("keyprov.uplink"), 1);
+}
+
+// ============================================================
+// CR-013：不可变 attempt / fingerprint / 806095 / supersede / legacy
+// ============================================================
+TEST_F(V2cKeyProvisioningCoordinatorTest, AttemptFrozenOnFirstRequest) {
+    sec_->status_items.clear();
+    make_ready();
+    coord_->tick();
+    auto snap = coord_->snapshot();
+    ASSERT_EQ(snap.state, V2cKeyProvState::WAIT_RESPONSE);
+    EXPECT_EQ(snap.fingerprint_version, 1u);
+    EXPECT_FALSE(snap.legacy_snapshot_unknown);
+    EXPECT_EQ(snap.attempts_created, 1u);
+    // 提交证据已记录。
+    EXPECT_FALSE(coord_->snapshot().request_id.empty());
+}
+
+TEST_F(V2cKeyProvisioningCoordinatorTest, CertificateChangeTriggersReconcileNoChangedRequest) {
+    sec_->status_items.clear();
+    make_ready();
+    coord_->tick();
+    std::string rid = coord_->snapshot().request_id;
+    ASSERT_FALSE(rid.empty());
+    ASSERT_EQ(coord_->snapshot().state, V2cKeyProvState::WAIT_RESPONSE);
+
+    // 同 UID 换证：接收证书摘要变化（Wrapped Key 接收者绑定变化）。
+    deliver_cert_change(std::string(64, 'b'), /*session_gen=*/2);
+
+    // 身份失效暂停 deadline -> 重读快照重新评估：candidate != frozen -> RECONCILE。
+    coord_->tick();
+    auto snap = coord_->snapshot();
+    EXPECT_EQ(snap.state, V2cKeyProvState::RECONCILE_OLD_ATTEMPT);
+    // 换证同时改变 deviceIdentityDigest 与 recipientCertificateDigest（同源）；
+    // dimension 取首个差异项（DEVICE_IDENTITY 或 CERTIFICATE），两者都合法。
+    uint64_t fp_changes = 0;
+    for (const auto& kv : snap.fingerprint_changes_total) {
+        if (kv.first == "DEVICE_IDENTITY" || kv.first == "CERTIFICATE") {
+            fp_changes += kv.second;
+        }
+    }
+    EXPECT_GE(fp_changes, 1u);
+
+    // 不得以原 requestId 发送变化后的 KeyProvisioningRequest（仅最初 1 次）。
+    int request_payloads = 0;
+    for (const auto& c : mqtt_->publish_route_calls()) {
+        if (c.route_id != "keyprov.uplink") continue;
+        VehicleMessageEnvelope env;
+        if (!env.ParseFromArray(c.payload.data(), (int)c.payload.size())) continue;
+        if (env.payload_type() == kKeyprovPayloadRequest) {
+            request_payloads++;
+            EXPECT_EQ(c.request_id, rid);
+        }
+    }
+    EXPECT_EQ(request_payloads, 1);
+}
+
+TEST_F(V2cKeyProvisioningCoordinatorTest, CertSessionChangeSameLeafReusesRequestId) {
+    sec_->status_items.clear();
+    make_ready();
+    coord_->tick();
+    std::string rid = coord_->snapshot().request_id;
+    ASSERT_FALSE(rid.empty());
+
+    // cert session 代际变化但 leaf 摘要不变：业务 fingerprint 相同 -> 复用 requestId。
+    deliver_cert_change(std::string(64, 'a'), /*session_gen=*/2);
+
+    sleep_ms(230);
+    coord_->tick();  // timeout -> RETRY_WAIT
+    sleep_ms(60);
+    coord_->tick();  // -> CHECKING -> candidate==frozen -> 复用原 requestId 重发
+    auto snap = coord_->snapshot();
+    EXPECT_EQ(snap.state, V2cKeyProvState::WAIT_RESPONSE);
+    EXPECT_EQ(snap.request_id, rid);
+    EXPECT_TRUE(snap.fingerprint_changes_total.empty());  // 未进入对账
+    int request_payloads = 0;
+    for (const auto& c : mqtt_->publish_route_calls()) {
+        if (c.route_id != "keyprov.uplink") continue;
+        VehicleMessageEnvelope env;
+        if (!env.ParseFromArray(c.payload.data(), (int)c.payload.size())) continue;
+        if (env.payload_type() == kKeyprovPayloadRequest) {
+            request_payloads++;
+            EXPECT_EQ(c.request_id, rid);
+        }
+    }
+    EXPECT_GE(request_payloads, 2);
+}
+
+TEST_F(V2cKeyProvisioningCoordinatorTest, SecVersionChangeTriggersReconcile) {
+    sec_->status_items.clear();
+    make_ready();
+    coord_->tick();
+    std::string rid = coord_->snapshot().request_id;
+    ASSERT_FALSE(rid.empty());
+
+    // SEC 当前版本变化（缺失 -> 已登记版本，但仍未 ACTIVE）：业务输入变化。
+    sec_->status_items = {status_item(kKeyprovPurposeUplink, kMissing, 5),
+                          status_item(kKeyprovPurposeDownlink, kMissing, 5)};
+    sleep_ms(230);
+    coord_->tick();
+    sleep_ms(60);
+    coord_->tick();
+    auto snap = coord_->snapshot();
+    EXPECT_EQ(snap.state, V2cKeyProvState::RECONCILE_OLD_ATTEMPT);
+    EXPECT_GE(snap.fingerprint_changes_total.count("CURRENT_VERSIONS"), 1u);
+    int request_payloads = 0;
+    for (const auto& c : mqtt_->publish_route_calls()) {
+        if (c.route_id != "keyprov.uplink") continue;
+        VehicleMessageEnvelope env;
+        if (!env.ParseFromArray(c.payload.data(), (int)c.payload.size())) continue;
+        if (env.payload_type() == kKeyprovPayloadRequest) request_payloads++;
+    }
+    EXPECT_EQ(request_payloads, 1);  // 不发送变化后的 Request
+}
+
+TEST_F(V2cKeyProvisioningCoordinatorTest, RequestKeepsFrozenBusinessFieldsAcrossRetries) {
+    sec_->status_items.clear();
+    make_ready();
+    coord_->tick();
+    std::string rid = coord_->snapshot().request_id;
+    ASSERT_FALSE(rid.empty());
+
+    sleep_ms(230);
+    coord_->tick();  // timeout -> RETRY_WAIT
+    sleep_ms(60);
+    coord_->tick();  // 复用原 requestId 重发
+    // 重试的 Request 冻结业务字段（suite/format/purpose/版本）保持不变。
+    int request_payloads = 0;
+    for (const auto& c : mqtt_->publish_route_calls()) {
+        if (c.route_id != "keyprov.uplink") continue;
+        VehicleMessageEnvelope env;
+        if (!env.ParseFromArray(c.payload.data(), (int)c.payload.size())) continue;
+        if (env.payload_type() != kKeyprovPayloadRequest) continue;
+        KeyProvisioningRequest req;
+        ASSERT_TRUE(req.ParseFromString(env.payload()));
+        EXPECT_EQ(req.request_id(), rid);
+        EXPECT_EQ(req.current_versions_size(), 0);  // 冻结：SEC 未登记版本
+        ASSERT_EQ(req.supported_wrapping_suites_size(), 1);
+        EXPECT_EQ(req.supported_wrapping_suites(0),
+                  WRAPPING_SUITE_ECDH_ES_P256_HKDF_SHA256_AES256GCM);
+        ASSERT_EQ(req.supported_envelope_formats_size(), 1);
+        EXPECT_EQ(req.supported_envelope_formats(0),
+                  KEY_ENVELOPE_FORMAT_ECDH_ES_P256_V1);
+        EXPECT_EQ(req.device_identity_digest().size(), 32u);
+        request_payloads++;
+    }
+    EXPECT_GE(request_payloads, 2);
+}
+
+TEST_F(V2cKeyProvisioningCoordinatorTest, Response806095StopsRetryAndReconciles) {
+    sec_->status_items.clear();
+    make_ready();
+    coord_->tick();
+    std::string rid = coord_->snapshot().request_id;
+    ASSERT_FALSE(rid.empty());
+    ASSERT_EQ(coord_->snapshot().state, V2cKeyProvState::WAIT_RESPONSE);
+
+    // 首次 Request 直接被云端以 806095 拒绝（Response.error）。
+    coord_->handle_routed_downlink(downlink(
+        make_response_error_envelope(rid, KEY_PROVISIONING_RESULT_REJECTED, "806095")));
+    auto snap = coord_->snapshot();
+    EXPECT_EQ(snap.state, V2cKeyProvState::RECONCILE_OLD_ATTEMPT);
+    EXPECT_EQ(snap.idempotency_conflicts_total, 1u);
+    EXPECT_EQ(snap.conflict_vmd_code, "806095");
+    EXPECT_GE(snap.blocked_reasons_total["IDEMPOTENCY_CONFLICT"], 1u);
+
+    // 继续对账：SEC 无副作用 -> 发 StatusRequest，保持 RECONCILE，不重发 Request。
+    sec_->query_state = 3;  // FAILED：无已提交副作用
+    sec_->query_error_code = 0;
+    sleep_ms(300);
+    coord_->tick();
+    EXPECT_EQ(coord_->snapshot().state, V2cKeyProvState::RECONCILE_OLD_ATTEMPT);
+    int request_payloads = 0;
+    bool saw_status_request = false;
+    for (const auto& c : mqtt_->publish_route_calls()) {
+        if (c.route_id != "keyprov.uplink") continue;
+        VehicleMessageEnvelope env;
+        if (!env.ParseFromArray(c.payload.data(), (int)c.payload.size())) continue;
+        if (env.payload_type() == kKeyprovPayloadRequest) request_payloads++;
+        if (env.payload_type() == kKeyprovPayloadStatusRequest) saw_status_request = true;
+    }
+    EXPECT_EQ(request_payloads, 1);
+    EXPECT_TRUE(saw_status_request);
+}
+
+TEST_F(V2cKeyProvisioningCoordinatorTest, Status806095LeadsToAwaitCloudTermination) {
+    sec_->status_items.clear();
+    sec_->query_state = 3;  // SEC clean
+    make_ready();
+    coord_->tick();
+    std::string rid = coord_->snapshot().request_id;
+    // 进入对账：首次 Request 被 806095 拒绝。
+    coord_->handle_routed_downlink(downlink(
+        make_response_error_envelope(rid, KEY_PROVISIONING_RESULT_REJECTED, "806095")));
+    EXPECT_EQ(coord_->snapshot().state, V2cKeyProvState::RECONCILE_OLD_ATTEMPT);
+
+    // 对账 Status 返回幂等冲突 -> VMD 有未终结旧批次 -> 待云端终结。
+    coord_->handle_routed_downlink(downlink(
+        make_status_response_envelope(rid, kStatusUnspecified, "806095")));
+    auto snap = coord_->snapshot();
+    EXPECT_EQ(snap.state, V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION);
+    EXPECT_EQ(snap.blocked_reason, keyprov_blocked_reason::kAwaitCloudTermination);
+    EXPECT_GE(snap.blocked_reasons_total[
+                  keyprov_blocked_reason::kAwaitCloudTermination], 1u);
+    EXPECT_GE(snap.idempotency_conflicts_total, 2u);  // Response + Status
+}
+
+TEST_F(V2cKeyProvisioningCoordinatorTest, VmdFailedSupersedesRemoteCreatesNewAttempt) {
+    sec_->status_items.clear();
+    sec_->query_state = 3;  // SEC clean（无已提交副作用）
+    make_ready();
+    coord_->tick();
+    std::string rid = coord_->snapshot().request_id;
+    coord_->handle_routed_downlink(downlink(
+        make_response_error_envelope(rid, KEY_PROVISIONING_RESULT_REJECTED, "806095")));
+    EXPECT_EQ(coord_->snapshot().state, V2cKeyProvState::RECONCILE_OLD_ATTEMPT);
+
+    // VMD 已终结（FAILED）+ SEC 无副作用 -> SUPERSEDED_REMOTE -> 新 attempt。
+    coord_->handle_routed_downlink(downlink(
+        make_status_response_envelope(rid, kStatusFailed)));
+    auto snap = coord_->snapshot();
+    EXPECT_EQ(snap.state, V2cKeyProvState::WAIT_RESPONSE);  // 新 attempt 已发布
+    EXPECT_NE(snap.request_id, rid);
+    EXPECT_EQ(snap.superseded_remote, 1u);
+    EXPECT_GE(snap.attempts_created, 2u);
+}
+
+TEST_F(V2cKeyProvisioningCoordinatorTest, VmdNoBatchSupersedesLocalCreatesNewAttempt) {
+    sec_->status_items.clear();
+    sec_->query_state = 3;  // SEC clean
+    // 首次 attempt：publish 被 STALE 拒绝（从未提交成功，submission=NONE）。
+    mqtt_->publish_route_result = {false, MqttDeliveryOutcome::Accepted,
+                                   session_reason::kPublishContextStale, true};
+    make_ready();
+    coord_->tick();
+    std::string rid = coord_->snapshot().request_id;
+    ASSERT_FALSE(rid.empty());
+    EXPECT_EQ(coord_->snapshot().state, V2cKeyProvState::WAIT_CLOUD);
+
+    // 证书变化 -> candidate != frozen -> RECONCILE（从未提交，无提交证据）。
+    deliver_cert_change(std::string(64, 'b'), /*session_gen=*/2);
+    mqtt_->publish_route_result = {true, MqttDeliveryOutcome::Accepted, "", true};
+    coord_->tick();  // gate + WAIT_CLOUD -> CHECKING -> RECONCILE
+    EXPECT_EQ(coord_->snapshot().state, V2cKeyProvState::RECONCILE_OLD_ATTEMPT);
+
+    // VMD 无批次（UNSPECIFIED）+ 从未提交 + SEC 无副作用 -> SUPERSEDED_LOCAL -> 新 attempt。
+    coord_->handle_routed_downlink(downlink(
+        make_status_response_envelope(rid, kStatusUnspecified)));
+    auto snap = coord_->snapshot();
+    EXPECT_EQ(snap.state, V2cKeyProvState::WAIT_RESPONSE);
+    EXPECT_NE(snap.request_id, rid);
+    EXPECT_EQ(snap.superseded_local, 1u);
+}
+
+TEST_F(V2cKeyProvisioningCoordinatorTest, LegacyRecordBlocksNewRequest) {
+    // 写旧版多键记录（缺 snapshot/fingerprint）。
+    {
+        hwyz::store::Store raw = hwyz::store::Store::open("tsp", store_root_);
+        raw.save<std::string>("keyprov.v2c.present", "1");
+        raw.save<std::string>("keyprov.v2c.request_id", "kp-legacy");
+        raw.save<std::string>("keyprov.v2c.state", "WAIT_RESPONSE");
+        raw.flush();
+    }
+    coord_->stop();
+    coord_ = std::make_unique<V2cKeyProvisioningCoordinator>(mqtt_, sec_, store_);
+    coord_->set_clock_sync_check([this] { return clock_synced_; });
+    ASSERT_TRUE(coord_->initialize(cfg_));
+    ASSERT_TRUE(coord_->start(false));
+    sec_->query_state = 3;  // SEC clean
+    sec_->status_items.clear();
+    make_ready();
+    coord_->tick();
+    auto snap = coord_->snapshot();
+    EXPECT_TRUE(snap.legacy_snapshot_unknown);
+    EXPECT_EQ(snap.state, V2cKeyProvState::LEGACY_SNAPSHOT_UNKNOWN);
+    EXPECT_EQ(snap.legacy_store_records, 1u);
+    // 不发送 KeyProvisioningRequest（默认阻断）。
+    int request_payloads = 0;
+    for (const auto& c : mqtt_->publish_route_calls()) {
+        if (c.route_id != "keyprov.uplink") continue;
+        VehicleMessageEnvelope env;
+        if (!env.ParseFromArray(c.payload.data(), (int)c.payload.size())) continue;
+        if (env.payload_type() == kKeyprovPayloadRequest) request_payloads++;
+    }
+    EXPECT_EQ(request_payloads, 0);
+}
+
+TEST_F(V2cKeyProvisioningCoordinatorTest, LegacyWithSecCommittedRecoversAck) {
+    {
+        hwyz::store::Store raw = hwyz::store::Store::open("tsp", store_root_);
+        raw.save<std::string>("keyprov.v2c.present", "1");
+        raw.save<std::string>("keyprov.v2c.request_id", "kp-legacy");
+        raw.save<std::string>("keyprov.v2c.state", "ACK_PENDING");
+        raw.flush();
+    }
+    coord_->stop();
+    coord_ = std::make_unique<V2cKeyProvisioningCoordinator>(mqtt_, sec_, store_);
+    coord_->set_clock_sync_check([this] { return clock_synced_; });
+    ASSERT_TRUE(coord_->initialize(cfg_));
+    ASSERT_TRUE(coord_->start(false));
+    sec_->status_items = {status_item(kKeyprovPurposeUplink, kActive, 3),
+                          status_item(kKeyprovPurposeDownlink, kActive, 3)};
+    sec_->query_state = kCommitted;
+    sec_->query_items = sec_->status_items;
+    sec_->import_proof = {0x0C};
+    make_ready();
+    coord_->tick();  // LEGACY -> SEC journal COMMITTED -> 恢复 ACK
+    auto snap = coord_->snapshot();
+    EXPECT_EQ(snap.state, V2cKeyProvState::ACK_PENDING);
+    EXPECT_EQ(sec_->import_calls, 0);  // 不重复导入
+    bool saw_ack = false;
+    for (const auto& c : mqtt_->publish_route_calls()) {
+        if (c.route_id != "keyprov.uplink") continue;
+        VehicleMessageEnvelope env;
+        if (!env.ParseFromArray(c.payload.data(), (int)c.payload.size())) continue;
+        if (env.payload_type() == kKeyprovPayloadAck) saw_ack = true;
+    }
+    EXPECT_TRUE(saw_ack);
+}
+
+TEST_F(V2cKeyProvisioningCoordinatorTest, LateOldRequestIdResultIsolated) {
+    // 旧 requestId 的迟到结果（supersede 后）不得推进新 attempt。
+    sec_->status_items.clear();
+    sec_->query_state = 3;  // SEC clean
+    make_ready();
+    coord_->tick();
+    std::string rid = coord_->snapshot().request_id;
+    coord_->handle_routed_downlink(downlink(
+        make_response_error_envelope(rid, KEY_PROVISIONING_RESULT_REJECTED, "806095")));
+    EXPECT_EQ(coord_->snapshot().state, V2cKeyProvState::RECONCILE_OLD_ATTEMPT);
+    // 终结旧批次 -> 新 attempt（新 requestId）。
+    coord_->handle_routed_downlink(downlink(
+        make_status_response_envelope(rid, kStatusFailed)));
+    std::string new_rid = coord_->snapshot().request_id;
+    ASSERT_NE(new_rid, rid);
+
+    // 旧 requestId 的迟到 Response：requestId 不匹配 -> 隔离，不推进新 attempt。
+    auto state_before = coord_->snapshot().state;
+    coord_->handle_routed_downlink(downlink(make_response_envelope(rid)));
+    EXPECT_EQ(coord_->snapshot().state, state_before);
+    EXPECT_EQ(coord_->snapshot().request_id, new_rid);
+    EXPECT_GE(coord_->snapshot().responses_rejected, 1u);
 }
 
 int main(int argc, char** argv) {
