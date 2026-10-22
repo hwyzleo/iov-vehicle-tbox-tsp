@@ -1011,6 +1011,85 @@ TEST_F(V2cKeyProvisioningCoordinatorTest, VmdNoBatchSupersedesLocalCreatesNewAtt
     EXPECT_EQ(snap.superseded_local, 1u);
 }
 
+// 回归：SEC journal outcome unknown 时，禁止新 attempt，但必须继续发 VMD
+// StatusRequest（CR-013 §8 / SPEC §20.2：SEC journal 与 VMD Status 双路对账），
+// 不能把 UNKNOWN 当作已消费终态导致对账卡死、无限退避。
+TEST_F(V2cKeyProvisioningCoordinatorTest, SecUnknownKeepsVmdStatusReconciliation) {
+    sec_->status_items.clear();
+    make_ready();
+    coord_->tick();
+    std::string rid = coord_->snapshot().request_id;
+    ASSERT_FALSE(rid.empty());
+    ASSERT_EQ(coord_->snapshot().state, V2cKeyProvState::WAIT_RESPONSE);
+
+    // 首次 Request 被 806095 拒绝 -> 进入对账。
+    coord_->handle_routed_downlink(downlink(
+        make_response_error_envelope(rid, KEY_PROVISIONING_RESULT_REJECTED, "806095")));
+    EXPECT_EQ(coord_->snapshot().state, V2cKeyProvState::RECONCILE_OLD_ATTEMPT);
+
+    // SEC 查询持续返回 outcome unknown。
+    sec_->query_error_code = kUnknownErr;  // ErrorCode::BUSINESS_KEY_IMPORT_UNKNOWN
+    coord_->tick();
+
+    auto snap = coord_->snapshot();
+    EXPECT_EQ(snap.state, V2cKeyProvState::RECONCILE_OLD_ATTEMPT);
+    EXPECT_EQ(snap.blocked_reason, keyprov_blocked_reason::kSecOutcomeUnknown);
+
+    // 关键断言：SEC unknown 仍发出 VMD StatusRequest（修复前不会发）。
+    int request_payloads = 0;
+    int status_payloads = 0;
+    for (const auto& c : mqtt_->publish_route_calls()) {
+        if (c.route_id != "keyprov.uplink") continue;
+        VehicleMessageEnvelope env;
+        if (!env.ParseFromArray(c.payload.data(), (int)c.payload.size())) continue;
+        if (env.payload_type() == kKeyprovPayloadRequest) request_payloads++;
+        if (env.payload_type() == kKeyprovPayloadStatusRequest) status_payloads++;
+    }
+    EXPECT_GE(status_payloads, 1);
+    EXPECT_EQ(request_payloads, 1);  // 未创建新 Request
+
+    // 等待 StatusResponse 期间再次 tick：保持 RECONCILE，不重复发 Status、不发新 Request。
+    coord_->tick();
+    snap = coord_->snapshot();
+    EXPECT_EQ(snap.state, V2cKeyProvState::RECONCILE_OLD_ATTEMPT);
+    EXPECT_EQ(snap.blocked_reason, keyprov_blocked_reason::kSecOutcomeUnknown);
+}
+
+// 回归：SEC outcome unknown 期间 VMD 已终结（FAILED）也不得建新 attempt
+// （CR-013 §9：outcome unknown 禁止新 attempt）；SEC 恢复明确无副作用后才收敛。
+TEST_F(V2cKeyProvisioningCoordinatorTest, SecUnknownBlocksNewAttemptUntilSecResolves) {
+    sec_->status_items.clear();
+    make_ready();
+    coord_->tick();
+    std::string rid = coord_->snapshot().request_id;
+    ASSERT_FALSE(rid.empty());
+    coord_->handle_routed_downlink(downlink(
+        make_response_error_envelope(rid, KEY_PROVISIONING_RESULT_REJECTED, "806095")));
+    EXPECT_EQ(coord_->snapshot().state, V2cKeyProvState::RECONCILE_OLD_ATTEMPT);
+
+    // VMD 已终结（FAILED），但 SEC 仍 unknown：保持对账、不建新 attempt。
+    sec_->query_error_code = kUnknownErr;
+    coord_->handle_routed_downlink(downlink(
+        make_status_response_envelope(rid, kStatusFailed)));
+    auto snap = coord_->snapshot();
+    EXPECT_EQ(snap.state, V2cKeyProvState::RECONCILE_OLD_ATTEMPT);
+    EXPECT_EQ(snap.blocked_reason, keyprov_blocked_reason::kSecOutcomeUnknown);
+    EXPECT_EQ(snap.request_id, rid);
+    EXPECT_EQ(snap.superseded_remote, 0u);
+    EXPECT_EQ(snap.attempts_created, 1u);  // 未建新 attempt
+
+    // SEC 恢复为明确无副作用 -> VMD FAILED 才允许 SUPERSEDED_REMOTE 建新 attempt。
+    sec_->query_error_code = 0;
+    sec_->query_state = 3;  // FAILED：无已提交副作用
+    coord_->handle_routed_downlink(downlink(
+        make_status_response_envelope(rid, kStatusFailed)));
+    snap = coord_->snapshot();
+    EXPECT_EQ(snap.state, V2cKeyProvState::WAIT_RESPONSE);  // 新 attempt 已发布
+    EXPECT_NE(snap.request_id, rid);
+    EXPECT_EQ(snap.superseded_remote, 1u);
+    EXPECT_GE(snap.attempts_created, 2u);
+}
+
 TEST_F(V2cKeyProvisioningCoordinatorTest, LegacyRecordBlocksNewRequest) {
     // 写旧版多键记录（缺 snapshot/fingerprint）。
     {

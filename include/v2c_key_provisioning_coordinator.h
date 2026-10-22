@@ -195,8 +195,10 @@ private:
     void handle_reconcile_status_locked(const KeyProvStatusResponseData& status);
     // 是否有 accepted/PUBACK/timeout/崩溃等"可能已提交"证据。
     bool submission_evidence_locked() const;
-    // SEC journal 对账：COMMITTED -> 恢复 ACK；UNKNOWN -> 保持对账；clean -> 继续。
-    // 返回 true 表示本次对账已消费（状态已改），false 表示需要继续 VMD 对账。
+    // SEC journal 对账：COMMITTED -> 恢复 ACK；UNKNOWN -> 保持对账（禁止新 attempt）
+    // 但继续 VMD StatusRequest 只读对账；clean -> 继续 VMD 终态判定。
+    // 返回 true 表示本次对账已消费（ACK 恢复/安全阻断，无需再发 Status），
+    // false 表示调用方需继续 VMD 对账（含 SEC outcome unknown 场景）。
     bool reconcile_sec_journal_locked();
     // 以原 requestId 发送 StatusRequest（对账/待终结观察）。
     void send_status_request_locked();
@@ -268,6 +270,11 @@ private:
     std::string blocked_reason_;
     uint64_t store_generation_ = 0;
     bool legacy_snapshot_unknown_ = false;
+    // CR-013 §9：SEC journal 是否仍处于 outcome unknown（true 时禁止建新 attempt）。
+    bool sec_outcome_unknown_ = false;
+    // SEC outcome unknown 连续轮次（>= max_attempts_before_alert 时告警一次）。
+    uint32_t sec_unknown_rounds_ = 0;
+    bool sec_unknown_alerted_ = false;
     bool reconcile_status_sent_ = false;   // 对账中已发 StatusRequest（等待响应）
     std::string conflict_vmd_code_;        // 脱敏冲突 VMD code（如 806095）
     // 发送时快照，用于异步结果迟到隔离（requestId+generation+fingerprint）。

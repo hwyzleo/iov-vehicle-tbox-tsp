@@ -662,6 +662,16 @@ void V2cKeyProvisioningCoordinator::freeze_current_input_locked() {
 }
 
 void V2cKeyProvisioningCoordinator::create_new_attempt_locked() {
+    if (sec_outcome_unknown_) {
+        // CR-013 §9：SEC outcome 仍未知时禁止新 attempt，保持原 requestId 对账。
+        // 兜底保护：任何调用方不得绕过对账直接建新 attempt。
+        blocked_reason_ = keyprov_blocked_reason::kSecOutcomeUnknown;
+        count_blocked_reason_locked(keyprov_blocked_reason::kSecOutcomeUnknown);
+        state_ = V2cKeyProvState::RECONCILE_OLD_ATTEMPT;
+        schedule_retry_locked();
+        persist_locked();
+        return;
+    }
     KeyprovAttemptSnapshot cand;
     KeyprovFingerprint fp;
     std::string err;
@@ -718,6 +728,9 @@ void V2cKeyProvisioningCoordinator::create_new_attempt_locked() {
     conflict_vmd_code_.clear();
     submission_ = keyprov_submission::kNone;
     legacy_snapshot_unknown_ = false;
+    sec_outcome_unknown_ = false;   // 新 attempt 与旧 SEC 事实解绑，重新对账
+    sec_unknown_rounds_ = 0;
+    sec_unknown_alerted_ = false;
     counters_.attempts_created++;
     bump_store_generation_locked();
     awaiting_active_ = false;
@@ -770,6 +783,9 @@ bool V2cKeyProvisioningCoordinator::reconcile_sec_journal_locked() {
         // 不重复导入、不建新 attempt）。
         ack_items_ = build_ack_items(res);
         if (ack_items_.size() == config_.purposes.size()) {
+            sec_outcome_unknown_ = false;   // SEC 已给出明确事实
+            sec_unknown_rounds_ = 0;
+            sec_unknown_alerted_ = false;
             blocked_reason_.clear();
             state_ = V2cKeyProvState::ACK_PENDING;
             ack_sent_ = false;
@@ -779,6 +795,7 @@ bool V2cKeyProvisioningCoordinator::reconcile_sec_journal_locked() {
             do_ack_locked();
         } else {
             // items 不完整：安全异常 -> 保持阻断/对账，不发伪成功 ACK。
+            sec_outcome_unknown_ = true;
             blocked_reason_ = keyprov_blocked_reason::kSecOutcomeUnknown;
             count_blocked_reason_locked(keyprov_blocked_reason::kSecOutcomeUnknown);
             state_ = V2cKeyProvState::RECONCILE_OLD_ATTEMPT;
@@ -791,16 +808,33 @@ bool V2cKeyProvisioningCoordinator::reconcile_sec_journal_locked() {
         ec == ErrorCode::BUSINESS_KEY_OUTCOME_UNKNOWN ||
         (ec == ErrorCode::SUCCESS &&
          res.state == BusinessKeyImportState::UNKNOWN)) {
-        // outcome unknown：保持原 requestId 对账，禁止新 attempt。
+        // outcome unknown：保持原 requestId 对账、禁止新 attempt（CR-013 §9）。
+        // 但 VMD StatusRequest 只读对账必须继续（CR-013 §8 / SPEC §20.2：SEC journal
+        // 与 VMD Status 双路收敛），因此返回 false 交由调用方推进 Status 周期，
+        // 而不是把 UNKNOWN 当作已消费的终态导致对账卡死。
+        sec_outcome_unknown_ = true;
+        if (++sec_unknown_rounds_ >= config_.max_attempts_before_alert &&
+            !sec_unknown_alerted_) {
+            sec_unknown_alerted_ = true;
+            LogAdapter::keyprov().warn(
+                "tsp.keyprov.sec_outcome_unknown_persistent",
+                "SEC outcome 持续未知，保持原 requestId 对账并观察 VMD 终态", {
+                    {"rounds", tbox::fw::log::FieldValue::makeInt(
+                        static_cast<int64_t>(sec_unknown_rounds_))}
+                });
+        }
         blocked_reason_ = keyprov_blocked_reason::kSecOutcomeUnknown;
         count_blocked_reason_locked(keyprov_blocked_reason::kSecOutcomeUnknown);
         state_ = V2cKeyProvState::RECONCILE_OLD_ATTEMPT;
         schedule_retry_locked();
         persist_locked();
-        return true;
+        return false;
     }
     // 其余（FAILED / REQUESTED / STAGED / 查询不可用）视为无已提交副作用，
     // 交由调用方继续 VMD 终态判定。
+    sec_outcome_unknown_ = false;
+    sec_unknown_rounds_ = 0;
+    sec_unknown_alerted_ = false;
     return false;
 }
 
@@ -838,6 +872,10 @@ void V2cKeyProvisioningCoordinator::send_status_request_locked() {
 
 void V2cKeyProvisioningCoordinator::do_reconcile_locked() {
     // 1) SEC journal 事实优先（原 requestId / operation 绑定）。
+    //    COMMITTED 恢复 ACK / 安全异常 -> 已消费直接返回；
+    //    UNKNOWN / clean -> 返回 false，继续 VMD Status 只读对账
+    //    （CR-013 §8 / SPEC §20.2：SEC journal 与 VMD Status 双路收敛，
+    //     SEC unknown 不得阻断 StatusRequest）。
     if (reconcile_sec_journal_locked()) return;
     // 2) 无已提交副作用：以原 requestId 查 VMD Status 确认批次事实。
     if (!reconcile_status_sent_) {
@@ -882,6 +920,17 @@ void V2cKeyProvisioningCoordinator::handle_reconcile_status_locked(
         case kKeyProvStatusFailed: {
             // VMD 已终结（FAILED）：SEC 无副作用 -> SUPERSEDED_REMOTE -> 新 attempt。
             if (reconcile_sec_journal_locked()) return;
+            if (sec_outcome_unknown_) {
+                // SEC 未给出明确事实：不得断言无副作用/建新 attempt，保持对账
+                // （CR-013 §9：outcome unknown 禁止新 attempt）。
+                blocked_reason_ = keyprov_blocked_reason::kSecOutcomeUnknown;
+                count_blocked_reason_locked(
+                    keyprov_blocked_reason::kSecOutcomeUnknown);
+                state_ = V2cKeyProvState::RECONCILE_OLD_ATTEMPT;
+                schedule_retry_locked();
+                persist_locked();
+                return;
+            }
             counters_.superseded_remote++;
             record_.last_error = "vmd_batch_terminated";
             state_ = V2cKeyProvState::SUPERSEDED_REMOTE;
@@ -892,6 +941,16 @@ void V2cKeyProvisioningCoordinator::handle_reconcile_status_locked(
         case kKeyProvStatusUnspecified: {
             // VMD 无批次：仅当可证明从未提交且 SEC 无副作用时 SUPERSEDED_LOCAL。
             if (reconcile_sec_journal_locked()) return;
+            if (sec_outcome_unknown_) {
+                // SEC 未给出明确事实：不能断言“从未提交”，保持对账（禁止新 attempt）。
+                blocked_reason_ = keyprov_blocked_reason::kSecOutcomeUnknown;
+                count_blocked_reason_locked(
+                    keyprov_blocked_reason::kSecOutcomeUnknown);
+                state_ = V2cKeyProvState::RECONCILE_OLD_ATTEMPT;
+                schedule_retry_locked();
+                persist_locked();
+                return;
+            }
             if (!submission_evidence_locked()) {
                 counters_.superseded_local++;
                 record_.last_error = "never_submitted";
