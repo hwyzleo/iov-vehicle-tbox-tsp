@@ -339,7 +339,7 @@ TEST(KeyProvisioningIntegrationTest, FingerprintChangeReconcilesAndSupersedes) {
     ASSERT_TRUE(coord.initialize(cfg));
     ASSERT_TRUE(coord.start(false));
     sec->status_items.clear();
-    sec->query_state = 3;  // SEC clean（无已提交副作用）
+    sec->query_state = 5;  // NOT_FOUND：SEC 证明无记录
     make_ready(mqtt);
     coord.tick();
     std::string rid = coord.snapshot().request_id;
@@ -411,7 +411,7 @@ TEST(KeyProvisioningIntegrationTest, IdempotencyConflictEndToEnd) {
     ASSERT_TRUE(coord.initialize(cfg));
     ASSERT_TRUE(coord.start(false));
     sec->status_items.clear();
-    sec->query_state = 3;
+    sec->query_state = 5;  // NOT_FOUND
     make_ready(mqtt);
     coord.tick();
     std::string rid = coord.snapshot().request_id;

@@ -171,6 +171,7 @@ tsp_add_test(KeyprovAttemptTest
 tsp_add_test(V2cKeyProvisioningCoordinatorTest
     test_v2c_key_provisioning_coordinator.cpp
     ${PROJECT_SOURCE_DIR}/src/v2c_key_provisioning_coordinator.cpp
+    ${PROJECT_SOURCE_DIR}/src/sec_business_key_adapter.cpp
     ${PROJECT_SOURCE_DIR}/src/keyprov_attempt.cpp
     ${PROJECT_SOURCE_DIR}/src/keyprov_protocol.cpp
     ${PROJECT_SOURCE_DIR}/src/keyprov_readiness.cpp
@@ -186,6 +187,7 @@ tsp_add_test(KeyprovReadinessTest
 tsp_add_test(KeyProvisioningIntegrationTest
     test_key_provisioning_integration.cpp
     ${PROJECT_SOURCE_DIR}/src/v2c_key_provisioning_coordinator.cpp
+    ${PROJECT_SOURCE_DIR}/src/sec_business_key_adapter.cpp
     ${PROJECT_SOURCE_DIR}/src/keyprov_attempt.cpp
     ${PROJECT_SOURCE_DIR}/src/keyprov_protocol.cpp
     ${PROJECT_SOURCE_DIR}/src/keyprov_readiness.cpp

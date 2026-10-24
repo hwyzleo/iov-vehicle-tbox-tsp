@@ -97,6 +97,9 @@ struct V2cKeyProvisioningSnapshot {
     bool legacy_snapshot_unknown = false;
     uint64_t blocked_attempts_current = 0;  // 当前是否处于阻断态（0/1）
     std::string conflict_vmd_code;       // 脱敏冲突 VMD code（如 806095，空=无）
+    // ---- CR-014 可观测字段（有限枚举，脱敏） ----
+    std::string sec_evidence_kind;       // SecImportEvidenceKind 名
+    bool import_invocation_recorded = false;  // 已调用 SEC import API
     // 脱敏计数器
     uint64_t cloud_ready_events = 0;
     uint64_t requests_published = 0;
@@ -211,6 +214,9 @@ private:
     void mark_submitted_locked();
     void mark_confirmed_locked();
     void bump_store_generation_locked();
+    // CR-014 §21.5：对账保持路径的三元组抑制（相同则跳过写盘/计数，返回 true）。
+    bool reconcile_obs_suppressed_locked(int vmd_status,
+                                         SecImportEvidenceKind kind);
 
     bool capability_gate_locked(std::string& reason);
     // 系统时钟是否已同步（未注入时读 systemd-timesyncd 标记）。
@@ -272,6 +278,24 @@ private:
     bool legacy_snapshot_unknown_ = false;
     // CR-013 §9：SEC journal 是否仍处于 outcome unknown（true 时禁止建新 attempt）。
     bool sec_outcome_unknown_ = false;
+    // CR-014：仅 SEC NOT_FOUND 时置位（无本地安全调用证据冲突前提下）。
+    bool sec_no_side_effects_proven_ = false;
+    // CR-014：SEC import invocation 证据（已调用 import API，持久化恢复）。
+    bool import_invocation_recorded_ = false;
+    // CR-014：import 结果待定（回调待收敛；重启后按 Store 保守恢复）。
+    bool pending_callback_ = false;
+    // CR-014：最近一次 SEC 证据分类（有限枚举，可观测）。
+    SecImportEvidenceKind last_sec_evidence_kind_ =
+        SecImportEvidenceKind::ContractUnknown;
+    // CR-014：观测时 SEC capability 快照契约版本（仅诊断；失败/未知记 0）。
+    uint32_t sec_import_result_contract_version_ = 0;
+    // CR-014 §21.5：相同三元组 {vmd_state, sec_evidence, store_generation}
+    // 抑制重复写盘/日志（last_obs_vmd_status_=-1 表示 SEC 阶段；-3 表示 BLOCKED
+    // EVIDENCE_CONFLICT 重查；>=0 为 VMD Status 值）。
+    bool last_obs_valid_ = false;
+    int last_obs_vmd_status_ = -1;
+    SecImportEvidenceKind last_obs_kind_ = SecImportEvidenceKind::ContractUnknown;
+    uint64_t last_obs_generation_ = 0;
     // SEC outcome unknown 连续轮次（>= max_attempts_before_alert 时告警一次）。
     uint32_t sec_unknown_rounds_ = 0;
     bool sec_unknown_alerted_ = false;

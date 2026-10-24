@@ -32,8 +32,9 @@
 namespace tbox {
 namespace tsp {
 
-// Store schema 版本（CR-013 §10 新增 v2）。未知/更高版本不得降级解释。
-constexpr uint32_t kV2cStoreSchemaVersion = 2;
+// Store schema 版本（CR-013 §10 新增 v2；CR-014 §8/§21.6 新增 v3）。
+// 未知/更高版本不得降级解释。
+constexpr uint32_t kV2cStoreSchemaVersion = 3;
 
 struct V2cKeyProvisioningRecord {
     bool valid = false;                    // Store 中是否存在记录
@@ -57,6 +58,16 @@ struct V2cKeyProvisioningRecord {
     std::string blocked_reason;            // keyprov_blocked_reason::*（受控枚举）
     uint64_t store_generation = 0;         // 单调递增，CAS/迟到结果隔离依据
     std::vector<std::string> terminalized_request_ids;  // append-only audit（有界）
+
+    // ---- v3 聚合字段（CR-014 §8/§21.6：SEC import result 证据） ----
+    // sec_import_evidence_kind：SecImportEvidenceKind 数值（0..5）。
+    // 旧记录（v2 及以下）缺字段时默认 ContractUnknown + import_invocation=true
+    // （"可能已调用"，保持阻断），除非 SEC/VMD 权威查询重新建立证据。
+    uint32_t sec_import_result_contract_version = 0;  // 0=UNKNOWN（仅诊断）
+    int sec_import_evidence_kind = 5;                 // 默认 ContractUnknown
+    uint64_t sec_evidence_observed_store_generation = 0;
+    int64_t sec_evidence_observed_at_ms = 0;
+    bool import_invocation = false;  // 已调用 SEC import API（缺字段默认 true）
 
     // ---- legacy 解析产物（非持久化，load() 派生） ----
     bool legacy_snapshot_unknown = false;  // 旧记录缺 snapshot/fingerprint

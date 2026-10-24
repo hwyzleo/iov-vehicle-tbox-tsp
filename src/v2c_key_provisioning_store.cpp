@@ -2,6 +2,7 @@
 #include "v2c_key_provisioning_store.h"
 
 #include "log_adapter.h"
+#include "sec_business_key_facade.h"
 
 #include <nlohmann/json.hpp>
 
@@ -150,6 +151,14 @@ nlohmann::json record_to_json(const V2cKeyProvisioningRecord& r) {
     j["blocked_reason"] = r.blocked_reason;
     j["store_generation"] = r.store_generation;
     j["terminalized_request_ids"] = r.terminalized_request_ids;
+    // ---- CR-014 v3：SEC import result 证据（非敏感） ----
+    j["sec_import_result_contract_version"] =
+        r.sec_import_result_contract_version;
+    j["sec_import_evidence_kind"] = r.sec_import_evidence_kind;
+    j["sec_evidence_observed_store_generation"] =
+        r.sec_evidence_observed_store_generation;
+    j["sec_evidence_observed_at_ms"] = r.sec_evidence_observed_at_ms;
+    j["import_invocation"] = r.import_invocation;
     return j;
 }
 
@@ -192,6 +201,27 @@ V2cKeyProvisioningRecord V2cKeyProvisioningStore::load() const {
             for (const auto& v : j.value("terminalized_request_ids",
                                          nlohmann::json::array())) {
                 r.terminalized_request_ids.push_back(v.get<std::string>());
+            }
+            // ---- CR-014 v3：SEC import result 证据读取（缺字段保守默认） ----
+            r.sec_import_result_contract_version =
+                j.value("sec_import_result_contract_version", 0u);
+            const int ev_kind =
+                j.value("sec_import_evidence_kind",
+                        static_cast<int>(tbox::tsp::SecImportEvidenceKind::ContractUnknown));
+            r.sec_import_evidence_kind =
+                (ev_kind >= 0 && ev_kind <= 5)
+                    ? ev_kind
+                    : static_cast<int>(tbox::tsp::SecImportEvidenceKind::ContractUnknown);
+            r.sec_evidence_observed_store_generation =
+                j.value("sec_evidence_observed_store_generation", 0ull);
+            r.sec_evidence_observed_at_ms =
+                j.value("sec_evidence_observed_at_ms", static_cast<int64_t>(0));
+            // 旧记录（v2 及以下）缺 import_invocation 字段 -> 默认 true
+            // （"可能已调用"，保持阻断），不得推断为"从未调用"。
+            if (j.contains("import_invocation")) {
+                r.import_invocation = j.value("import_invocation", false);
+            } else {
+                r.import_invocation = true;
             }
             // schema/fingerprint 版本守卫：未知版本不得降级解释（CR-013 §4/§10）。
             if (r.schema_version > kV2cStoreSchemaVersion ||

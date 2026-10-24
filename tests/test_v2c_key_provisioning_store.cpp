@@ -2,9 +2,12 @@
 #include <gtest/gtest.h>
 
 #include "keyprov_attempt.h"
+#include "sec_business_key_facade.h"
 #include "v2c_key_provisioning_store.h"
 
 #include "store.h"
+
+#include <nlohmann/json.hpp>
 
 #include <cstdlib>
 #include <string>
@@ -60,6 +63,13 @@ V2cKeyProvisioningRecord make_v2_record(const std::string& rid) {
     rec.terminalized_request_ids = {"kp-old1"};
     rec.purposes = {"UPLINK_AEAD", "DOWNLINK_AEAD"};
     rec.business_key_versions = {{"UPLINK_AEAD", 5}, {"DOWNLINK_AEAD", 7}};
+    // ---- CR-014 v3：SEC import result 证据 ----
+    rec.sec_import_result_contract_version = 2;
+    rec.sec_import_evidence_kind =
+        static_cast<int>(tbox::tsp::SecImportEvidenceKind::NotFound);
+    rec.sec_evidence_observed_store_generation = 7;
+    rec.sec_evidence_observed_at_ms = 111;
+    rec.import_invocation = true;
     return rec;
 }
 } // namespace
@@ -105,6 +115,72 @@ TEST(V2cKeyProvisioningStoreTest, SaveLoadRoundTripFullV2) {
     EXPECT_FALSE(rec.legacy_snapshot_unknown);
     ASSERT_EQ(rec.business_key_versions.size(), 2u);
     EXPECT_EQ(rec.business_key_versions[1].second, 7u);
+    // CR-014 v3：SEC import result 证据 round-trip。
+    EXPECT_EQ(rec.sec_import_result_contract_version, 2u);
+    EXPECT_EQ(rec.sec_import_evidence_kind,
+              static_cast<int>(SecImportEvidenceKind::NotFound));
+    EXPECT_EQ(rec.sec_evidence_observed_store_generation, 7u);
+    EXPECT_EQ(rec.sec_evidence_observed_at_ms, 111);
+    EXPECT_TRUE(rec.import_invocation);
+}
+
+// CR-014 §8/§21.6：旧 v2 记录缺 SEC 证据字段 -> 保守默认
+// （ContractUnknown + import_invocation=true“可能已调用”，保持阻断）。
+TEST(V2cKeyProvisioningStoreTest, V2RecordDefaultsSecEvidenceConservative) {
+    auto root = temp_root();
+    // 用原始 framework Store 直接写 v2 聚合 JSON（无 sec 字段、schema_version=2）。
+    {
+        hwyz::store::Store raw = hwyz::store::Store::open("tsp", root);
+        nlohmann::json j = nlohmann::json::object();
+        j["schema_version"] = 2;
+        j["fingerprint_version"] = 1;
+        j["attempt_fingerprint"] = std::string(64, 'a');
+        j["request_id"] = "kp-v2legacy";
+        j["state"] = "RECONCILE_OLD_ATTEMPT";
+        j["submission"] = keyprov_submission::kSubmitted;
+        j["store_generation"] = 3;
+        raw.save<std::string>("keyprov.v2c.attempt.v2", j.dump());
+        raw.flush();
+    }
+    V2cKeyProvisioningStore store(root);
+    auto rec = store.load();
+    ASSERT_TRUE(rec.valid);
+    // 有 fingerprint 不是 legacy_snapshot_unknown。
+    EXPECT_FALSE(rec.legacy_snapshot_unknown);
+    // SEC 证据字段缺省 -> 保守默认。
+    EXPECT_EQ(rec.sec_import_result_contract_version, 0u);
+    EXPECT_EQ(rec.sec_import_evidence_kind,
+              static_cast<int>(SecImportEvidenceKind::ContractUnknown));
+    EXPECT_TRUE(rec.import_invocation);  // “可能已调用”，不得推断为从未调用
+}
+
+TEST(V2cKeyProvisioningStoreTest, SaveLoadRoundTripSecEvidenceKinds) {
+    auto root = temp_root();
+    V2cKeyProvisioningRecord rec = make_v2_record("kp-seckind");
+    rec.sec_import_evidence_kind =
+        static_cast<int>(SecImportEvidenceKind::OutcomeUnknown);
+    rec.import_invocation = false;
+    {
+        V2cKeyProvisioningStore store(root);
+        store.save(rec);
+    }
+    V2cKeyProvisioningStore store(root);
+    auto loaded = store.load();
+    ASSERT_TRUE(loaded.valid);
+    EXPECT_EQ(loaded.sec_import_evidence_kind,
+              static_cast<int>(SecImportEvidenceKind::OutcomeUnknown));
+    EXPECT_FALSE(loaded.import_invocation);  // v3 显式 false 不覆盖为 true
+    // 越界 kind 防御：非法值归 ContractUnknown。
+    V2cKeyProvisioningRecord bad = make_v2_record("kp-badkind");
+    bad.sec_import_evidence_kind = 99;
+    auto root2 = temp_root();
+    {
+        V2cKeyProvisioningStore store2(root2);
+        store2.save(bad);
+    }
+    V2cKeyProvisioningStore store2(root2);
+    EXPECT_EQ(store2.load().sec_import_evidence_kind,
+              static_cast<int>(SecImportEvidenceKind::ContractUnknown));
 }
 
 TEST(V2cKeyProvisioningStoreTest, LegacyRecordMarkedSnapshotUnknown) {

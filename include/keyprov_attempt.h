@@ -128,6 +128,10 @@ constexpr const char* kAwaitCloudTermination = "AWAIT_CLOUD_TERMINATION";
 constexpr const char* kSecOutcomeUnknown = "SEC_OUTCOME_UNKNOWN";
 constexpr const char* kVmdOutcomeUnknown = "VMD_OUTCOME_UNKNOWN";
 constexpr const char* kUnknown = "UNKNOWN";
+// ---- TBOX-TSP-DSN-CR-014 §21.5：SEC 证据阻断细分 ----
+constexpr const char* kSecImportNotFound = "SEC_IMPORT_NOT_FOUND";
+constexpr const char* kSecImportInProgress = "SEC_IMPORT_IN_PROGRESS";
+constexpr const char* kEvidenceConflict = "EVIDENCE_CONFLICT";
 } // namespace keyprov_blocked_reason
 
 // submission 状态受控枚举（persist_locked 使用）。

@@ -26,6 +26,51 @@ class SecClient;
 
 namespace tsp {
 
+// ============================================================
+// TBOX-TSP-DSN-CR-014 §2/§3/§21.1：SEC import result 强类型分类。
+// ============================================================
+// 分类语义（adapter exhaustive switch）：
+//   COMMITTED              -> Committed      （journal 已原子提交）
+//   FAILED                 -> Failed         （journal 存在且失败；不得等同 NotFound）
+//   NOT_FOUND              -> NotFound       （结构化 journal 证明无记录/无副作用）
+//   UNKNOWN/OUTCOME_UNKNOWN -> OutcomeUnknown（可能有副作用，fail-closed）
+//   REQUESTED/STAGED       -> OutcomeUnknown（事务痕迹已存在，fail-closed；
+//                             raw_import_state 保留原始数值用于诊断区分）
+//   未知数值/字符串         -> ContractUnknown（防御兜底；Store 旧记录缺字段默认值）
+//   传输/解析/timeout       -> QueryError     （sec_import_result_contract_version=0）
+//
+// 除明确 NotFound 外，所有新增、未知和失败路径均保持 sec_outcome_unknown_=true；
+// 旧 SEC 的 UNKNOWN 不得升级为 NotFound。
+enum class SecImportEvidenceKind : uint8_t {
+    Committed = 0,
+    Failed = 1,
+    NotFound = 2,
+    OutcomeUnknown = 3,
+    QueryError = 4,
+    ContractUnknown = 5
+};
+
+const char* sec_import_evidence_kind_to_string(SecImportEvidenceKind k);
+
+struct SecImportEvidence {
+    SecImportEvidenceKind kind = SecImportEvidenceKind::ContractUnknown;
+    // 观测时 capability 快照的契约版本；查询失败/无法确认记 0=UNKNOWN。
+    // 仅用于兼容诊断，不得作为 NOT_FOUND 或释放旧 attempt 的证明。
+    uint32_t sec_import_result_contract_version = 0;
+    std::vector<uint8_t> request_id_digest;  // 32B raw（受控摘要，无完整 requestId）
+    uint64_t observed_store_generation = 0;
+    bool import_invocation_recorded = false;  // 已调用 SEC import API
+    bool pending_callback = false;            // import 结果待定（回调待收敛）
+    int raw_import_state = -1;                // 原始 SEC state 数值（诊断保留，-1=无）
+};
+
+// SEC import result 分类（实现位于 sec_business_key_adapter.cpp）。
+// ec!=SUCCESS 时按 QueryError 处理且契约版本记 0；结果有效时 contract_version
+// 取调用方提供的 capability 快照契约版本。
+SecImportEvidence sec_classify_import_result(
+    tbox::sec::ErrorCode ec, const tbox::sec::ImportResult& result,
+    uint32_t sec_import_result_contract_version);
+
 class SecBusinessKeyFacade {
 public:
     virtual ~SecBusinessKeyFacade() = default;
