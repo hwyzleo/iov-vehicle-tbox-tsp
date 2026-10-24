@@ -119,6 +119,49 @@ AttemptChangeDimension keyprov_attempt_change_dimension(
 bool keyprov_is_idempotency_conflict(const KeyProvProtocolError& error);
 
 // ============================================================
+// TBOX-TSP-DSN-CR-016 §4.1/§23.1：云端可释放 UNSPECIFIED 判定窄类型
+// ============================================================
+// VMD 对不存在批次按只读契约返回 status=UNSPECIFIED(0) + 806099 + retryable=false
+// + action=DO_NOT_RETRY。TSP 只在 SEC 已证明无副作用（NO_SIDE_EFFECT_PROVEN）且
+// 完整错误四元组匹配时才把该 UNSPECIFIED 分类为“明确可释放”；其余缺字段、未知
+// 枚举或解析失败一律 fail-closed。错误分类只消费稳定 code/action，禁止 message
+// 文本匹配（REQ-008/§7.3）。
+
+// 规范化后的动作（有限枚举；UNSPECIFIED=未知/缺失，fail-closed）。
+// 数值仅追加，不得重排。
+enum class ProtocolErrorAction : uint8_t {
+    UNSPECIFIED = 0,   // 未知/缺失 action（fail-closed）
+    DO_NOT_RETRY = 1   // 云端建议不要重试（批次不存在的确定性语义）
+};
+
+// canonical VMD“批次不存在/未找到”码（ERR_NOT_FOUND）。只允许显式绑定该常量，
+// 不得以 message 文本或其它 code 推断批次不存在。
+constexpr int32_t kKeyProvErrorCodeNotFound = 806099;
+
+// 规范化后的云端错误（Coordinator 矩阵输入；不直接依赖生成类型）。
+struct CloudProtocolError {
+    int32_t code = 0;   // 0=未识别/缺失；仅 806099 视为 ERR_NOT_FOUND
+    bool retryable = false;
+    ProtocolErrorAction action = ProtocolErrorAction::UNSPECIFIED;
+    bool present = false;  // StatusResponse 是否携带 error（code 非空）
+};
+
+// 云端决策矩阵输入：同时携带 VMD status 与规范化 ProtocolError
+// （REQ-009：不得仅传 status 整数）。
+struct CloudStatusDecisionInput {
+    int status = kKeyProvStatusUnspecified;  // KEY_PROVISIONING_STATUS_* 数值
+    CloudProtocolError error;
+};
+
+// 规范化 wire ProtocolError -> CloudProtocolError。
+// 只识别 code=="806099" -> kKeyProvErrorCodeNotFound、action=="DO_NOT_RETRY"；
+// 其它 code/action、缺失 error、默认 error 均映射为不匹配值（fail-closed）。
+CloudProtocolError keyprov_normalize_protocol_error(
+    const KeyProvProtocolError& wire);
+
+const char* keyprov_protocol_error_action_to_string(ProtocolErrorAction a);
+
+// ============================================================
 // blocked reason 受控枚举（指标/日志用，有限集合）
 // ============================================================
 namespace keyprov_blocked_reason {

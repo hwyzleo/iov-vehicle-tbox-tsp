@@ -225,6 +225,95 @@ TEST(KeyprovAttemptTest, IdempotencyConflictClassifier) {
     EXPECT_FALSE(keyprov_is_idempotency_conflict(e));
 }
 
+// ============================================================
+// TBOX-TSP-DSN-CR-016 §4.1/§23.1：云端错误规范化（fail-closed）
+// ============================================================
+TEST(KeyprovAttemptTest, NormalizeProtocolErrorRecognizesReleasableTuple) {
+    KeyProvProtocolError wire;
+    wire.code = "806099";
+    wire.retryable = false;
+    wire.action = "DO_NOT_RETRY";
+    auto e = keyprov_normalize_protocol_error(wire);
+    EXPECT_TRUE(e.present);
+    EXPECT_EQ(e.code, kKeyProvErrorCodeNotFound);
+    EXPECT_FALSE(e.retryable);
+    EXPECT_EQ(e.action, ProtocolErrorAction::DO_NOT_RETRY);
+}
+
+TEST(KeyprovAttemptTest, NormalizeProtocolErrorMissingErrorFailsClosed) {
+    // 缺失 error（code 为空）：present=false，任何字段不得被判定为可释放。
+    auto e = keyprov_normalize_protocol_error(KeyProvProtocolError{});
+    EXPECT_FALSE(e.present);
+    EXPECT_EQ(e.code, 0);
+    EXPECT_EQ(e.action, ProtocolErrorAction::UNSPECIFIED);
+}
+
+TEST(KeyprovAttemptTest, NormalizeProtocolErrorRetryableFailsClosed) {
+    KeyProvProtocolError wire;
+    wire.code = "806099";
+    wire.retryable = true;  // 806099 但可重试：不自洽，不得释放
+    wire.action = "DO_NOT_RETRY";
+    auto e = keyprov_normalize_protocol_error(wire);
+    EXPECT_TRUE(e.present);
+    EXPECT_EQ(e.code, kKeyProvErrorCodeNotFound);
+    EXPECT_TRUE(e.retryable);
+    EXPECT_EQ(e.action, ProtocolErrorAction::DO_NOT_RETRY);
+    // 判定层拒绝：retryable=true 不构成可释放四元组（由 is_releasable 检查）。
+}
+
+TEST(KeyprovAttemptTest, NormalizeProtocolErrorUnknownCodeAndActionFailsClosed) {
+    // 未知 code（非 806099）：映射 0，不可释放；不做 message 文本匹配。
+    KeyProvProtocolError wire;
+    wire.code = "804010";
+    wire.action = "DO_NOT_RETRY";
+    auto e = keyprov_normalize_protocol_error(wire);
+    EXPECT_TRUE(e.present);
+    EXPECT_EQ(e.code, 0);
+    EXPECT_EQ(e.action, ProtocolErrorAction::DO_NOT_RETRY);
+
+    // 未知 action（含 QUERY_STATUS_LATER / 空 / KEYPROV_IDEMPOTENCY_CONFLICT）：
+    // 一律 UNSPECIFIED（fail-closed）。
+    wire = KeyProvProtocolError{};
+    wire.code = "806099";
+    wire.action = "QUERY_STATUS_LATER";
+    e = keyprov_normalize_protocol_error(wire);
+    EXPECT_TRUE(e.present);
+    EXPECT_EQ(e.code, kKeyProvErrorCodeNotFound);
+    EXPECT_EQ(e.action, ProtocolErrorAction::UNSPECIFIED);
+
+    wire = KeyProvProtocolError{};
+    wire.code = "806099";
+    wire.action = "";
+    e = keyprov_normalize_protocol_error(wire);
+    EXPECT_EQ(e.action, ProtocolErrorAction::UNSPECIFIED);
+
+    wire = KeyProvProtocolError{};
+    wire.code = "806099";
+    wire.action = "KEYPROV_IDEMPOTENCY_CONFLICT";
+    e = keyprov_normalize_protocol_error(wire);
+    EXPECT_EQ(e.action, ProtocolErrorAction::UNSPECIFIED);
+
+    // 非数字 code（解析失败）：映射 0（fail-closed）。
+    wire = KeyProvProtocolError{};
+    wire.code = "batch-not-found";
+    wire.action = "DO_NOT_RETRY";
+    e = keyprov_normalize_protocol_error(wire);
+    EXPECT_TRUE(e.present);
+    EXPECT_EQ(e.code, 0);
+}
+
+TEST(KeyprovAttemptTest, ProtocolErrorActionToString) {
+    EXPECT_STREQ(keyprov_protocol_error_action_to_string(
+                     ProtocolErrorAction::UNSPECIFIED),
+                 "UNSPECIFIED");
+    EXPECT_STREQ(keyprov_protocol_error_action_to_string(
+                     ProtocolErrorAction::DO_NOT_RETRY),
+                 "DO_NOT_RETRY");
+    EXPECT_STREQ(keyprov_protocol_error_action_to_string(
+                     static_cast<ProtocolErrorAction>(99)),
+                 "?");
+}
+
 int main(int argc, char** argv) {
     testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

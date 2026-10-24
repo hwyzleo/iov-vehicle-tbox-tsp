@@ -70,8 +70,15 @@ constexpr int kKeyProvPurposeUplinkValue = 1;      // KEY_PURPOSE_UPLINK_AEAD
 constexpr int kKeyProvPurposeDownlinkValue = 2;    // KEY_PURPOSE_DOWNLINK_AEAD
 constexpr int kKeyProvResultSucceeded = 1;         // KEY_PROVISIONING_RESULT_SUCCEEDED
 constexpr int kKeyProvResultRetryableFailure = 2;  // KEY_PROVISIONING_RESULT_RETRYABLE_FAILURE
-constexpr int kKeyProvStatusActive = 4;            // KEY_PROVISIONING_STATUS_ACTIVE
 constexpr int kKeyProvImportImported = 1;          // KEY_IMPORT_RESULT_IMPORTED
+// 业务开通状态（KEY_PROVISIONING_STATUS_*，VEH-PROTO §7.2 固定，v1 永久保留）。
+constexpr int kKeyProvStatusUnspecified = 0;       // KEY_PROVISIONING_STATUS_UNSPECIFIED
+constexpr int kKeyProvStatusRequested = 1;         // KEY_PROVISIONING_STATUS_REQUESTED
+constexpr int kKeyProvStatusIssued = 2;            // KEY_PROVISIONING_STATUS_ISSUED
+constexpr int kKeyProvStatusAckPending = 3;        // KEY_PROVISIONING_STATUS_ACK_PENDING
+constexpr int kKeyProvStatusActive = 4;            // KEY_PROVISIONING_STATUS_ACTIVE
+constexpr int kKeyProvStatusFailed = 5;            // KEY_PROVISIONING_STATUS_FAILED
+constexpr int kKeyProvStatusUnknown = 6;           // KEY_PROVISIONING_STATUS_UNKNOWN
 
 // 支持的封装套件（proto enum 名，VEH-PROTO §7.2 allowlist）
 constexpr const char* kKeyprovSuiteHpkeBaseX25519 =

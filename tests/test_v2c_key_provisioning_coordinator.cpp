@@ -115,9 +115,10 @@ std::vector<uint8_t> make_response_error_envelope(
 }
 
 // CR-013：StatusResponse 下行（状态对账）。
+// retryable：CR-016 判定 806099 四元组需要显式 retryable=false。
 std::vector<uint8_t> make_status_response_envelope(
     const std::string& request_id, int status, const std::string& code = "",
-    const std::string& action = "") {
+    const std::string& action = "", bool retryable = false) {
     KeyProvisioningStatusResponse msg;
     msg.set_request_id(request_id);
     msg.set_status(static_cast<KeyProvisioningStatus>(status));
@@ -126,6 +127,7 @@ std::vector<uint8_t> make_status_response_envelope(
         auto* e = msg.mutable_error();
         e->set_code(code);
         e->set_action(action);
+        e->set_retryable(retryable);
     }
     std::string payload;
     msg.SerializeToString(&payload);
@@ -1766,6 +1768,351 @@ TEST(KeyProvisioningClassifierTest, NoResidueProvenRequiresCr021Contract) {
         tbox::sec::ErrorCode::CONNECTION_FAILED, res, /*contract=*/2);
     EXPECT_EQ(evq.kind, SecImportEvidenceKind::QueryError);
     EXPECT_FALSE(evq.no_residue_proven);
+}
+
+// ============================================================
+// TBOX-TSP-DSN-CR-016 §9.1/§9.3：可释放 UNSPECIFIED 与唯一 successor
+// ============================================================
+
+// proven + UNSPECIFIED + 806099/false/DO_NOT_RETRY：
+// 恰好一次 SUPERSEDED_REMOTE，创建唯一 successor 并发送新 Request（不再永久轮询）。
+TEST_F(V2cKeyProvisioningCoordinatorTest,
+       Unspecified806099ReleasableCreatesUniqueSuccessor) {
+    sec_->status_items.clear();
+    sec_->query_state = kNotFound;  // SEC 证明无记录（proven）
+    make_ready();
+    coord_->tick();
+    std::string rid = coord_->snapshot().request_id;
+    ASSERT_FALSE(rid.empty());
+    ASSERT_EQ(coord_->snapshot().state, V2cKeyProvState::WAIT_RESPONSE);
+
+    // 首次 Request 被 806095 拒绝 -> 对账（resolution 保持 proven）。
+    coord_->handle_routed_downlink(downlink(
+        make_response_error_envelope(rid, KEY_PROVISIONING_RESULT_REJECTED, "806095")));
+    ASSERT_EQ(coord_->snapshot().state, V2cKeyProvState::RECONCILE_OLD_ATTEMPT);
+
+    // VMD 无批次：status=UNSPECIFIED + 806099 + retryable=false + DO_NOT_RETRY。
+    coord_->handle_routed_downlink(downlink(
+        make_status_response_envelope(rid, kStatusUnspecified, "806099",
+                                      "DO_NOT_RETRY")));
+    auto snap = coord_->snapshot();
+    EXPECT_EQ(snap.state, V2cKeyProvState::WAIT_RESPONSE);  // 新 attempt 已发布
+    EXPECT_NE(snap.request_id, rid);
+    EXPECT_TRUE(snap.request_id.rfind("kp-", 0) == 0);
+    EXPECT_EQ(snap.superseded_remote, 1u);
+    EXPECT_GE(snap.attempts_created, 2u);
+    // 唯一后继 digest 已生成（审计；与新 requestId 一致）。
+    EXPECT_FALSE(snap.successor_request_id_digest.empty());
+    EXPECT_EQ(snap.successor_request_id_digest,
+              tbox::fw::hash::sha256_hex(snap.request_id));
+    // 新 Request 已实际发布（冷启动现场链路：无人工介入自动收敛）。
+    int request_payloads = 0;
+    for (const auto& c : mqtt_->publish_route_calls()) {
+        if (c.route_id != "keyprov.uplink") continue;
+        VehicleMessageEnvelope env;
+        if (!env.ParseFromArray(c.payload.data(), (int)c.payload.size())) continue;
+        if (env.payload_type() == kKeyprovPayloadRequest) request_payloads++;
+    }
+    EXPECT_GE(request_payloads, 2);  // 旧 Request + successor Request
+}
+
+// 重复同一 StatusResponse / 旧 requestId 迟到响应：不产生第二个 successor。
+TEST_F(V2cKeyProvisioningCoordinatorTest,
+       Unspecified806099RepeatedResponseSingleSuccessor) {
+    sec_->status_items.clear();
+    sec_->query_state = kNotFound;
+    make_ready();
+    coord_->tick();
+    std::string rid = coord_->snapshot().request_id;
+    coord_->handle_routed_downlink(downlink(
+        make_response_error_envelope(rid, KEY_PROVISIONING_RESULT_REJECTED, "806095")));
+    coord_->handle_routed_downlink(downlink(
+        make_status_response_envelope(rid, kStatusUnspecified, "806099",
+                                      "DO_NOT_RETRY")));
+    std::string new_rid = coord_->snapshot().request_id;
+    ASSERT_NE(new_rid, rid);
+    EXPECT_EQ(coord_->snapshot().superseded_remote, 1u);
+
+    // 旧 requestId 的重复 806099 响应：迟到隔离，不建第二 successor。
+    coord_->handle_routed_downlink(downlink(
+        make_status_response_envelope(rid, kStatusUnspecified, "806099",
+                                      "DO_NOT_RETRY")));
+    auto snap = coord_->snapshot();
+    EXPECT_EQ(snap.superseded_remote, 1u);
+    EXPECT_EQ(snap.request_id, new_rid);
+    EXPECT_EQ(snap.attempts_created, 2u);
+    EXPECT_GE(snap.responses_rejected, 1u);
+}
+
+// 806099 但 retryable=true：协议不自洽，fail-closed，不得释放。
+TEST_F(V2cKeyProvisioningCoordinatorTest,
+       Unspecified806099RetryableTrueFailsClosed) {
+    sec_->status_items.clear();
+    sec_->query_state = kNotFound;
+    make_ready();
+    coord_->tick();
+    std::string rid = coord_->snapshot().request_id;
+    coord_->handle_routed_downlink(downlink(
+        make_response_error_envelope(rid, KEY_PROVISIONING_RESULT_REJECTED, "806095")));
+    coord_->handle_routed_downlink(downlink(
+        make_status_response_envelope(rid, kStatusUnspecified, "806099",
+                                      "DO_NOT_RETRY", /*retryable=*/true)));
+    auto snap = coord_->snapshot();
+    EXPECT_EQ(snap.state, V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION);
+    EXPECT_EQ(snap.blocked_reason, keyprov_blocked_reason::kSecImportNotFound);
+    EXPECT_EQ(snap.request_id, rid);
+    EXPECT_EQ(snap.superseded_remote, 0u);
+    EXPECT_EQ(snap.attempts_created, 1u);
+}
+
+// 806099 但 action 缺失 / 未知（QUERY_STATUS_LATER）：fail-closed。
+TEST_F(V2cKeyProvisioningCoordinatorTest,
+       Unspecified806099WrongActionFailsClosed) {
+    sec_->status_items.clear();
+    sec_->query_state = kNotFound;
+    make_ready();
+    coord_->tick();
+    std::string rid = coord_->snapshot().request_id;
+    coord_->handle_routed_downlink(downlink(
+        make_response_error_envelope(rid, KEY_PROVISIONING_RESULT_REJECTED, "806095")));
+    // 未知 action。
+    coord_->handle_routed_downlink(downlink(
+        make_status_response_envelope(rid, kStatusUnspecified, "806099",
+                                      "QUERY_STATUS_LATER")));
+    auto snap = coord_->snapshot();
+    EXPECT_EQ(snap.state, V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION);
+    EXPECT_EQ(snap.superseded_remote, 0u);
+    EXPECT_EQ(snap.attempts_created, 1u);
+    EXPECT_EQ(snap.request_id, rid);
+    // action 缺失（空）：同样 fail-closed。
+    coord_->handle_routed_downlink(downlink(
+        make_status_response_envelope(rid, kStatusUnspecified, "806099", "")));
+    snap = coord_->snapshot();
+    EXPECT_EQ(snap.state, V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION);
+    EXPECT_EQ(snap.superseded_remote, 0u);
+    EXPECT_EQ(snap.attempts_created, 1u);
+}
+
+// UNSPECIFIED 但 error 缺失（无 806099）：fail-closed，不得当作可释放终态。
+TEST_F(V2cKeyProvisioningCoordinatorTest,
+       UnspecifiedWithoutErrorFailsClosed) {
+    sec_->status_items.clear();
+    sec_->query_state = kNotFound;
+    make_ready();
+    coord_->tick();
+    std::string rid = coord_->snapshot().request_id;
+    coord_->handle_routed_downlink(downlink(
+        make_response_error_envelope(rid, KEY_PROVISIONING_RESULT_REJECTED, "806095")));
+    coord_->handle_routed_downlink(downlink(
+        make_status_response_envelope(rid, kStatusUnspecified)));  // 无 error
+    auto snap = coord_->snapshot();
+    EXPECT_EQ(snap.state, V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION);
+    EXPECT_EQ(snap.blocked_reason, keyprov_blocked_reason::kSecImportNotFound);
+    EXPECT_EQ(snap.superseded_remote, 0u);
+    EXPECT_EQ(snap.attempts_created, 1u);
+    EXPECT_EQ(snap.request_id, rid);
+}
+
+// UNSPECIFIED 但 code 非 806099：fail-closed（不做 message 文本匹配）。
+TEST_F(V2cKeyProvisioningCoordinatorTest,
+       UnspecifiedNon806099CodeFailsClosed) {
+    sec_->status_items.clear();
+    sec_->query_state = kNotFound;
+    make_ready();
+    coord_->tick();
+    std::string rid = coord_->snapshot().request_id;
+    coord_->handle_routed_downlink(downlink(
+        make_response_error_envelope(rid, KEY_PROVISIONING_RESULT_REJECTED, "806095")));
+    coord_->handle_routed_downlink(downlink(
+        make_status_response_envelope(rid, kStatusUnspecified, "804010",
+                                      "DO_NOT_RETRY")));
+    auto snap = coord_->snapshot();
+    EXPECT_EQ(snap.state, V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION);
+    EXPECT_EQ(snap.superseded_remote, 0u);
+    EXPECT_EQ(snap.attempts_created, 1u);
+    EXPECT_EQ(snap.request_id, rid);
+}
+
+// UNRESOLVED（import invocation 未稳定化）：即使完整 806099 四元组也不释放。
+TEST_F(V2cKeyProvisioningCoordinatorTest,
+       UnresolvedBlocks806099Release) {
+    sec_->status_items.clear();
+    make_ready();
+    coord_->tick();
+    std::string rid = coord_->snapshot().request_id;
+    // 调用 SEC import（结果待定）-> UNRESOLVED。
+    coord_->handle_routed_downlink(downlink(make_response_envelope(rid)));
+    sec_->import_state = kImportUnknown;
+    sec_->import_error_code = kUnknownErr;
+    coord_->tick();
+    ASSERT_TRUE(coord_->snapshot().import_invocation_recorded);
+    EXPECT_EQ(coord_->snapshot().import_invocation_resolution, "UNRESOLVED");
+
+    sleep_ms(60);
+    coord_->tick();  // -> WAIT_RESPONSE
+    coord_->handle_routed_downlink(downlink(
+        make_response_error_envelope(rid, KEY_PROVISIONING_RESULT_REJECTED, "806095")));
+    EXPECT_EQ(coord_->snapshot().state, V2cKeyProvState::RECONCILE_OLD_ATTEMPT);
+
+    // SEC NOT_FOUND -> 稳定化计数（UNRESOLVED 未 proven）；806099 不释放。
+    sec_->query_state = kNotFound;
+    coord_->handle_routed_downlink(downlink(
+        make_status_response_envelope(rid, kStatusUnspecified, "806099",
+                                      "DO_NOT_RETRY")));
+    auto snap = coord_->snapshot();
+    EXPECT_GE(snap.sec_not_found_count, 1u);
+    EXPECT_NE(snap.import_invocation_resolution, "NO_SIDE_EFFECT_PROVEN");
+    EXPECT_EQ(snap.superseded_remote, 0u);
+    EXPECT_EQ(snap.attempts_created, 1u);
+    EXPECT_EQ(snap.request_id, rid);
+}
+
+// SEC outcome unknown：即使完整 806099 四元组也不释放；SEC 恢复 proven 后才释放。
+TEST_F(V2cKeyProvisioningCoordinatorTest,
+       SecUnknownBlocks806099UntilProven) {
+    sec_->status_items.clear();
+    make_ready();
+    coord_->tick();
+    std::string rid = coord_->snapshot().request_id;
+    coord_->handle_routed_downlink(downlink(
+        make_response_error_envelope(rid, KEY_PROVISIONING_RESULT_REJECTED, "806095")));
+    EXPECT_EQ(coord_->snapshot().state, V2cKeyProvState::RECONCILE_OLD_ATTEMPT);
+
+    // SEC outcome unknown：806099 不得释放。
+    sec_->query_error_code = kUnknownErr;
+    coord_->handle_routed_downlink(downlink(
+        make_status_response_envelope(rid, kStatusUnspecified, "806099",
+                                      "DO_NOT_RETRY")));
+    auto snap = coord_->snapshot();
+    EXPECT_EQ(snap.state, V2cKeyProvState::RECONCILE_OLD_ATTEMPT);
+    EXPECT_EQ(snap.blocked_reason, keyprov_blocked_reason::kSecOutcomeUnknown);
+    EXPECT_EQ(snap.superseded_remote, 0u);
+    EXPECT_EQ(snap.attempts_created, 1u);
+    EXPECT_EQ(snap.request_id, rid);
+
+    // SEC 恢复 NOT_FOUND（proven）后同一 806099 响应才释放。
+    sec_->query_error_code = 0;
+    sec_->query_state = kNotFound;
+    coord_->handle_routed_downlink(downlink(
+        make_status_response_envelope(rid, kStatusUnspecified, "806099",
+                                      "DO_NOT_RETRY")));
+    snap = coord_->snapshot();
+    EXPECT_EQ(snap.state, V2cKeyProvState::WAIT_RESPONSE);
+    EXPECT_NE(snap.request_id, rid);
+    EXPECT_EQ(snap.superseded_remote, 1u);
+}
+
+// 崩溃点：supersede 已持久化（旧 record 终态化 + successor 已落盘）、新 record
+// 未创建。重启后必须复用同一 successor，不生成第二个 requestId（CR-016 §6.2/§9.2）。
+TEST_F(V2cKeyProvisioningCoordinatorTest,
+       RestartAfterSupersedePersistRestoresSameSuccessor) {
+    {
+        hwyz::store::Store raw = hwyz::store::Store::open("tsp", store_root_);
+        nlohmann::json j = nlohmann::json::object();
+        j["schema_version"] = 4;
+        j["fingerprint_version"] = 1;
+        j["attempt_fingerprint"] = std::string(64, 'a');
+        j["request_id"] = "kp-old";
+        j["idempotency_digest"] = "deadbeef";
+        j["state"] = "SUPERSEDED_REMOTE";
+        j["submission"] = keyprov_submission::kSubmitted;
+        j["import_invocation"] = false;
+        j["import_invocation_resolution"] =
+            static_cast<int>(ImportInvocationResolution::NO_SIDE_EFFECT_PROVEN);
+        j["store_generation"] = 1;
+        j["successor_request_id"] = "kp-pre";
+        j["successor_request_id_digest"] =
+            tbox::fw::hash::sha256_hex("kp-pre");
+        nlohmann::json snap = nlohmann::json::object();
+        snap["business_domain"] = kKeyprovBusinessDomainV2c;
+        snap["purposes"] = nlohmann::json::array({1, 2});
+        snap["current_versions"] = nlohmann::json::array();
+        snap["device_identity_digest"] = std::string(64, 'a');
+        snap["recipient_certificate_digest"] = std::string(64, 'a');
+        snap["certificate_ref_digest"] = std::string(64, 'a');
+        snap["wrapping_suites"] = nlohmann::json::array({2});
+        snap["envelope_formats"] = nlohmann::json::array({1});
+        snap["protocol_lock_digest"] = std::string(64, 'a');
+        j["snapshot"] = snap;
+        raw.save<std::string>("keyprov.v2c.attempt.v2", j.dump());
+        raw.flush();
+    }
+    coord_->stop();
+    coord_ = std::make_unique<V2cKeyProvisioningCoordinator>(mqtt_, sec_, store_);
+    coord_->set_clock_sync_check([this] { return clock_synced_; });
+    ASSERT_TRUE(coord_->initialize(cfg_));
+    ASSERT_TRUE(coord_->start(false));
+    sec_->status_items.clear();
+    make_ready();
+    coord_->tick();  // SUPERSEDED_REMOTE -> create_new_attempt：复用 kp-pre
+
+    auto snap = coord_->snapshot();
+    EXPECT_EQ(snap.state, V2cKeyProvState::WAIT_RESPONSE);
+    EXPECT_EQ(snap.request_id, "kp-pre");  // 复用同一 successor
+    EXPECT_GE(snap.attempts_created, 1u);
+    EXPECT_EQ(snap.successor_request_id_digest,
+              tbox::fw::hash::sha256_hex("kp-pre"));
+    // 发布的新 Request 必须携带复用后的 requestId。
+    bool saw_pre_request = false;
+    for (const auto& c : mqtt_->publish_route_calls()) {
+        if (c.route_id != "keyprov.uplink") continue;
+        if (c.request_id == "kp-pre") saw_pre_request = true;
+    }
+    EXPECT_TRUE(saw_pre_request);
+}
+
+// 冷启动现场：proven record 恢复 + VMD 对不存在批次返回 806099
+// -> 自动新 Request（无人工介入），原 requestId 停止持续轮询。
+TEST_F(V2cKeyProvisioningCoordinatorTest,
+       ColdStartProvenRecordWith806099CreatesNewAttempt) {
+    {
+        hwyz::store::Store raw = hwyz::store::Store::open("tsp", store_root_);
+        nlohmann::json j = nlohmann::json::object();
+        j["schema_version"] = 4;
+        j["fingerprint_version"] = 1;
+        j["attempt_fingerprint"] = std::string(64, 'b');
+        j["request_id"] = "kp-cold";
+        j["idempotency_digest"] = "cafe";
+        j["state"] = "RECONCILE_REMOTE";
+        j["submission"] = keyprov_submission::kSubmitted;
+        j["import_invocation"] = false;
+        j["import_invocation_resolution"] =
+            static_cast<int>(ImportInvocationResolution::NO_SIDE_EFFECT_PROVEN);
+        j["store_generation"] = 1;
+        nlohmann::json snap = nlohmann::json::object();
+        snap["business_domain"] = kKeyprovBusinessDomainV2c;
+        snap["purposes"] = nlohmann::json::array({1, 2});
+        snap["current_versions"] = nlohmann::json::array();
+        snap["device_identity_digest"] = std::string(64, 'a');
+        snap["recipient_certificate_digest"] = std::string(64, 'a');
+        snap["certificate_ref_digest"] = std::string(64, 'a');
+        snap["wrapping_suites"] = nlohmann::json::array({2});
+        snap["envelope_formats"] = nlohmann::json::array({1});
+        snap["protocol_lock_digest"] = std::string(64, 'a');
+        j["snapshot"] = snap;
+        raw.save<std::string>("keyprov.v2c.attempt.v2", j.dump());
+        raw.flush();
+    }
+    coord_->stop();
+    coord_ = std::make_unique<V2cKeyProvisioningCoordinator>(mqtt_, sec_, store_);
+    coord_->set_clock_sync_check([this] { return clock_synced_; });
+    ASSERT_TRUE(coord_->initialize(cfg_));
+    ASSERT_TRUE(coord_->start(false));
+    sec_->status_items.clear();
+    sec_->query_state = kNotFound;
+    make_ready();
+    coord_->tick();  // RECONCILE_REMOTE -> SEC NOT_FOUND proven -> 发 StatusRequest
+
+    // VMD 无批次：UNSPECIFIED + 806099/false/DO_NOT_RETRY -> 释放并新建 attempt。
+    coord_->handle_routed_downlink(downlink(
+        make_status_response_envelope("kp-cold", kStatusUnspecified, "806099",
+                                      "DO_NOT_RETRY")));
+    auto snap = coord_->snapshot();
+    EXPECT_EQ(snap.state, V2cKeyProvState::WAIT_RESPONSE);
+    EXPECT_NE(snap.request_id, "kp-cold");
+    EXPECT_EQ(snap.superseded_remote, 1u);
+    // 原 requestId 轮询终止：无 806099 持续 StatusRequest 风暴。
+    EXPECT_GE(snap.status_requests_sent, 1u);
 }
 
 

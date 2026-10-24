@@ -28,12 +28,6 @@ constexpr const char* kCapabilityKeyprov = "security.keyprov";
 constexpr const char* kTimesyncDir = "/run/systemd/timesync";
 constexpr const char* kTimesyncMarker = "/run/systemd/timesync/synchronized";
 
-constexpr int kKeyProvStatusFailed = 5;   // KEY_PROVISIONING_STATUS_FAILED
-constexpr int kKeyProvStatusUnspecified = 0;  // KEY_PROVISIONING_STATUS_UNSPECIFIED
-constexpr int kKeyProvStatusRequested = 1;
-constexpr int kKeyProvStatusIssued = 2;
-constexpr int kKeyProvStatusAckPending = 3;
-
 // 默认时钟同步判定：仅在 systemd-timesyncd 存在的平台上启用门禁
 // （无该目录的开发机/CI 不阻塞 keyprov）。
 bool default_clock_synchronized() {
@@ -866,6 +860,7 @@ void V2cKeyProvisioningCoordinator::create_new_attempt_locked() {
     stab_ = SecNotFoundStabilization{};
     recovery_phase_.clear();
     cached_vmd_status_ = -1;
+    cached_vmd_error_ = CloudProtocolError{};  // CR-016：随状态一起重置
     sec_not_found_first_observed_wall_ms_ = -1;
     sec_not_found_last_observed_wall_ms_ = -1;
     last_sec_evidence_kind_ = SecImportEvidenceKind::ContractUnknown;
@@ -1133,9 +1128,13 @@ void V2cKeyProvisioningCoordinator::do_reconcile_locked() {
         return;
     }
     // 2) proven 且已缓存 VMD 终态：立即执行完整云端决策矩阵（不等待新一轮 Status）。
+    //    释放判定同时消费缓存的状态与规范化错误四元组（CR-016 §23.1）。
     if (resolution_ == ImportInvocationResolution::NO_SIDE_EFFECT_PROVEN &&
         cached_vmd_status_ >= 0) {
-        apply_cloud_matrix_locked(cached_vmd_status_);
+        CloudStatusDecisionInput in;
+        in.status = cached_vmd_status_;
+        in.error = cached_vmd_error_;
+        apply_cloud_matrix_locked(in);
         return;
     }
     // 3) 无已提交副作用：以原 requestId 查 VMD Status 确认批次事实
@@ -1176,7 +1175,9 @@ void V2cKeyProvisioningCoordinator::handle_reconcile_status_locked(
     if (action != ReconcileAction::ALLOW_READONLY_REMOTE) return;
 
     // 稳定化期间只读缓存最近 VMD 观测（proven 后用于云端矩阵；不写盘风暴抑制）。
+    // CR-016：释放判定必须同时匹配 status 与错误四元组，故缓存规范化错误。
     cached_vmd_status_ = status.status;
+    cached_vmd_error_ = keyprov_normalize_protocol_error(status.error);
 
     // ACTIVE/SUCCEEDED：无论是否 proven 均不得重开（云端事实与件内事实分裂，
     // 自动创建新 attempt 可能覆盖业务版本/制造第二批次）-> AWAIT_REMOTE_REPAIR，
@@ -1201,43 +1202,58 @@ void V2cKeyProvisioningCoordinator::handle_reconcile_status_locked(
             status.status == kKeyProvStatusFailed) {
             enter_reconcile_evidence_locked("vmd_terminated_resume_stabilization");
         } else if (!reconcile_obs_suppressed_locked(
-                       status.status, last_sec_evidence_kind_)) {
+                       status.status, last_sec_evidence_kind_,
+                       cached_vmd_error_.code,
+                       static_cast<int>(cached_vmd_error_.action))) {
             // 退避已由 reconcile_sec_journal 调度，此处仅持久化（相同三元组抑制）。
             persist_locked();
         }
         return;
     }
 
-    // proven 且 SEC 已确认 NOT_FOUND：完整云端决策矩阵（§22.6）。
-    apply_cloud_matrix_locked(status.status);
+    // proven 且 SEC 已确认 NOT_FOUND：完整云端决策矩阵（§22.6/§23.3）。
+    // CR-016：矩阵输入同时携带 status 与规范化 ProtocolError（REQ-009）。
+    CloudStatusDecisionInput in;
+    in.status = status.status;
+    in.error = cached_vmd_error_;
+    apply_cloud_matrix_locked(in);
 }
 
-// CR-015 §22.6：完整云端决策矩阵（仅 proven + SEC NOT_FOUND 时释放；
-// FAILED 预生成唯一 successor）。
-void V2cKeyProvisioningCoordinator::apply_cloud_matrix_locked(int vmd_status) {
+// CR-015 §22.6 / CR-016 §23.3：完整云端决策矩阵（仅 proven + SEC NOT_FOUND 时释放；
+// FAILED 与“明确可释放 UNSPECIFIED”共用 CAS supersede + 唯一 successor）。
+void V2cKeyProvisioningCoordinator::apply_cloud_matrix_locked(
+    const CloudStatusDecisionInput& in) {
     if (resolution_ != ImportInvocationResolution::NO_SIDE_EFFECT_PROVEN ||
         sec_outcome_unknown_) {
         // 非 proven 或 SEC 未确认 NOT_FOUND：不 supersede（REQ-005：任一
         // UNKNOWN 或矛盾证据优先于已累计计数）。
         return;
     }
-    switch (vmd_status) {
+    switch (in.status) {
         case kKeyProvStatusFailed: {
-            // VMD 已终结（FAILED）——当前协议唯一被认可的可释放终态。
-            // 预生成唯一 successor（幂等恢复：崩溃后重启复用同一 requestId），
-            // 原子终态化旧 record，带 supersedesRequestId 创建新 record。
-            counters_.superseded_remote++;
-            record_.last_error = "vmd_batch_terminated";
-            if (successor_request_id_.empty()) {
-                successor_request_id_ = generate_id("kp");
-                successor_request_id_digest_ =
-                    tbox::fw::hash::sha256_hex(
-                        std::string_view(successor_request_id_));
+            // VMD 已终结（FAILED）——既有可释放终态。
+            supersede_remote_once_locked();
+            return;
+        }
+        case kKeyProvStatusUnspecified: {
+            // CR-016：仅严格子集（UNSPECIFIED + 806099 + false + DO_NOT_RETRY）
+            // 且 SEC proven 时才释放；其余 UNSPECIFIED 一律 fail-closed
+            // （不得把任意未知状态当云端终态）。
+            if (is_releasable_unspecified_locked(in)) {
+                supersede_remote_once_locked();
+            } else {
+                blocked_reason_ = keyprov_blocked_reason::kSecImportNotFound;
+                transition_to_locked(
+                    V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION);
+                schedule_status_retry_locked();
+                if (!reconcile_obs_suppressed_locked(
+                        in.status, last_sec_evidence_kind_, in.error.code,
+                        static_cast<int>(in.error.action))) {
+                    count_blocked_reason_locked(
+                        keyprov_blocked_reason::kSecImportNotFound);
+                    persist_locked();
+                }
             }
-            cached_vmd_status_ = -1;  // 已消费：避免同轮/后续重复触发 supersede
-            state_ = V2cKeyProvState::SUPERSEDED_REMOTE;
-            persist_locked();
-            create_new_attempt_locked();
             return;
         }
         case kKeyProvStatusActive: {
@@ -1259,36 +1275,23 @@ void V2cKeyProvisioningCoordinator::apply_cloud_matrix_locked(int vmd_status) {
                 V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION);
             schedule_status_retry_locked();
             if (!reconcile_obs_suppressed_locked(
-                    vmd_status, last_sec_evidence_kind_)) {
+                    in.status, last_sec_evidence_kind_, in.error.code,
+                    static_cast<int>(in.error.action))) {
                 count_blocked_reason_locked(
                     keyprov_blocked_reason::kSecImportNotFound);
                 persist_locked();
             }
             return;
         }
-        case kKeyProvStatusUnspecified: {
-            // UNSPECIFIED 无协议冻结语义证明“批次不存在/已终结并释放”：
-            // 一律 fail-closed（用户裁决），不得当作可释放终态。
-            blocked_reason_ = keyprov_blocked_reason::kSecImportNotFound;
-            transition_to_locked(
-                V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION);
-            schedule_status_retry_locked();
-            if (!reconcile_obs_suppressed_locked(
-                    vmd_status, last_sec_evidence_kind_)) {
-                count_blocked_reason_locked(
-                    keyprov_blocked_reason::kSecImportNotFound);
-                persist_locked();
-            }
-            return;
-        }
-        case 6:  // KEY_PROVISIONING_STATUS_UNKNOWN
+        case kKeyProvStatusUnknown:
         default: {
             // VMD 状态未知：非终态，SEC NOT_FOUND 不足以覆盖 VMD 未知。
             blocked_reason_ = keyprov_blocked_reason::kVmdOutcomeUnknown;
             transition_to_locked(V2cKeyProvState::RECONCILE_REMOTE);
             schedule_status_retry_locked();
             if (!reconcile_obs_suppressed_locked(
-                    vmd_status, last_sec_evidence_kind_)) {
+                    in.status, last_sec_evidence_kind_, in.error.code,
+                    static_cast<int>(in.error.action))) {
                 count_blocked_reason_locked(
                     keyprov_blocked_reason::kVmdOutcomeUnknown);
                 persist_locked();
@@ -1296,6 +1299,39 @@ void V2cKeyProvisioningCoordinator::apply_cloud_matrix_locked(int vmd_status) {
             return;
         }
     }
+}
+
+// CR-016 §4.2/§23.2：UNSPECIFIED 可释放判定（严格子集，任一条件不满足即 false）。
+bool V2cKeyProvisioningCoordinator::is_releasable_unspecified_locked(
+    const CloudStatusDecisionInput& in) const {
+    return resolution_ == ImportInvocationResolution::NO_SIDE_EFFECT_PROVEN &&
+           !sec_outcome_unknown_ &&
+           in.status == kKeyProvStatusUnspecified &&
+           in.error.present &&
+           in.error.code == kKeyProvErrorCodeNotFound &&
+           !in.error.retryable &&
+           in.error.action == ProtocolErrorAction::DO_NOT_RETRY;
+}
+
+// CR-016 §6.3/§23.5：终态化旧 attempt 并创建唯一 successor。
+// - successor_request_id_ 为空才生成新 kp-*；非空（崩溃发生在 supersede persist
+//   与 create 之间）时复用同一 ID，不得生成第二个 requestId；
+// - 成功创建后清空内存 successor 但保留 digest（审计：本 attempt 是唯一后继）；
+// - CAS/恢复一致性由 create_new_attempt_locked（单写执行域 + 原子 Store commit）承担。
+void V2cKeyProvisioningCoordinator::supersede_remote_once_locked() {
+    counters_.superseded_remote++;
+    record_.last_error = "vmd_batch_terminated";
+    if (successor_request_id_.empty()) {
+        successor_request_id_ = generate_id("kp");
+        successor_request_id_digest_ =
+            tbox::fw::hash::sha256_hex(
+                std::string_view(successor_request_id_));
+    }
+    cached_vmd_status_ = -1;  // 已消费：避免同轮/后续重复触发 supersede
+    cached_vmd_error_ = CloudProtocolError{};
+    state_ = V2cKeyProvState::SUPERSEDED_REMOTE;
+    persist_locked();
+    create_new_attempt_locked();
 }
 
 void V2cKeyProvisioningCoordinator::transition_to_locked(
@@ -1342,19 +1378,24 @@ void V2cKeyProvisioningCoordinator::count_blocked_reason_locked(
     counters_.blocked_reasons_total[key]++;
 }
 
-// CR-014 §21.5：相同三元组 {vmd_state, sec_evidence, store_generation} 不重复
-// 写盘/计数/刷日志。vmd_status 编码：-1=SEC 阶段（VMD 未知），-3=BLOCKED
-// EVIDENCE_CONFLICT 周期重查；>=0 为 VMD Status 数值。
+// CR-014 §21.5 / CR-016 §23.6：相同 {vmd_state, error_tuple, sec_evidence,
+// store_generation} 不重复写盘/计数/刷日志。vmd_status 编码：-1=SEC 阶段
+// （VMD 未知），-3=BLOCKED EVIDENCE_CONFLICT 周期重查；>=0 为 VMD Status 数值。
+// error_code/error_action 为规范化错误（SEC 阶段无 error 时默认 0/-1）。
 bool V2cKeyProvisioningCoordinator::reconcile_obs_suppressed_locked(
-    int vmd_status, SecImportEvidenceKind kind) {
+    int vmd_status, SecImportEvidenceKind kind, int error_code,
+    int error_action) {
     if (last_obs_valid_ && last_obs_vmd_status_ == vmd_status &&
-        last_obs_kind_ == kind &&
+        last_obs_kind_ == kind && last_obs_error_code_ == error_code &&
+        last_obs_error_action_ == error_action &&
         last_obs_generation_ == store_generation_) {
         return true;
     }
     last_obs_valid_ = true;
     last_obs_vmd_status_ = vmd_status;
     last_obs_kind_ = kind;
+    last_obs_error_code_ = error_code;
+    last_obs_error_action_ = error_action;
     last_obs_generation_ = store_generation_;
     return false;
 }

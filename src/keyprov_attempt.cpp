@@ -377,6 +377,39 @@ AttemptChangeDimension keyprov_attempt_change_dimension(
 }
 
 // ============================================================
+// TBOX-TSP-DSN-CR-016 §4.1/§23.1：云端错误规范化（fail-closed）
+// ============================================================
+CloudProtocolError keyprov_normalize_protocol_error(
+    const KeyProvProtocolError& wire) {
+    CloudProtocolError out;
+    // present = 错误对象携带了稳定 code（缺失/默认 error 视为未携带）。
+    if (wire.code.empty()) {
+        return out;
+    }
+    out.present = true;
+    // code：只识别 canonical 806099；其余数值/文本一律映射 0（不可释放），
+    // 不做 message 文本匹配、不解析任意数字（未知/解析失败 fail-closed）。
+    if (wire.code == "806099") {
+        out.code = kKeyProvErrorCodeNotFound;
+    }
+    out.retryable = wire.retryable;
+    // action：只识别 DO_NOT_RETRY；空/未知 action（如 QUERY_STATUS_LATER、
+    // KEYPROV_IDEMPOTENCY_CONFLICT 或任意新值）一律 UNSPECIFIED（fail-closed）。
+    if (wire.action == "DO_NOT_RETRY") {
+        out.action = ProtocolErrorAction::DO_NOT_RETRY;
+    }
+    return out;
+}
+
+const char* keyprov_protocol_error_action_to_string(ProtocolErrorAction a) {
+    switch (a) {
+        case ProtocolErrorAction::UNSPECIFIED: return "UNSPECIFIED";
+        case ProtocolErrorAction::DO_NOT_RETRY: return "DO_NOT_RETRY";
+        default: return "?";
+    }
+}
+
+// ============================================================
 // 806095 / 幂等冲突分类器（用户裁决口径）
 // ============================================================
 bool keyprov_is_idempotency_conflict(const KeyProvProtocolError& error) {

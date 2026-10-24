@@ -238,9 +238,12 @@ private:
     void mark_submitted_locked();
     void mark_confirmed_locked();
     void bump_store_generation_locked();
-    // CR-014 §21.5：对账保持路径的三元组抑制（相同则跳过写盘/计数，返回 true）。
+    // CR-014 §21.5：对账保持路径的四元组抑制（相同则跳过写盘/计数，返回 true）。
+    // CR-016 §23.6：抑制键扩展 error_tuple（code/action），缺省适配 SEC 阶段。
     bool reconcile_obs_suppressed_locked(int vmd_status,
-                                         SecImportEvidenceKind kind);
+                                         SecImportEvidenceKind kind,
+                                         int error_code = 0,
+                                         int error_action = -1);
     // ---- CR-015 §22.5：SEC NOT_FOUND 稳定化辅助 ----
     // 当前 resolution 是否已证明无副作用（NO_SIDE_EFFECT_PROVEN 且无相反本地证据）。
     bool no_side_effects_proven_locked() const;
@@ -263,8 +266,15 @@ private:
     void enter_hard_blocked_locked(const char* reason);
     // 进入证据对账（稳定化入口；旧 EVIDENCE_CONFLICT 恢复点）。
     void enter_reconcile_evidence_locked(const char* reason);
-    // 完整云端决策矩阵（resolution proven 后执行；vmd_status 为最近观测 VMD 状态）。
-    void apply_cloud_matrix_locked(int vmd_status);
+    // 完整云端决策矩阵（resolution proven 后执行；input 为最近观测 VMD
+    // status + 规范化 ProtocolError）。
+    void apply_cloud_matrix_locked(const CloudStatusDecisionInput& in);
+    // CR-016 §4.2/§23.2：UNSPECIFIED + 806099/false/DO_NOT_RETRY 严格子集判定。
+    bool is_releasable_unspecified_locked(
+        const CloudStatusDecisionInput& in) const;
+    // CR-016 §6.3/§23.5：终态化旧 attempt 并创建唯一 successor（幂等恢复：
+    // 已存在 successor 时只恢复，不重复生成）。
+    void supersede_remote_once_locked();
     // StatusRequest 专用退避（1s、2s、4s…max，有界+抖动）。
     void schedule_status_retry_locked();
     // 更新 SEC capability epoch（TSP 本地生成：查询失败→成功、契约版本变化、
@@ -350,6 +360,9 @@ private:
     SecNotFoundStabilization stab_;
     std::string recovery_phase_;      // keyprov_recovery_phase::*（诊断）
     int cached_vmd_status_ = -1;      // 稳定化期间缓存的最新 VMD Status（-1=无）
+    // CR-016：与 cached_vmd_status_ 配对的规范化错误（释放判定必须同时匹配
+    // status 与错误四元组；无 error 时 present=false 保持 fail-closed）。
+    CloudProtocolError cached_vmd_error_;
     // 唯一后继 requestId（supersede 幂等恢复：预生成后持久化）。
     std::string successor_request_id_;
     std::string successor_request_id_digest_;
@@ -368,6 +381,9 @@ private:
     bool last_obs_valid_ = false;
     int last_obs_vmd_status_ = -1;
     SecImportEvidenceKind last_obs_kind_ = SecImportEvidenceKind::ContractUnknown;
+    // CR-016：抑制键的 error 维度（-1=未观测到 error，SEC 阶段）。
+    int last_obs_error_code_ = 0;
+    int last_obs_error_action_ = -1;
     uint64_t last_obs_generation_ = 0;
     // SEC outcome unknown 连续轮次（>= max_attempts_before_alert 时告警一次）。
     uint32_t sec_unknown_rounds_ = 0;
