@@ -52,6 +52,12 @@ enum class SecImportEvidenceKind : uint8_t {
 
 const char* sec_import_evidence_kind_to_string(SecImportEvidenceKind k);
 
+// TBOX-TSP-DSN-CR-015 §6.1：支持 CR-021 精确 NOT_FOUND 语义所需的最低
+// SEC capability 契约版本（TBOX-SEC-DSN-CR-021 在 kContractVersion=2 中引入
+// NOT_FOUND additive 值 5 与“无残留检查”语义）。旧 SEC 的 UNKNOWN/低版本
+// NOT_FOUND 不得派生 no_residue_proven。
+constexpr uint32_t kSecCr021NotFoundContractVersion = 2;
+
 struct SecImportEvidence {
     SecImportEvidenceKind kind = SecImportEvidenceKind::ContractUnknown;
     // 观测时 capability 快照的契约版本；查询失败/无法确认记 0=UNKNOWN。
@@ -62,6 +68,9 @@ struct SecImportEvidence {
     bool import_invocation_recorded = false;  // 已调用 SEC import API
     bool pending_callback = false;            // import 结果待定（回调待收敛）
     int raw_import_state = -1;                // 原始 SEC state 数值（诊断保留，-1=无）
+    // CR-015：仅“新 SEC + 强类型 NOT_FOUND + capability/contract 匹配”时由
+    // adapter 派生（不新增 wire 字段）；旧 SEC 的 UNKNOWN 不得派生该值。
+    bool no_residue_proven = false;
 };
 
 // SEC import result 分类（实现位于 sec_business_key_adapter.cpp）。

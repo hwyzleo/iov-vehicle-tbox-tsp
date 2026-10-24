@@ -474,6 +474,137 @@ TEST(KeyProvisioningIntegrationTest, IdempotencyConflictEndToEnd) {
     coord.stop();
 }
 
+// ============================================================
+// TBOX-TSP-DSN-CR-015：SEC NOT_FOUND 稳定化端到端（现场验收链路）
+//   从未成功导入 + import invocation 已落盘 -> 强 NOT_FOUND 稳定化（N=3）
+//   -> proven -> VMD FAILED -> 唯一新 attempt -> Response -> COMMITTED -> ACK -> ACTIVE。
+// ============================================================
+TEST(KeyProvisioningIntegrationTest, SecNotFoundStabilizationEndToEnd) {
+    auto mqtt = std::make_shared<MockMqttFacade>();
+    auto sec = std::make_shared<FakeSecClient>();
+    std::string store_root = temp_root("cr15");
+    auto store = std::make_shared<V2cKeyProvisioningStore>(store_root);
+    V2cKeyProvisioningConfig cfg;
+    cfg.enabled = true;
+    cfg.request_timeout_ms = 500;
+    cfg.ack_timeout_ms = 500;
+    cfg.retry_initial_ms = 10;
+    cfg.retry_max_ms = 40;
+    cfg.status_request_initial_interval_ms = 10;
+    cfg.status_request_max_interval_ms = 40;
+    cfg.not_found_stabilization_count = 3;
+    cfg.not_found_stabilization_window_ms = 10;
+    V2cKeyProvisioningCoordinator coord(mqtt, sec, store);
+    coord.set_clock_sync_check([] { return true; });
+    ASSERT_TRUE(coord.initialize(cfg));
+    ASSERT_TRUE(coord.start(false));
+    sec->status_items.clear();
+    make_ready(mqtt);
+    coord.tick();
+    std::string rid = coord.snapshot().request_id;
+    ASSERT_FALSE(rid.empty());
+
+    // 进入导入：结果未知（invocation 已记录 -> resolution=UNRESOLVED）。
+    coord.handle_routed_downlink(downlink(make_response(rid)));
+    sec->import_error_code = 1024;  // ErrorCode::BUSINESS_KEY_IMPORT_UNKNOWN
+    sec->import_state = 4;          // BusinessKeyImportState::UNKNOWN
+    coord.tick();
+    ASSERT_EQ(sec->import_calls, 1);
+    EXPECT_EQ(coord.snapshot().import_invocation_resolution, "UNRESOLVED");
+
+    // 退避后重发 Request，被 806095 拒绝 -> 对账（import 证据仍在）。
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    coord.tick();  // RETRY_WAIT -> CHECKING -> REQUESTING -> WAIT_RESPONSE
+    KeyProvisioningResponse resp;
+    resp.set_request_id(rid);
+    resp.set_result(KEY_PROVISIONING_RESULT_REJECTED);
+    resp.mutable_error()->set_code("806095");
+    std::string rpayload;
+    resp.SerializeToString(&rpayload);
+    VehicleMessageEnvelope renv;
+    renv.set_request_id(rid);
+    renv.set_protocol_version("keyprov-v1");
+    renv.set_service("security.keyprov");
+    renv.set_payload_type(kKeyprovPayloadResponse);
+    renv.set_message_kind(MESSAGE_KIND_RESPONSE);
+    renv.set_message_id("r1");
+    renv.set_payload(rpayload);
+    std::string rs;
+    renv.SerializeToString(&rs);
+    RoutedDownlinkEvent de;
+    de.owner = "tsp";
+    de.route_id = "keyprov.downlink";
+    de.target = "tsp.keyprov";
+    de.payload = std::vector<uint8_t>(rs.begin(), rs.end());
+    coord.handle_routed_downlink(de);
+    EXPECT_EQ(coord.snapshot().state, V2cKeyProvState::RECONCILE_OLD_ATTEMPT);
+
+    // SEC 强 NOT_FOUND 稳定化：count=1 -> count=2 -> count=3（窗口满足）-> proven。
+    sec->query_state = 5;  // NOT_FOUND
+    sec->query_error_code = 0;
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    coord.tick();
+    EXPECT_EQ(coord.snapshot().sec_not_found_count, 1u);
+    EXPECT_EQ(coord.snapshot().state, V2cKeyProvState::STABILIZING_NOT_FOUND);
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    coord.tick();
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    coord.tick();
+    auto snap = coord.snapshot();
+    EXPECT_EQ(snap.import_invocation_resolution, "NO_SIDE_EFFECT_PROVEN");
+    EXPECT_EQ(snap.state, V2cKeyProvState::RECONCILE_REMOTE);
+    EXPECT_EQ(snap.superseded_remote, 0u);
+
+    // VMD FAILED -> 释放 -> 唯一新 attempt（新 requestId，supersedes 关联持久化）。
+    KeyProvisioningStatusResponse st;
+    st.set_request_id(rid);
+    st.set_status(KEY_PROVISIONING_STATUS_FAILED);
+    std::string spayload;
+    st.SerializeToString(&spayload);
+    VehicleMessageEnvelope senv;
+    senv.set_request_id(rid);
+    senv.set_protocol_version("keyprov-v1");
+    senv.set_service("security.keyprov");
+    senv.set_payload_type(kKeyprovPayloadStatusResponse);
+    senv.set_message_kind(MESSAGE_KIND_RESPONSE);
+    senv.set_message_id("st1");
+    senv.set_payload(spayload);
+    std::string ss;
+    senv.SerializeToString(&ss);
+    RoutedDownlinkEvent de2;
+    de2.owner = "tsp";
+    de2.route_id = "keyprov.downlink";
+    de2.target = "tsp.keyprov";
+    de2.payload = std::vector<uint8_t>(ss.begin(), ss.end());
+    coord.handle_routed_downlink(de2);
+    std::string new_rid = coord.snapshot().request_id;
+    snap = coord.snapshot();
+    EXPECT_NE(new_rid, rid);
+    EXPECT_EQ(snap.superseded_remote, 1u);
+    EXPECT_EQ(snap.state, V2cKeyProvState::WAIT_RESPONSE);
+    auto rec = store->load();
+    ASSERT_TRUE(rec.valid);
+    EXPECT_EQ(rec.supersedes_request_id, rid);
+    EXPECT_FALSE(rec.successor_request_id_digest.empty());  // 唯一后继 digest 已持久化
+
+    // 新 attempt 全链路：Response -> import COMMITTED -> ACK -> ACTIVE。
+    coord.handle_routed_downlink(downlink(make_response(new_rid)));
+    sec->import_items = {active("UPLINK_AEAD"), active("DOWNLINK_AEAD")};
+    sec->import_state = 2;  // COMMITTED
+    sec->import_error_code = 0;  // 重置（此前为 UNKNOWN）
+    sec->import_proof = {0x02};
+    coord.tick();
+    EXPECT_EQ(coord.snapshot().state, V2cKeyProvState::ACK_PENDING);
+    coord.handle_routed_downlink(downlink(make_ack_result(
+        new_rid, KEY_PROVISIONING_RESULT_SUCCEEDED)));
+    EXPECT_EQ(coord.snapshot().state, V2cKeyProvState::ACTIVE);
+    // 敏感扫描：Store 无 wrappedKey/parameters/proof 原文。
+    EXPECT_FALSE(dir_contains_bytes(store_root, std::vector<uint8_t>(32, 'W')));
+    EXPECT_FALSE(dir_contains_bytes(store_root, std::vector<uint8_t>(8, 'P')));
+    EXPECT_FALSE(dir_contains_bytes(store_root, std::vector<uint8_t>(64, 0xE1)));
+    coord.stop();
+}
+
 int main(int argc, char** argv) {
     testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

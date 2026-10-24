@@ -159,6 +159,16 @@ nlohmann::json record_to_json(const V2cKeyProvisioningRecord& r) {
         r.sec_evidence_observed_store_generation;
     j["sec_evidence_observed_at_ms"] = r.sec_evidence_observed_at_ms;
     j["import_invocation"] = r.import_invocation;
+    // ---- CR-015 v4：导入意图处置与稳定化（非敏感） ----
+    j["import_invocation_resolution"] = r.import_invocation_resolution;
+    j["sec_not_found_count"] = r.sec_not_found_count;
+    j["sec_not_found_first_observed_ms"] = r.sec_not_found_first_observed_ms;
+    j["sec_not_found_last_observed_ms"] = r.sec_not_found_last_observed_ms;
+    j["sec_capability_epoch"] = r.sec_capability_epoch;
+    j["sec_contract_version"] = r.sec_contract_version;
+    j["recovery_phase"] = r.recovery_phase;
+    j["successor_request_id"] = r.successor_request_id;
+    j["successor_request_id_digest"] = r.successor_request_id_digest;
     return j;
 }
 
@@ -218,10 +228,49 @@ V2cKeyProvisioningRecord V2cKeyProvisioningStore::load() const {
                 j.value("sec_evidence_observed_at_ms", static_cast<int64_t>(0));
             // 旧记录（v2 及以下）缺 import_invocation 字段 -> 默认 true
             // （"可能已调用"，保持阻断），不得推断为"从未调用"。
-            if (j.contains("import_invocation")) {
+            const bool invocation_field_present = j.contains("import_invocation");
+            if (invocation_field_present) {
                 r.import_invocation = j.value("import_invocation", false);
             } else {
                 r.import_invocation = true;
+            }
+            // ---- CR-015 v4：导入意图处置与稳定化读取（缺字段保守默认） ----
+            // v3→v4 迁移：import_invocation 显式存在且为 false → NO_SIDE_EFFECT_PROVEN
+            // （TSP 未越过调用前持久化线性化点，无本地 SEC import invocation 冲突）；
+            // 否则（true / 字段缺失）→ UNRESOLVED（可能已调用，必须重新稳定化），
+            // 不得因缺省值直接释放。
+            const int stored_resolution =
+                j.value("import_invocation_resolution", -1);
+            if (stored_resolution >= 0 && stored_resolution <= 2) {
+                r.import_invocation_resolution = stored_resolution;
+            } else if (invocation_field_present && !r.import_invocation) {
+                r.import_invocation_resolution =
+                    static_cast<int>(ImportInvocationResolution::NO_SIDE_EFFECT_PROVEN);
+            } else {
+                r.import_invocation_resolution =
+                    static_cast<int>(ImportInvocationResolution::UNRESOLVED);
+            }
+            r.sec_not_found_count = j.value("sec_not_found_count", 0u);
+            r.sec_not_found_first_observed_ms =
+                j.value("sec_not_found_first_observed_ms", static_cast<int64_t>(-1));
+            r.sec_not_found_last_observed_ms =
+                j.value("sec_not_found_last_observed_ms", static_cast<int64_t>(-1));
+            r.sec_capability_epoch = j.value("sec_capability_epoch", 0ull);
+            r.sec_contract_version = j.value("sec_contract_version", 0u);
+            r.recovery_phase = j.value("recovery_phase", std::string{});
+            r.successor_request_id = j.value("successor_request_id", std::string{});
+            r.successor_request_id_digest =
+                j.value("successor_request_id_digest", std::string{});
+            // v3 及以下无稳定化字段时按迁移默认值初始化（不得直接释放）。
+            if (r.schema_version < 4) {
+                r.sec_not_found_count = 0;
+                r.sec_not_found_first_observed_ms = -1;
+                r.sec_not_found_last_observed_ms = -1;
+                r.sec_capability_epoch = 0;
+                r.sec_contract_version = 0;
+                r.recovery_phase = keyprov_recovery_phase::kReconcileEvidence;
+                r.successor_request_id.clear();
+                r.successor_request_id_digest.clear();
             }
             // schema/fingerprint 版本守卫：未知版本不得降级解释（CR-013 §4/§10）。
             if (r.schema_version > kV2cStoreSchemaVersion ||

@@ -32,9 +32,10 @@
 namespace tbox {
 namespace tsp {
 
-// Store schema 版本（CR-013 §10 新增 v2；CR-014 §8/§21.6 新增 v3）。
+// Store schema 版本（CR-013 §10 新增 v2；CR-014 §8/§21.6 新增 v3；
+// CR-015 §22.3 新增 v4：导入意图处置与 NOT_FOUND 稳定化）。
 // 未知/更高版本不得降级解释。
-constexpr uint32_t kV2cStoreSchemaVersion = 3;
+constexpr uint32_t kV2cStoreSchemaVersion = 4;
 
 struct V2cKeyProvisioningRecord {
     bool valid = false;                    // Store 中是否存在记录
@@ -68,6 +69,21 @@ struct V2cKeyProvisioningRecord {
     uint64_t sec_evidence_observed_store_generation = 0;
     int64_t sec_evidence_observed_at_ms = 0;
     bool import_invocation = false;  // 已调用 SEC import API（缺字段默认 true）
+
+    // ---- v4 聚合字段（CR-015 §22.2/§22.3：导入意图处置与稳定化） ----
+    // import_invocation_resolution：ImportInvocationResolution 数值（0..2）。
+    // v3→v4 迁移默认值：import_invocation=true → UNRESOLVED；
+    // 字段显式存在且为 false → NO_SIDE_EFFECT_PROVEN；更老记录字段缺失
+    // （import_invocation 保守默认 true）→ UNRESOLVED（不得因缺省值释放）。
+    int import_invocation_resolution = 0;  // 默认 UNRESOLVED
+    uint32_t sec_not_found_count = 0;     // 连续强 NOT_FOUND 计数（诊断；重启后重新稳定化）
+    int64_t sec_not_found_first_observed_ms = -1;  // wall clock（仅诊断）
+    int64_t sec_not_found_last_observed_ms = -1;
+    uint64_t sec_capability_epoch = 0;    // 0=unknown（必须重新查询）
+    uint32_t sec_contract_version = 0;    // 稳定化观测时 SEC capability 契约版本
+    std::string recovery_phase;           // keyprov_recovery_phase::*（诊断）
+    std::string successor_request_id;     // 预生成唯一后继 requestId（幂等恢复）
+    std::string successor_request_id_digest;  // sha256(successor_request_id) hex（审计）
 
     // ---- legacy 解析产物（非持久化，load() 派生） ----
     bool legacy_snapshot_unknown = false;  // 旧记录缺 snapshot/fingerprint

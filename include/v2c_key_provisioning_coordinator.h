@@ -53,25 +53,40 @@ struct V2cKeyProvisioningConfig {
     double retry_multiplier = 2.0;
     bool retry_jitter = true;
     uint32_t poll_interval_ms = 200;      // worker tick
+    // ---- TBOX-TSP-DSN-CR-015 §22.4/§22.5：SEC NOT_FOUND 稳定化与 Status 退避 ----
+    // 稳定窗 = sec_import_timeout_ms + sec_callback_grace_ms（独立配置，有界）；
+    // 若 not_found_stabilization_window_ms>0 则显式覆盖（必须 >= 该下界，见校验）。
+    uint32_t not_found_stabilization_count = 3;      // N（有界，1..8）
+    uint32_t sec_import_timeout_ms = 5000;           // SEC import IPC 调用 deadline（有界）
+    uint32_t sec_callback_grace_ms = 1000;           // 迟到回调宽限（有界）
+    uint32_t not_found_stabilization_window_ms = 0;  // 0 → 自动 = import_timeout+callback_grace
+    uint32_t status_request_initial_interval_ms = 1000;  // StatusRequest 退避起始（有界）
+    uint32_t status_request_max_interval_ms = 30000;     // StatusRequest 退避上限（有界）
 };
 
 enum class V2cKeyProvState : uint8_t {
     DISABLED = 0,
-    WAIT_CLOUD,
-    CHECKING,
-    REQUESTING,
-    WAIT_RESPONSE,
-    IMPORTING,
-    ACK_PENDING,
-    ACTIVE,
-    RETRY_WAIT,
-    BLOCKED,
+    WAIT_CLOUD = 1,
+    CHECKING = 2,
+    REQUESTING = 3,
+    WAIT_RESPONSE = 4,
+    IMPORTING = 5,
+    ACK_PENDING = 6,
+    ACTIVE = 7,
+    RETRY_WAIT = 8,
+    BLOCKED = 9,
     // ---- TBOX-TSP-DSN-CR-013：不可变 attempt 与 requestId 幂等 ----------------
-    RECONCILE_OLD_ATTEMPT,              // 业务输入变化/806095：先对账 VMD Status + SEC journal
-    SUPERSEDED_LOCAL,                   // 可证明从未提交且 VMD 无批次：旧 record 终态化，建新 attempt
-    SUPERSEDED_REMOTE,                  // VMD 已终结旧批次且 SEC 无副作用：终态化，建新 attempt
-    BLOCKED_AWAIT_CLOUD_TERMINATION,    // VMD 有未终结旧批次/无法证明：等待受控终结
-    LEGACY_SNAPSHOT_UNKNOWN             // 旧 Store 无 snapshot/fingerprint：默认阻断，先对账
+    RECONCILE_OLD_ATTEMPT = 10,              // 业务输入变化/806095：先对账 VMD Status + SEC journal
+    SUPERSEDED_LOCAL = 11,                   // 可证明从未提交且 VMD 无批次：旧 record 终态化，建新 attempt
+    SUPERSEDED_REMOTE = 12,                  // VMD 已终结旧批次且 SEC 无副作用：终态化，建新 attempt
+    BLOCKED_AWAIT_CLOUD_TERMINATION = 13,    // VMD 有未终结旧批次/无法证明：等待受控终结
+    LEGACY_SNAPSHOT_UNKNOWN = 14,            // 旧 Store 无 snapshot/fingerprint：默认阻断，先对账
+    // ---- TBOX-TSP-DSN-CR-015 §22.4：证据收敛与恢复（显式追加，不重排既有值） ----
+    RECONCILE_EVIDENCE = 15,                 // EVIDENCE_CONFLICT 恢复点/稳定化入口（v3 映射）
+    STABILIZING_NOT_FOUND = 16,              // 强 NOT_FOUND 连续计数中（同能力代际）
+    RECONCILE_REMOTE = 17,                   // resolution=NO_SIDE_EFFECT_PROVEN：完整云端矩阵
+    AWAIT_REMOTE_REPAIR = 18,                // VMD ACTIVE/SUCCEEDED：不重开，等待云端终结/治理
+    HARD_BLOCKED = 19                        // 矛盾证据（HARD_CONFLICT）：仅诊断查询，人工治理
 };
 
 const char* v2c_key_prov_state_to_string(V2cKeyProvState s);
@@ -100,6 +115,13 @@ struct V2cKeyProvisioningSnapshot {
     // ---- CR-014 可观测字段（有限枚举，脱敏） ----
     std::string sec_evidence_kind;       // SecImportEvidenceKind 名
     bool import_invocation_recorded = false;  // 已调用 SEC import API
+    // ---- CR-015 可观测字段（有限枚举，脱敏） ----
+    std::string import_invocation_resolution;  // UNRESOLVED/NO_SIDE_EFFECT_PROVEN/HARD_CONFLICT
+    std::string recovery_phase;           // keyprov_recovery_phase::*（诊断）
+    uint32_t sec_not_found_count = 0;    // 当前连续强 NOT_FOUND 计数
+    uint64_t sec_capability_epoch = 0;   // 当前 SEC capability epoch（摘要值，仅诊断）
+    bool sec_epoch_unknown = false;      // SEC capability epoch 未知（需重新查询）
+    std::string successor_request_id_digest;  // 唯一后继 requestId 摘要（hex，审计）
     // 脱敏计数器
     uint64_t cloud_ready_events = 0;
     uint64_t requests_published = 0;
@@ -122,6 +144,9 @@ struct V2cKeyProvisioningSnapshot {
     std::map<std::string, uint64_t> fingerprint_changes_total;   // AttemptChangeDimension 名
     std::map<std::string, uint64_t> blocked_reasons_total;       // keyprov_blocked_reason::*
     std::map<std::string, uint64_t> attempt_transitions_total;   // "FROM->TO"
+    // ---- CR-015 指标（有限枚举；result/reason 受控） ----
+    std::map<std::string, uint64_t> sec_not_found_stabilization_total;  // result：REACHED/RESET_*
+    std::map<std::string, uint64_t> hard_conflicts_total;               // reason：keyprov_blocked_reason::*
 };
 
 class V2cKeyProvisioningCoordinator {
@@ -199,10 +224,9 @@ private:
     // 是否有 accepted/PUBACK/timeout/崩溃等"可能已提交"证据。
     bool submission_evidence_locked() const;
     // SEC journal 对账：COMMITTED -> 恢复 ACK；UNKNOWN -> 保持对账（禁止新 attempt）
-    // 但继续 VMD StatusRequest 只读对账；clean -> 继续 VMD 终态判定。
-    // 返回 true 表示本次对账已消费（ACK 恢复/安全阻断，无需再发 Status），
-    // false 表示调用方需继续 VMD 对账（含 SEC outcome unknown 场景）。
-    bool reconcile_sec_journal_locked();
+    // 但继续 VMD StatusRequest 只读对账；强 NOT_FOUND -> 稳定化计数；
+    // 返回 ReconcileAction 决定调用方后续动作（CR-015 §22.5 替代旧 bool consumed）。
+    ReconcileAction reconcile_sec_journal_locked();
     // 以原 requestId 发送 StatusRequest（对账/待终结观察）。
     void send_status_request_locked();
     // 记录幂等冲突脱敏事实并计数。
@@ -217,6 +241,36 @@ private:
     // CR-014 §21.5：对账保持路径的三元组抑制（相同则跳过写盘/计数，返回 true）。
     bool reconcile_obs_suppressed_locked(int vmd_status,
                                          SecImportEvidenceKind kind);
+    // ---- CR-015 §22.5：SEC NOT_FOUND 稳定化辅助 ----
+    // 当前 resolution 是否已证明无副作用（NO_SIDE_EFFECT_PROVEN 且无相反本地证据）。
+    bool no_side_effects_proven_locked() const;
+    // 同一规范化 requestId / CAS generation 匹配（迟到/错配证据直接丢弃）。
+    bool same_attempt_locked(const SecImportEvidence& ev) const;
+    bool cas_generation_matches_locked(const SecImportEvidence& ev) const;
+    // TSP 已知相反证据（staging/partial、ACK proof、已提交导入结果等）。
+    bool contrary_local_evidence_locked() const;
+    // 稳定化窗口（ms）：显式配置 > 0 用之；否则 = sec_import_timeout + callback_grace。
+    uint32_t stabilization_window_ms_locked() const;
+    // 清零稳定化计数/时间窗并记录 outcome 指标（result：REACHED/RESET_*）。
+    void reset_not_found_stabilization_locked(const char* result);
+    // SEC capability epoch 变化：为新 epoch 重启计数（保留已观测分类）。
+    void restart_not_found_stabilization_for_locked(const SecImportEvidence& ev);
+    // 记录一次强 NOT_FOUND 观测（同 epoch/attempt 才计数）。
+    void observe_not_found_locked(const SecImportEvidence& ev);
+    // 达成 N + 稳定窗：处置为 NO_SIDE_EFFECT_PROVEN 并进入 RECONCILE_REMOTE。
+    void prove_no_side_effects_locked();
+    // 矛盾证据（proven 后出现非 NOT_FOUND / 迟到 callback）：HARD_CONFLICT。
+    void enter_hard_blocked_locked(const char* reason);
+    // 进入证据对账（稳定化入口；旧 EVIDENCE_CONFLICT 恢复点）。
+    void enter_reconcile_evidence_locked(const char* reason);
+    // 完整云端决策矩阵（resolution proven 后执行；vmd_status 为最近观测 VMD 状态）。
+    void apply_cloud_matrix_locked(int vmd_status);
+    // StatusRequest 专用退避（1s、2s、4s…max，有界+抖动）。
+    void schedule_status_retry_locked();
+    // 更新 SEC capability epoch（TSP 本地生成：查询失败→成功、契约版本变化、
+    // NOT_FOUND 能力位变化时递增；CR-015 §22.4/§10）。
+    void update_sec_capability_epoch_locked(
+        tbox::sec::ErrorCode ec, const tbox::sec::V2cKeyProvisioningCapability& cap);
 
     bool capability_gate_locked(std::string& reason);
     // 系统时钟是否已同步（未注入时读 systemd-timesyncd 标记）。
@@ -243,6 +297,7 @@ private:
     bool purposes_complete_locked(const std::vector<tbox::sec::BusinessKeyStatus>& items) const;
 
     static int64_t now_ms();
+    static int64_t now_monotonic_ms();
     static std::string generate_id(const char* prefix);
 
     std::shared_ptr<MqttFacade> mqtt_;
@@ -278,8 +333,10 @@ private:
     bool legacy_snapshot_unknown_ = false;
     // CR-013 §9：SEC journal 是否仍处于 outcome unknown（true 时禁止建新 attempt）。
     bool sec_outcome_unknown_ = false;
-    // CR-014：仅 SEC NOT_FOUND 时置位（无本地安全调用证据冲突前提下）。
-    bool sec_no_side_effects_proven_ = false;
+    // CR-015：导入意图处置（替代 CR-014 的 sec_no_side_effects_proven_ 布尔）。
+    // import_invocation_recorded 保留为审计事实；是否阻断由 resolution 决定。
+    ImportInvocationResolution resolution_ =
+        ImportInvocationResolution::UNRESOLVED;
     // CR-014：SEC import invocation 证据（已调用 import API，持久化恢复）。
     bool import_invocation_recorded_ = false;
     // CR-014：import 结果待定（回调待收敛；重启后按 Store 保守恢复）。
@@ -289,6 +346,22 @@ private:
         SecImportEvidenceKind::ContractUnknown;
     // CR-014：观测时 SEC capability 快照契约版本（仅诊断；失败/未知记 0）。
     uint32_t sec_import_result_contract_version_ = 0;
+    // ---- CR-015 §22.2：NOT_FOUND 稳定化状态 ----
+    SecNotFoundStabilization stab_;
+    std::string recovery_phase_;      // keyprov_recovery_phase::*（诊断）
+    int cached_vmd_status_ = -1;      // 稳定化期间缓存的最新 VMD Status（-1=无）
+    // 唯一后继 requestId（supersede 幂等恢复：预生成后持久化）。
+    std::string successor_request_id_;
+    std::string successor_request_id_digest_;
+    // SEC capability epoch（TSP 本地生成；0=unknown）。
+    uint64_t current_sec_capability_epoch_ = 0;
+    bool sec_capability_unavailable_ = false;   // capability 查询失败（epoch 未知）
+    uint32_t last_sec_capability_contract_ = 0; // 上次成功查询的契约版本
+    bool last_capability_not_found_flag_ = false;
+    uint32_t status_backoff_ms_ = 0;            // StatusRequest 专用指数退避
+    // wall clock 仅诊断（稳定窗判定使用 monotonic clock）。
+    int64_t sec_not_found_first_observed_wall_ms_ = -1;
+    int64_t sec_not_found_last_observed_wall_ms_ = -1;
     // CR-014 §21.5：相同三元组 {vmd_state, sec_evidence, store_generation}
     // 抑制重复写盘/日志（last_obs_vmd_status_=-1 表示 SEC 阶段；-3 表示 BLOCKED
     // EVIDENCE_CONFLICT 重查；>=0 为 VMD Status 值）。

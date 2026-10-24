@@ -135,6 +135,19 @@ bool TspApplication::initialize() {
         cfg->getDouble("tsp.key_provisioning.retry.multiplier", 2.0);
     keyprov_config_.retry_jitter =
         cfg->getBool("tsp.key_provisioning.retry.jitter", true);
+    // ---- CR-015 §22.4/§22.7：SEC NOT_FOUND 稳定化与 StatusRequest 退避 ----
+    keyprov_config_.not_found_stabilization_count = static_cast<uint32_t>(
+        cfg->getInt("tsp.key_provisioning.not_found_stabilization_count", 3));
+    keyprov_config_.sec_import_timeout_ms = static_cast<uint32_t>(
+        cfg->getInt("tsp.key_provisioning.sec_import_timeout_ms", 5000));
+    keyprov_config_.sec_callback_grace_ms = static_cast<uint32_t>(
+        cfg->getInt("tsp.key_provisioning.sec_callback_grace_ms", 1000));
+    keyprov_config_.not_found_stabilization_window_ms = static_cast<uint32_t>(
+        cfg->getInt("tsp.key_provisioning.not_found_stabilization_window_ms", 0));
+    keyprov_config_.status_request_initial_interval_ms = static_cast<uint32_t>(
+        cfg->getInt("tsp.key_provisioning.status_request_initial_interval_ms", 1000));
+    keyprov_config_.status_request_max_interval_ms = static_cast<uint32_t>(
+        cfg->getInt("tsp.key_provisioning.status_request_max_interval_ms", 30000));
     auto purposes = cfg->getStringList("tsp.key_provisioning.purposes");
     if (!purposes.empty()) keyprov_config_.purposes = std::move(purposes);
     sec_client_ = std::make_shared<SecClientBusinessKeyAdapter>(sec_socket_path);

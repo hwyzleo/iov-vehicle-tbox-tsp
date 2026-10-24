@@ -94,6 +94,31 @@ fields:
               max_ms: {type: integer, min: 10, max: 600000}
               multiplier: {type: number, min: 1.0}
               jitter: {type: boolean}
+          # ---- TBOX-TSP-DSN-CR-015 §22.4/§22.7：稳定化与 StatusRequest 退避（有界） ----
+          not_found_stabilization_count:
+            type: integer
+            min: 1
+            max: 8
+          sec_import_timeout_ms:
+            type: integer
+            min: 100
+            max: 600000
+          sec_callback_grace_ms:
+            type: integer
+            min: 0
+            max: 600000
+          not_found_stabilization_window_ms:
+            type: integer
+            min: 0
+            max: 600000
+          status_request_initial_interval_ms:
+            type: integer
+            min: 100
+            max: 600000
+          status_request_max_interval_ms:
+            type: integer
+            min: 100
+            max: 600000
       vehicle_message:
         type: map
         fields:

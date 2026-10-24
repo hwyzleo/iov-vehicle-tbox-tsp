@@ -117,6 +117,12 @@ const char* v2c_key_prov_state_to_string(V2cKeyProvState s) {
             return "BLOCKED_AWAIT_CLOUD_TERMINATION";
         case V2cKeyProvState::LEGACY_SNAPSHOT_UNKNOWN:
             return "LEGACY_SNAPSHOT_UNKNOWN";
+        // ---- TBOX-TSP-DSN-CR-015 §22.4：证据收敛与恢复 ----
+        case V2cKeyProvState::RECONCILE_EVIDENCE:   return "RECONCILE_EVIDENCE";
+        case V2cKeyProvState::STABILIZING_NOT_FOUND: return "STABILIZING_NOT_FOUND";
+        case V2cKeyProvState::RECONCILE_REMOTE:      return "RECONCILE_REMOTE";
+        case V2cKeyProvState::AWAIT_REMOTE_REPAIR:   return "AWAIT_REMOTE_REPAIR";
+        case V2cKeyProvState::HARD_BLOCKED:          return "HARD_BLOCKED";
         default: return "?";
     }
 }
@@ -131,7 +137,12 @@ bool v2c_key_prov_state_from_string(const std::string& s, V2cKeyProvState& out) 
         V2cKeyProvState::RECONCILE_OLD_ATTEMPT, V2cKeyProvState::SUPERSEDED_LOCAL,
         V2cKeyProvState::SUPERSEDED_REMOTE,
         V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION,
-        V2cKeyProvState::LEGACY_SNAPSHOT_UNKNOWN};
+        V2cKeyProvState::LEGACY_SNAPSHOT_UNKNOWN,
+        V2cKeyProvState::RECONCILE_EVIDENCE,
+        V2cKeyProvState::STABILIZING_NOT_FOUND,
+        V2cKeyProvState::RECONCILE_REMOTE,
+        V2cKeyProvState::AWAIT_REMOTE_REPAIR,
+        V2cKeyProvState::HARD_BLOCKED};
     for (auto s2 : all) {
         if (s == v2c_key_prov_state_to_string(s2)) {
             out = s2;
@@ -139,6 +150,26 @@ bool v2c_key_prov_state_from_string(const std::string& s, V2cKeyProvState& out) 
         }
     }
     return false;
+}
+
+// CR-015 §22.4：状态 → 恢复阶段（诊断）。
+const char* recovery_phase_for_state(V2cKeyProvState s) {
+    switch (s) {
+        case V2cKeyProvState::RECONCILE_EVIDENCE:
+            return keyprov_recovery_phase::kReconcileEvidence;
+        case V2cKeyProvState::STABILIZING_NOT_FOUND:
+            return keyprov_recovery_phase::kStabilizingSecNotFound;
+        case V2cKeyProvState::RECONCILE_REMOTE:
+            return keyprov_recovery_phase::kReconcileRemote;
+        case V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION:
+            return keyprov_recovery_phase::kAwaitCloudTermination;
+        case V2cKeyProvState::AWAIT_REMOTE_REPAIR:
+            return keyprov_recovery_phase::kAwaitRemoteRepair;
+        case V2cKeyProvState::HARD_BLOCKED:
+            return keyprov_recovery_phase::kHardEvidenceConflict;
+        default:
+            return "";
+    }
 }
 
 // ============================================================
@@ -192,6 +223,32 @@ bool V2cKeyProvisioningCoordinator::initialize(
             // 重启后无法确认回调是否已收敛：保守按"可能待定"处理，
             // 首次 SEC 权威查询后会按结果修正。
             pending_callback_ = record_.import_invocation;
+            // ---- CR-015 §22.3：恢复导入意图处置与稳定化状态 ----
+            resolution_ =
+                static_cast<ImportInvocationResolution>(
+                    record_.import_invocation_resolution);
+            if (resolution_ != ImportInvocationResolution::UNRESOLVED &&
+                resolution_ != ImportInvocationResolution::NO_SIDE_EFFECT_PROVEN &&
+                resolution_ != ImportInvocationResolution::HARD_CONFLICT) {
+                resolution_ = ImportInvocationResolution::UNRESOLVED;  // 防御
+            }
+            stab_.consecutive_count = record_.sec_not_found_count;  // 诊断保留
+            stab_.sec_capability_epoch = record_.sec_capability_epoch;  // 0=unknown
+            stab_.sec_contract_version = record_.sec_contract_version;
+            stab_.attempt_generation = record_.store_generation;
+            if (!record_.request_id.empty()) {
+                auto d = tbox::fw::hash::sha256(std::string_view(record_.request_id));
+                stab_.request_id_digest.assign(d.begin(), d.end());
+            }
+            // 重启单调窗重开：不得跨重启复用单调时间，不得因旧计数直接释放。
+            stab_.first_observed_monotonic_ms = -1;
+            stab_.last_observed_monotonic_ms = -1;
+            recovery_phase_ = record_.recovery_phase;
+            successor_request_id_ = record_.successor_request_id;
+            successor_request_id_digest_ = record_.successor_request_id_digest;
+            if (!successor_request_id_digest_.empty()) {
+                counters_.successor_request_id_digest = successor_request_id_digest_;
+            }
         }
         if (record_.legacy_snapshot_unknown) {
             // CR-013 §10：旧 Store 缺 snapshot/fingerprint，默认阻断发送；
@@ -212,8 +269,37 @@ bool V2cKeyProvisioningCoordinator::initialize(
             } else if (restored == V2cKeyProvState::ACK_PENDING) {
                 state_ = V2cKeyProvState::WAIT_CLOUD;
                 recovering_ack_ = true;  // SEC 已导入、云端未确认：恢复 ACK
-            } else {
+            } else if (restored == V2cKeyProvState::BLOCKED &&
+                       blocked_reason_ ==
+                           keyprov_blocked_reason::kEvidenceConflict) {
+                // CR-015 §22.4：旧 v3 EVIDENCE_CONFLICT 永久阻断 → 稳定化入口
+                // （不立即释放；强 NOT_FOUND 连续稳定化后才允许云端终态判定）。
+                state_ = V2cKeyProvState::RECONCILE_EVIDENCE;
+                recovery_phase_ = keyprov_recovery_phase::kReconcileEvidence;
+            } else if (restored == V2cKeyProvState::BLOCKED &&
+                       resolution_ == ImportInvocationResolution::HARD_CONFLICT) {
+                state_ = V2cKeyProvState::HARD_BLOCKED;
+                recovery_phase_ = keyprov_recovery_phase::kHardEvidenceConflict;
+            } else if ((restored == V2cKeyProvState::BLOCKED ||
+                        restored == V2cKeyProvState::RECONCILE_OLD_ATTEMPT) &&
+                       resolution_ ==
+                           ImportInvocationResolution::NO_SIDE_EFFECT_PROVEN) {
+                // v3 记录曾阻断但无本地导入意图（import_invocation 显式 false）：
+                // 恢复后直接进入云端矩阵；仍须 SEC 权威 NOT_FOUND + VMD 可释放
+                // 终态才释放（不跳过 SEC 权威查询/反证检查）。
+                state_ = V2cKeyProvState::RECONCILE_REMOTE;
+                recovery_phase_ = keyprov_recovery_phase::kReconcileRemote;
+            } else if (restored == V2cKeyProvState::WAIT_CLOUD ||
+                       restored == V2cKeyProvState::CHECKING ||
+                       restored == V2cKeyProvState::RETRY_WAIT) {
                 state_ = V2cKeyProvState::WAIT_CLOUD;
+            } else {
+                // 其余状态（RECONCILE/LEGACY/BLOCKED_AWAIT/SUPERSEDED/新 CR-015
+                // 状态）原样恢复，避免重启后丢失恢复语义。
+                state_ = restored;
+                if (recovery_phase_.empty()) {
+                    recovery_phase_ = recovery_phase_for_state(state_);
+                }
             }
         }
     } else {
@@ -430,10 +516,24 @@ V2cKeyProvisioningSnapshot V2cKeyProvisioningCoordinator::snapshot() const {
     // CR-014 可观测字段（有限枚举，脱敏）
     s.sec_evidence_kind = sec_import_evidence_kind_to_string(last_sec_evidence_kind_);
     s.import_invocation_recorded = import_invocation_recorded_;
+    // CR-015 可观测字段（有限枚举，脱敏）
+    s.import_invocation_resolution =
+        keyprov_import_invocation_resolution_to_string(resolution_);
+    s.recovery_phase = recovery_phase_;
+    s.sec_not_found_count = stab_.consecutive_count;
+    s.sec_capability_epoch = current_sec_capability_epoch_;
+    s.sec_epoch_unknown = sec_capability_unavailable_;
+    s.successor_request_id_digest = successor_request_id_digest_;
     s.blocked_attempts_current =
         (state_ == V2cKeyProvState::BLOCKED ||
          state_ == V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION ||
-         state_ == V2cKeyProvState::LEGACY_SNAPSHOT_UNKNOWN)
+         state_ == V2cKeyProvState::LEGACY_SNAPSHOT_UNKNOWN ||
+         state_ == V2cKeyProvState::RECONCILE_OLD_ATTEMPT ||
+         state_ == V2cKeyProvState::RECONCILE_EVIDENCE ||
+         state_ == V2cKeyProvState::STABILIZING_NOT_FOUND ||
+         state_ == V2cKeyProvState::RECONCILE_REMOTE ||
+         state_ == V2cKeyProvState::AWAIT_REMOTE_REPAIR ||
+         state_ == V2cKeyProvState::HARD_BLOCKED)
             ? 1u : 0u;
     return s;
 }
@@ -586,7 +686,13 @@ void V2cKeyProvisioningCoordinator::handle_routed_downlink(
             // CR-013：对账态（RECONCILE / LEGACY / 待云端终结）统一走终态对账。
             if (state_ == V2cKeyProvState::RECONCILE_OLD_ATTEMPT ||
                 state_ == V2cKeyProvState::LEGACY_SNAPSHOT_UNKNOWN ||
-                state_ == V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION) {
+                state_ == V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION ||
+                // CR-015：证据收敛/恢复态同样消费 StatusResponse（只读对账/云端矩阵）。
+                state_ == V2cKeyProvState::RECONCILE_EVIDENCE ||
+                state_ == V2cKeyProvState::STABILIZING_NOT_FOUND ||
+                state_ == V2cKeyProvState::RECONCILE_REMOTE ||
+                state_ == V2cKeyProvState::AWAIT_REMOTE_REPAIR ||
+                state_ == V2cKeyProvState::HARD_BLOCKED) {
                 reconcile_status_sent_ = false;
                 handle_reconcile_status_locked(st);
                 return;
@@ -712,7 +818,16 @@ void V2cKeyProvisioningCoordinator::create_new_attempt_locked() {
     }
 
     // 新 requestId + idempotency（wire 兼容）。
-    record_.request_id = generate_id("kp");
+    // CR-015 §22.7：supersede 幂等——若已预生成唯一 successor（崩溃发生在
+    // supersede persist 与 create 之间），复用同一 requestId，不生成第二个。
+    // 采用后清空 requestId 但保留 digest（审计：本 attempt 是唯一后继；
+    // 非 supersede 的首建 attempt 不设置 digest）。
+    if (successor_request_id_.empty()) {
+        record_.request_id = generate_id("kp");
+    } else {
+        record_.request_id = successor_request_id_;
+        successor_request_id_.clear();
+    }
     record_.idempotency_digest =
         tbox::fw::hash::sha256_hex(std::string_view(
             record_.request_id + "|" + config_.business_domain));
@@ -743,10 +858,16 @@ void V2cKeyProvisioningCoordinator::create_new_attempt_locked() {
     sec_outcome_unknown_ = false;   // 新 attempt 与旧 SEC 事实解绑，重新对账
     sec_unknown_rounds_ = 0;
     sec_unknown_alerted_ = false;
-    // CR-014：新 attempt 重置 SEC 证据（import invocation / no-side-effects / 三元组）。
-    sec_no_side_effects_proven_ = false;
+    // CR-015：新 attempt 无本地导入意图 -> 直接 NO_SIDE_EFFECT_PROVEN
+    // （保持 CR-014 快速释放路径）；一旦调用 import（do_import）转 UNRESOLVED。
     import_invocation_recorded_ = false;
     pending_callback_ = false;
+    resolution_ = ImportInvocationResolution::NO_SIDE_EFFECT_PROVEN;
+    stab_ = SecNotFoundStabilization{};
+    recovery_phase_.clear();
+    cached_vmd_status_ = -1;
+    sec_not_found_first_observed_wall_ms_ = -1;
+    sec_not_found_last_observed_wall_ms_ = -1;
     last_sec_evidence_kind_ = SecImportEvidenceKind::ContractUnknown;
     last_obs_valid_ = false;
     counters_.attempts_created++;
@@ -790,9 +911,9 @@ bool V2cKeyProvisioningCoordinator::submission_evidence_locked() const {
            import_attempted_ || ack_sent_ || status_sent_;
 }
 
-bool V2cKeyProvisioningCoordinator::reconcile_sec_journal_locked() {
+ReconcileAction V2cKeyProvisioningCoordinator::reconcile_sec_journal_locked() {
     const std::string rid = record_.request_id;
-    if (rid.empty()) return false;
+    if (rid.empty()) return ReconcileAction::TERMINAL_HANDLED;
     tbox::sec::ImportResult res;
     ErrorCode ec = sec_->get_business_key_import_result(rid, res);
     // CR-014 §3/§21.1：强类型分类（adapter exhaustive switch；除 NotFound 外
@@ -806,18 +927,26 @@ bool V2cKeyProvisioningCoordinator::reconcile_sec_journal_locked() {
     ev.pending_callback = pending_callback_;
     last_sec_evidence_kind_ = ev.kind;
 
+    // CR-015 §6.1：迟到/错配证据（非同 attempt / CAS generation 不匹配）直接丢弃。
+    if (!same_attempt_locked(ev) || !cas_generation_matches_locked(ev)) {
+        return ReconcileAction::WAIT_SEC;
+    }
+
     switch (ev.kind) {
         case SecImportEvidenceKind::Committed: {
-            // 原 requestId 已完成双用途原子导入：恢复原 ACK（CR-012 journal proof
-            // 复用，不重复导入、不建新 attempt）。
+            // 原 requestId 已完成双用途原子导入：SEC 权威事实优先，恢复原 ACK
+            // （CR-012 journal proof 复用，不重复导入、不建新 attempt）。
+            // COMMITTED 不构成矛盾：它是权威事实（用户确认：SEC 意外返回 COMMITTED
+            // 应以 SEC 权威事实为准恢复原 ACK，而非继续释放）。
             ack_items_ = build_ack_items(res);
             if (ack_items_.size() == config_.purposes.size()) {
                 sec_outcome_unknown_ = false;   // SEC 已给出明确事实
-                sec_no_side_effects_proven_ = false;
+                resolution_ = ImportInvocationResolution::UNRESOLVED;
                 pending_callback_ = false;
                 sec_unknown_rounds_ = 0;
                 sec_unknown_alerted_ = false;
                 blocked_reason_.clear();
+                reset_not_found_stabilization_locked("RESET_COMMITTED");
                 state_ = V2cKeyProvState::ACK_PENDING;
                 ack_sent_ = false;
                 status_sent_ = false;
@@ -827,7 +956,6 @@ bool V2cKeyProvisioningCoordinator::reconcile_sec_journal_locked() {
             } else {
                 // items 不完整：安全异常 -> 保持阻断/对账，不发伪成功 ACK。
                 sec_outcome_unknown_ = true;
-                sec_no_side_effects_proven_ = false;
                 blocked_reason_ = keyprov_blocked_reason::kSecOutcomeUnknown;
                 count_blocked_reason_locked(
                     keyprov_blocked_reason::kSecOutcomeUnknown);
@@ -835,45 +963,93 @@ bool V2cKeyProvisioningCoordinator::reconcile_sec_journal_locked() {
                 schedule_retry_locked();
                 persist_locked();
             }
-            return true;
+            return ReconcileAction::TERMINAL_HANDLED;
         }
         case SecImportEvidenceKind::NotFound: {
-            // 结构化 journal 证明无记录/无副作用（sec_no_side_effects_proven_）。
-            sec_no_side_effects_proven_ = true;
-            sec_outcome_unknown_ = false;
-            sec_unknown_rounds_ = 0;
-            sec_unknown_alerted_ = false;
-            pending_callback_ = false;  // 无记录：回调不可能待定
-            if (import_invocation_recorded_ || ev.pending_callback) {
-                // 证据冲突：本地已调用 SEC import（或回调待定），SEC 却证明
-                // 无记录。持续阻断直至新权威证据（SEC 重启/能力代际变化、
-                // journal 状态变化、pending callback 收敛或人工治理），
-                // 不按普通定时器自动重试或释放。
-                const bool suppressed =
-                    reconcile_obs_suppressed_locked(-3, ev.kind);
-                blocked_reason_ = keyprov_blocked_reason::kEvidenceConflict;
-                record_.last_error = "evidence_conflict";
-                state_ = V2cKeyProvState::BLOCKED;
-                schedule_retry_locked();
-                if (!suppressed) {
-                    count_blocked_reason_locked(
-                        keyprov_blocked_reason::kEvidenceConflict);
-                    persist_locked();
+            // 弱 NOT_FOUND（旧契约 / 无法证明无残留）：不得进入稳定化 -> fail-closed
+            // （REQ-001：只有支持 CR-021 精确语义的 SEC 才可进入稳定化流程）。
+            if (!ev.no_residue_proven ||
+                ev.sec_import_result_contract_version <
+                    kSecCr021NotFoundContractVersion) {
+                reset_not_found_stabilization_locked("RESET_WEAK_NOT_FOUND");
+                sec_outcome_unknown_ = true;
+                blocked_reason_ =
+                    keyprov_blocked_reason::kSecImportNotFound;
+                if (state_ != V2cKeyProvState::HARD_BLOCKED) {
+                    transition_to_locked(V2cKeyProvState::RECONCILE_EVIDENCE);
                 }
-                return true;  // 已消费：阻断，不发 VMD Status
+                schedule_retry_locked();
+                persist_locked();
+                return ReconcileAction::WAIT_SEC;
             }
-            // 无本地安全调用证据：交由调用方按 VMD 终态判定（FAILED -> 释放）。
-            return false;
+            // 强 NOT_FOUND：使用更新后的值（不再读取入口快照；§22.5）。
+            pending_callback_ = false;
+            sec_outcome_unknown_ = false;  // SEC 已给出明确无副作用证明
+            if (resolution_ == ImportInvocationResolution::NO_SIDE_EFFECT_PROVEN) {
+                // 已证明（无本地导入意图 / 已完成稳定化）：直接进入云端矩阵路径。
+                // 仍须 SEC 权威 NOT_FOUND + VMD 可释放终态 + 无反证才释放。
+                if (state_ != V2cKeyProvState::RECONCILE_REMOTE &&
+                    state_ != V2cKeyProvState::RECONCILE_OLD_ATTEMPT &&
+                    state_ != V2cKeyProvState::LEGACY_SNAPSHOT_UNKNOWN &&
+                    state_ != V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION &&
+                    state_ != V2cKeyProvState::AWAIT_REMOTE_REPAIR) {
+                    transition_to_locked(V2cKeyProvState::RECONCILE_REMOTE);
+                }
+                persist_locked();
+                return ReconcileAction::ALLOW_READONLY_REMOTE;
+            }
+            if (resolution_ == ImportInvocationResolution::HARD_CONFLICT) {
+                // 已矛盾：仅诊断查询，不重新计数（人工治理）。
+                schedule_retry_locked();
+                persist_locked();
+                return ReconcileAction::WAIT_SEC;
+            }
+            // UNRESOLVED：稳定化计数（连续强 NOT_FOUND + 同能力代际）。
+            observe_not_found_locked(ev);
+            if (state_ != V2cKeyProvState::STABILIZING_NOT_FOUND &&
+                state_ != V2cKeyProvState::LEGACY_SNAPSHOT_UNKNOWN) {
+                transition_to_locked(V2cKeyProvState::STABILIZING_NOT_FOUND);
+            }
+            if (stab_.consecutive_count >= config_.not_found_stabilization_count &&
+                stab_.first_observed_monotonic_ms >= 0 &&
+                now_monotonic_ms() - stab_.first_observed_monotonic_ms >=
+                    static_cast<int64_t>(stabilization_window_ms_locked()) &&
+                !contrary_local_evidence_locked()) {
+                // N + 稳定窗 + 无反证：收敛为已证明无副作用。
+                prove_no_side_effects_locked();
+            } else {
+                blocked_reason_ =
+                    keyprov_blocked_reason::kStabilizingSecNotFound;
+                schedule_status_retry_locked();  // 稳定化期间只读 Status 退避
+                persist_locked();
+            }
+            return ReconcileAction::ALLOW_READONLY_REMOTE;
         }
         case SecImportEvidenceKind::Failed:
         case SecImportEvidenceKind::OutcomeUnknown:
         case SecImportEvidenceKind::QueryError:
         case SecImportEvidenceKind::ContractUnknown: {
+            // 经稳定化达成（RECONCILE_REMOTE 阶段）后出现与 NOT_FOUND 矛盾的 SEC
+            // 结果 -> HARD_CONFLICT（REQ-003：停止自动释放，人工治理）。
+            // 无本地导入意图（resolution=NO_SIDE_EFFECT_PROVEN 默认值）的记录在
+            // 其它状态收到 FAILED/UNKNOWN 不构成矛盾：仅 fail-closed 保持对账
+            // （SEC 必须返回 NOT_FOUND 才可释放）。
+            if (state_ == V2cKeyProvState::RECONCILE_REMOTE) {
+                enter_hard_blocked_locked(
+                    keyprov_blocked_reason::kHardEvidenceConflict);
+                return ReconcileAction::TERMINAL_HANDLED;
+            }
+            if (resolution_ == ImportInvocationResolution::HARD_CONFLICT) {
+                // 已矛盾：仅诊断查询，保持 HARD_BLOCKED。
+                schedule_retry_locked();
+                persist_locked();
+                return ReconcileAction::WAIT_SEC;
+            }
             // fail-closed：所有非 NotFound 路径均保持 sec_outcome_unknown_，
-            // 禁止新 attempt；但 VMD StatusRequest 只读对账必须继续
+            // 禁止新 attempt；计数清零；但 VMD StatusRequest 只读对账必须继续
             // （CR-013 §8 / SPEC §20.2：SEC journal 与 VMD Status 双路收敛）。
+            reset_not_found_stabilization_locked("RESET_CONTRARY");
             sec_outcome_unknown_ = true;
-            sec_no_side_effects_proven_ = false;
             if (++sec_unknown_rounds_ >= config_.max_attempts_before_alert &&
                 !sec_unknown_alerted_) {
                 sec_unknown_alerted_ = true;
@@ -906,10 +1082,10 @@ bool V2cKeyProvisioningCoordinator::reconcile_sec_journal_locked() {
                 count_blocked_reason_locked(reason);
                 persist_locked();
             }
-            return false;  // 调用方继续 VMD Status 对账
+            return ReconcileAction::ALLOW_READONLY_REMOTE;
         }
     }
-    return false;
+    return ReconcileAction::WAIT_SEC;
 }
 
 void V2cKeyProvisioningCoordinator::send_status_request_locked() {
@@ -945,21 +1121,33 @@ void V2cKeyProvisioningCoordinator::send_status_request_locked() {
 }
 
 void V2cKeyProvisioningCoordinator::do_reconcile_locked() {
-    // 1) SEC journal 事实优先（原 requestId / operation 绑定）。
-    //    COMMITTED 恢复 ACK / 安全异常 -> 已消费直接返回；
-    //    UNKNOWN / clean -> 返回 false，继续 VMD Status 只读对账
-    //    （CR-013 §8 / SPEC §20.2：SEC journal 与 VMD Status 双路收敛，
-    //     SEC unknown 不得阻断 StatusRequest）。
-    if (reconcile_sec_journal_locked()) return;
-    // 2) 无已提交副作用：以原 requestId 查 VMD Status 确认批次事实。
+    // 1) SEC journal 权威事实优先（原 requestId / operation 绑定）。
+    //    TERMINAL_HANDLED：COMMITTED 恢复 ACK / 硬错误已完成状态迁移，直接返回；
+    //    WAIT_SEC：继续稳定化/阻断，本轮不发 Status；
+    //    ALLOW_READONLY_REMOTE：可发送只读 VMD StatusRequest（CR-015 §22.5）。
+    const ReconcileAction action = reconcile_sec_journal_locked();
+    if (action == ReconcileAction::TERMINAL_HANDLED) return;
+    if (action == ReconcileAction::WAIT_SEC) {
+        schedule_retry_locked();
+        persist_locked();
+        return;
+    }
+    // 2) proven 且已缓存 VMD 终态：立即执行完整云端决策矩阵（不等待新一轮 Status）。
+    if (resolution_ == ImportInvocationResolution::NO_SIDE_EFFECT_PROVEN &&
+        cached_vmd_status_ >= 0) {
+        apply_cloud_matrix_locked(cached_vmd_status_);
+        return;
+    }
+    // 3) 无已提交副作用：以原 requestId 查 VMD Status 确认批次事实
+    //    （稳定化期间只读缓存，不得释放；proven 后全矩阵）。
     if (!reconcile_status_sent_) {
         send_status_request_locked();
         return;
     }
     if (deadline_ms_ > 0 && now_ms() >= deadline_ms_) {
-        // 响应丢失：退避后重试（保留原 requestId）。
+        // 响应丢失：StatusRequest 退避后重试（保留原 requestId）。
         reconcile_status_sent_ = false;
-        schedule_retry_locked();
+        schedule_status_retry_locked();
         persist_locked();
         return;
     }
@@ -975,7 +1163,7 @@ void V2cKeyProvisioningCoordinator::handle_reconcile_status_locked(
         blocked_reason_ = keyprov_blocked_reason::kAwaitCloudTermination;
         count_blocked_reason_locked(keyprov_blocked_reason::kAwaitCloudTermination);
         state_ = V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION;
-        schedule_retry_locked();
+        schedule_status_retry_locked();
         persist_locked();
         return;
     }
@@ -983,69 +1171,110 @@ void V2cKeyProvisioningCoordinator::handle_reconcile_status_locked(
     // 匹配由 handle_routed_downlink 入口的 awaiting_* 隔离覆盖（requestId +
     // store_generation + fingerprint；证书摘要变化体现为 fingerprint 变化）。
 
-    switch (status.status) {
-        case kKeyProvStatusActive: {
-            // 云端已有 ACTIVE 批次：SEC COMMITTED -> 恢复 ACK；否则等待受控终结。
-            if (reconcile_sec_journal_locked()) return;  // COMMITTED/EVIDENCE_CONFLICT
-            if (sec_outcome_unknown_) return;  // fail-closed 状态已由 reconcile 设置
-            // SEC NOT_FOUND 但 VMD 有 ACTIVE 批次：非终态，等待云端终结。
-            blocked_reason_ = keyprov_blocked_reason::kSecImportNotFound;
-            state_ = V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION;
-            schedule_retry_locked();
-            if (!reconcile_obs_suppressed_locked(
-                    status.status, last_sec_evidence_kind_)) {
-                count_blocked_reason_locked(
-                    keyprov_blocked_reason::kSecImportNotFound);
-                persist_locked();
-            }
-            return;
+    // CR-015 §22.5：先重查 SEC 权威事实；TERMINAL_HANDLED/WAIT_SEC 已消费本轮。
+    const ReconcileAction action = reconcile_sec_journal_locked();
+    if (action != ReconcileAction::ALLOW_READONLY_REMOTE) return;
+
+    // 稳定化期间只读缓存最近 VMD 观测（proven 后用于云端矩阵；不写盘风暴抑制）。
+    cached_vmd_status_ = status.status;
+
+    // ACTIVE/SUCCEEDED：无论是否 proven 均不得重开（云端事实与件内事实分裂，
+    // 自动创建新 attempt 可能覆盖业务版本/制造第二批次）-> AWAIT_REMOTE_REPAIR，
+    // 只允许只读查询和人工/云端终结（REQ-005/§7.3）。
+    if (status.status == kKeyProvStatusActive) {
+        blocked_reason_ = keyprov_blocked_reason::kAwaitRemoteRepair;
+        record_.last_error = "vmd_active_sec_not_found";
+        count_blocked_reason_locked(
+            keyprov_blocked_reason::kAwaitRemoteRepair);
+        transition_to_locked(V2cKeyProvState::AWAIT_REMOTE_REPAIR);
+        schedule_status_retry_locked();
+        persist_locked();
+        return;
+    }
+
+    // 非 proven 或 SEC 尚未给出无副作用证明（NOT_FOUND）：不 supersede
+    // （VMD FAILED 仅作为待释放条件缓存，不得单独触发新 attempt；REQ-004）。
+    // AWAIT_REMOTE_REPAIR 收到 FAILED（云端已终结）时恢复稳定化以完成证明。
+    if (resolution_ != ImportInvocationResolution::NO_SIDE_EFFECT_PROVEN ||
+        sec_outcome_unknown_) {
+        if (state_ == V2cKeyProvState::AWAIT_REMOTE_REPAIR &&
+            status.status == kKeyProvStatusFailed) {
+            enter_reconcile_evidence_locked("vmd_terminated_resume_stabilization");
+        } else if (!reconcile_obs_suppressed_locked(
+                       status.status, last_sec_evidence_kind_)) {
+            // 退避已由 reconcile_sec_journal 调度，此处仅持久化（相同三元组抑制）。
+            persist_locked();
         }
+        return;
+    }
+
+    // proven 且 SEC 已确认 NOT_FOUND：完整云端决策矩阵（§22.6）。
+    apply_cloud_matrix_locked(status.status);
+}
+
+// CR-015 §22.6：完整云端决策矩阵（仅 proven + SEC NOT_FOUND 时释放；
+// FAILED 预生成唯一 successor）。
+void V2cKeyProvisioningCoordinator::apply_cloud_matrix_locked(int vmd_status) {
+    if (resolution_ != ImportInvocationResolution::NO_SIDE_EFFECT_PROVEN ||
+        sec_outcome_unknown_) {
+        // 非 proven 或 SEC 未确认 NOT_FOUND：不 supersede（REQ-005：任一
+        // UNKNOWN 或矛盾证据优先于已累计计数）。
+        return;
+    }
+    switch (vmd_status) {
         case kKeyProvStatusFailed: {
-            // VMD 已终结（FAILED）——当前协议唯一被认可的可释放终态（用户裁决：
-            // 不把无 error 的 UNSPECIFIED 当可释放）。
-            if (reconcile_sec_journal_locked()) return;  // COMMITTED/EVIDENCE_CONFLICT
-            if (sec_outcome_unknown_) {
-                // SEC 未给出明确事实（Failed/OutcomeUnknown/QueryError/
-                // ContractUnknown）：不得断言无副作用/建新 attempt，保持对账。
-                return;  // reconcile 已设置 RECONCILE + blocked_reason + 退避
-            }
-            // 仅 SEC NOT_FOUND（sec_no_side_effects_proven_）且无本地冲突：
-            // SUPERSEDED_REMOTE。原子终态化旧 record，带 supersedesRequestId
-            // 创建新 record，再调度发送（CR-014 §21.4 步骤 5/6，不得先清空）。
+            // VMD 已终结（FAILED）——当前协议唯一被认可的可释放终态。
+            // 预生成唯一 successor（幂等恢复：崩溃后重启复用同一 requestId），
+            // 原子终态化旧 record，带 supersedesRequestId 创建新 record。
             counters_.superseded_remote++;
             record_.last_error = "vmd_batch_terminated";
+            if (successor_request_id_.empty()) {
+                successor_request_id_ = generate_id("kp");
+                successor_request_id_digest_ =
+                    tbox::fw::hash::sha256_hex(
+                        std::string_view(successor_request_id_));
+            }
+            cached_vmd_status_ = -1;  // 已消费：避免同轮/后续重复触发 supersede
             state_ = V2cKeyProvState::SUPERSEDED_REMOTE;
             persist_locked();
             create_new_attempt_locked();
             return;
         }
-        case kKeyProvStatusUnspecified: {
-            // UNSPECIFIED 无协议冻结语义证明“批次不存在/已终结并释放”：
-            // 一律 fail-closed（用户裁决），不得当作可释放终态。
-            if (reconcile_sec_journal_locked()) return;
-            if (sec_outcome_unknown_) return;
-            blocked_reason_ = keyprov_blocked_reason::kSecImportNotFound;
-            state_ = V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION;
-            schedule_retry_locked();
-            if (!reconcile_obs_suppressed_locked(
-                    status.status, last_sec_evidence_kind_)) {
-                count_blocked_reason_locked(
-                    keyprov_blocked_reason::kSecImportNotFound);
-                persist_locked();
-            }
+        case kKeyProvStatusActive: {
+            blocked_reason_ = keyprov_blocked_reason::kAwaitRemoteRepair;
+            record_.last_error = "vmd_active_sec_not_found";
+            count_blocked_reason_locked(
+                keyprov_blocked_reason::kAwaitRemoteRepair);
+            transition_to_locked(V2cKeyProvState::AWAIT_REMOTE_REPAIR);
+            schedule_status_retry_locked();
+            persist_locked();
             return;
         }
         case kKeyProvStatusRequested:
         case kKeyProvStatusIssued:
         case kKeyProvStatusAckPending: {
             // VMD 有未终结批次：等待受控终结（不调用 MPT 治理接口）。
-            if (reconcile_sec_journal_locked()) return;
-            if (sec_outcome_unknown_) return;
             blocked_reason_ = keyprov_blocked_reason::kSecImportNotFound;
-            state_ = V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION;
-            schedule_retry_locked();
+            transition_to_locked(
+                V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION);
+            schedule_status_retry_locked();
             if (!reconcile_obs_suppressed_locked(
-                    status.status, last_sec_evidence_kind_)) {
+                    vmd_status, last_sec_evidence_kind_)) {
+                count_blocked_reason_locked(
+                    keyprov_blocked_reason::kSecImportNotFound);
+                persist_locked();
+            }
+            return;
+        }
+        case kKeyProvStatusUnspecified: {
+            // UNSPECIFIED 无协议冻结语义证明“批次不存在/已终结并释放”：
+            // 一律 fail-closed（用户裁决），不得当作可释放终态。
+            blocked_reason_ = keyprov_blocked_reason::kSecImportNotFound;
+            transition_to_locked(
+                V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION);
+            schedule_status_retry_locked();
+            if (!reconcile_obs_suppressed_locked(
+                    vmd_status, last_sec_evidence_kind_)) {
                 count_blocked_reason_locked(
                     keyprov_blocked_reason::kSecImportNotFound);
                 persist_locked();
@@ -1055,13 +1284,11 @@ void V2cKeyProvisioningCoordinator::handle_reconcile_status_locked(
         case 6:  // KEY_PROVISIONING_STATUS_UNKNOWN
         default: {
             // VMD 状态未知：非终态，SEC NOT_FOUND 不足以覆盖 VMD 未知。
-            if (reconcile_sec_journal_locked()) return;
-            if (sec_outcome_unknown_) return;
             blocked_reason_ = keyprov_blocked_reason::kVmdOutcomeUnknown;
-            state_ = V2cKeyProvState::RECONCILE_OLD_ATTEMPT;
-            schedule_retry_locked();
+            transition_to_locked(V2cKeyProvState::RECONCILE_REMOTE);
+            schedule_status_retry_locked();
             if (!reconcile_obs_suppressed_locked(
-                    status.status, last_sec_evidence_kind_)) {
+                    vmd_status, last_sec_evidence_kind_)) {
                 count_blocked_reason_locked(
                     keyprov_blocked_reason::kVmdOutcomeUnknown);
                 persist_locked();
@@ -1078,6 +1305,13 @@ void V2cKeyProvisioningCoordinator::transition_to_locked(
                       "->" + v2c_key_prov_state_to_string(next);
     counters_.attempt_transitions_total[key]++;
     state_ = next;
+    // CR-015：恢复/诊断阶段随状态迁移同步（仅可观测性）。
+    const char* phase = recovery_phase_for_state(next);
+    if (phase && *phase) {
+        recovery_phase_ = phase;
+    } else {
+        recovery_phase_.clear();
+    }
 }
 
 void V2cKeyProvisioningCoordinator::count_blocked_reason_locked(
@@ -1093,7 +1327,11 @@ void V2cKeyProvisioningCoordinator::count_blocked_reason_locked(
         // CR-014：SEC 证据阻断细分
         keyprov_blocked_reason::kSecImportNotFound,
         keyprov_blocked_reason::kSecImportInProgress,
-        keyprov_blocked_reason::kEvidenceConflict};
+        keyprov_blocked_reason::kEvidenceConflict,
+        // CR-015：证据收敛与恢复细分
+        keyprov_blocked_reason::kStabilizingSecNotFound,
+        keyprov_blocked_reason::kAwaitRemoteRepair,
+        keyprov_blocked_reason::kHardEvidenceConflict};
     const char* key = keyprov_blocked_reason::kUnknown;
     for (const char* k : kKnown) {
         if (std::strcmp(k, r) == 0) {
@@ -1121,6 +1359,186 @@ bool V2cKeyProvisioningCoordinator::reconcile_obs_suppressed_locked(
     return false;
 }
 
+// ============================================================
+// CR-015 §22.5：SEC NOT_FOUND 稳定化辅助
+// ============================================================
+bool V2cKeyProvisioningCoordinator::no_side_effects_proven_locked() const {
+    if (resolution_ != ImportInvocationResolution::NO_SIDE_EFFECT_PROVEN) {
+        return false;
+    }
+    // 即使 resolution=proven，仍须无相反本地证据（REQ-002 #6：不跳过反证检查）。
+    return !contrary_local_evidence_locked();
+}
+
+bool V2cKeyProvisioningCoordinator::same_attempt_locked(
+    const SecImportEvidence& ev) const {
+    if (record_.request_id.empty() ||
+        ev.request_id_digest.size() != 32) {
+        return false;
+    }
+    auto d = tbox::fw::hash::sha256(std::string_view(record_.request_id));
+    return std::equal(d.begin(), d.end(), ev.request_id_digest.begin());
+}
+
+bool V2cKeyProvisioningCoordinator::cas_generation_matches_locked(
+    const SecImportEvidence& ev) const {
+    return ev.observed_store_generation == store_generation_;
+}
+
+bool V2cKeyProvisioningCoordinator::contrary_local_evidence_locked() const {
+    // staging/partial（内存 import bundle）、ACK proof（已构建）等相反证据；
+    // import invocation 本身是待稳定化的事实，不算相反证据（REQ-002 #6）。
+    return !pending_items_.empty() || !ack_items_.empty();
+}
+
+uint32_t V2cKeyProvisioningCoordinator::stabilization_window_ms_locked() const {
+    if (config_.not_found_stabilization_window_ms > 0) {
+        return config_.not_found_stabilization_window_ms;
+    }
+    // 稳定窗 = SEC import IPC 调用 deadline + 迟到回调宽限（独立配置，有界）。
+    return config_.sec_import_timeout_ms + config_.sec_callback_grace_ms;
+}
+
+void V2cKeyProvisioningCoordinator::reset_not_found_stabilization_locked(
+    const char* result) {
+    const char* key = (result && *result) ? result : "RESET";
+    counters_.sec_not_found_stabilization_total[key]++;
+    if (stab_.consecutive_count > 0) {
+        stab_.consecutive_count = 0;
+        stab_.first_observed_monotonic_ms = -1;
+        stab_.last_observed_monotonic_ms = -1;
+        sec_not_found_first_observed_wall_ms_ = -1;
+        sec_not_found_last_observed_wall_ms_ = -1;
+    }
+}
+
+void V2cKeyProvisioningCoordinator::restart_not_found_stabilization_for_locked(
+    const SecImportEvidence& ev) {
+    // 新 epoch：计数与时间窗清零（保留已观测分类 resolution）。
+    reset_not_found_stabilization_locked("RESET_EPOCH_CHANGED");
+    stab_.sec_capability_epoch = current_sec_capability_epoch_;
+    stab_.sec_contract_version = ev.sec_import_result_contract_version;
+    stab_.request_id_digest = ev.request_id_digest;
+    stab_.attempt_generation = ev.observed_store_generation;
+}
+
+void V2cKeyProvisioningCoordinator::observe_not_found_locked(
+    const SecImportEvidence& ev) {
+    if (!same_attempt_locked(ev) || !cas_generation_matches_locked(ev)) {
+        return;  // 迟到/错配证据不推进
+    }
+    const int64_t now_mono = now_monotonic_ms();
+    // SEC 重启/能力代际变化：计数清零重新累计（REQ-002 #3）。
+    if (stab_.sec_capability_epoch == 0 ||
+        stab_.sec_capability_epoch != current_sec_capability_epoch_) {
+        restart_not_found_stabilization_for_locked(ev);
+    }
+    // 非同 attempt（requestId/generation 变化）：重置后重计。
+    if (stab_.request_id_digest != ev.request_id_digest ||
+        stab_.attempt_generation != ev.observed_store_generation) {
+        reset_not_found_stabilization_locked("RESET_ATTEMPT_CHANGED");
+    }
+    if (stab_.consecutive_count == 0) {
+        stab_.first_observed_monotonic_ms = now_mono;  // 单调窗起点
+    }
+    // 使用更新后的值（不含入口快照的 pending_callback）。
+    stab_.request_id_digest = ev.request_id_digest;
+    stab_.attempt_generation = ev.observed_store_generation;
+    stab_.sec_contract_version = ev.sec_import_result_contract_version;
+    stab_.consecutive_count++;
+    stab_.last_observed_monotonic_ms = now_mono;
+    // wall clock 仅诊断（稳定窗判定使用单调时钟）。
+    const int64_t wall = now_ms();
+    if (sec_not_found_first_observed_wall_ms_ < 0) {
+        sec_not_found_first_observed_wall_ms_ = wall;
+    }
+    sec_not_found_last_observed_wall_ms_ = wall;
+}
+
+void V2cKeyProvisioningCoordinator::prove_no_side_effects_locked() {
+    if (resolution_ == ImportInvocationResolution::NO_SIDE_EFFECT_PROVEN) {
+        return;
+    }
+    resolution_ = ImportInvocationResolution::NO_SIDE_EFFECT_PROVEN;
+    counters_.sec_not_found_stabilization_total["REACHED"]++;
+    sec_outcome_unknown_ = false;
+    blocked_reason_.clear();
+    transition_to_locked(V2cKeyProvState::RECONCILE_REMOTE);
+    persist_locked();
+    LogAdapter::keyprov().info(
+        "tsp.keyprov.sec_not_found_stabilized",
+        "SEC 强 NOT_FOUND 稳定化达成：处置为已证明无副作用", {
+            {"count", tbox::fw::log::FieldValue::makeInt(
+                static_cast<int64_t>(stab_.consecutive_count))},
+            {"contract", tbox::fw::log::FieldValue::makeInt(
+                static_cast<int64_t>(stab_.sec_contract_version))},
+            {"epoch", tbox::fw::log::FieldValue::makeInt(
+                static_cast<int64_t>(current_sec_capability_epoch_))},
+            {"generation", tbox::fw::log::FieldValue::makeInt(
+                static_cast<int64_t>(store_generation_))}
+        });
+    // 云端决策矩阵由调用方统一执行一次（do_reconcile 用缓存 / handle_reconcile_status
+    // 用新响应），避免同轮重复 supersede。
+}
+
+void V2cKeyProvisioningCoordinator::enter_hard_blocked_locked(
+    const char* reason) {
+    resolution_ = ImportInvocationResolution::HARD_CONFLICT;
+    blocked_reason_ = (reason && *reason)
+                          ? reason
+                          : keyprov_blocked_reason::kHardEvidenceConflict;
+    record_.last_error = "hard_evidence_conflict";
+    count_blocked_reason_locked(blocked_reason_.c_str());
+    counters_.hard_conflicts_total[blocked_reason_]++;
+    transition_to_locked(V2cKeyProvState::HARD_BLOCKED);
+    schedule_retry_locked();
+    persist_locked();
+    LogAdapter::keyprov().warn(
+        "tsp.keyprov.hard_evidence_conflict",
+        "SEC 证据矛盾：已证明无副作用后又出现相反证据，禁止自动释放，等待人工治理", {
+            {"generation", tbox::fw::log::FieldValue::makeInt(
+                static_cast<int64_t>(store_generation_))},
+            {"contract", tbox::fw::log::FieldValue::makeInt(
+                static_cast<int64_t>(sec_import_result_contract_version_))}
+        });
+}
+
+void V2cKeyProvisioningCoordinator::enter_reconcile_evidence_locked(
+    const char* reason) {
+    if (reason && *reason) record_.last_error = reason;
+    blocked_reason_ = keyprov_blocked_reason::kStabilizingSecNotFound;
+    transition_to_locked(V2cKeyProvState::RECONCILE_EVIDENCE);
+    schedule_status_retry_locked();
+    persist_locked();
+}
+
+// CR-015 §22.5/§22.7：StatusRequest 专用退避（1s、2s、4s…max，有界+抖动）。
+void V2cKeyProvisioningCoordinator::schedule_status_retry_locked() {
+    uint32_t backoff =
+        status_backoff_ms_ == 0 ? config_.status_request_initial_interval_ms
+                                : status_backoff_ms_;
+    if (config_.retry_jitter && backoff > 0) {
+        static thread_local std::mt19937 rng{std::random_device{}()};
+        std::uniform_int_distribution<uint32_t> dist(0, backoff / 4 + 1);
+        backoff += dist(rng);
+    }
+    next_retry_ms_ = now_ms() + backoff;
+    uint64_t next = static_cast<uint64_t>(backoff) *
+                    static_cast<uint64_t>(config_.retry_multiplier <= 0
+                                              ? 2
+                                              : config_.retry_multiplier);
+    if (next > config_.status_request_max_interval_ms) {
+        next = config_.status_request_max_interval_ms;
+    }
+    status_backoff_ms_ = static_cast<uint32_t>(next);
+}
+
+int64_t V2cKeyProvisioningCoordinator::now_monotonic_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 void V2cKeyProvisioningCoordinator::mark_submitted_locked() {
     submission_ = keyprov_submission::kSubmitted;
 }
@@ -1141,6 +1559,9 @@ void V2cKeyProvisioningCoordinator::refresh_sec_readiness_locked() {
     KeyprovReadiness r = keyprov_build_lock_readiness();
     tbox::sec::V2cKeyProvisioningCapability cap;
     ErrorCode ec = sec_->get_v2c_key_provisioning_capability(cap);
+    // CR-015 §22.4：SEC capability epoch 追踪（查询失败→成功 / 契约版本变化 /
+    // NOT_FOUND 能力位变化 = SEC 重启/能力代际边界）。
+    update_sec_capability_epoch_locked(ec, cap);
     // 查询失败/未实现：SEC 四项保持 false（fail-closed），不得用 NOT_READY 归约。
     if (ec == ErrorCode::SUCCESS) {
         keyprov_apply_sec_capability(cap, r);
@@ -1150,6 +1571,32 @@ void V2cKeyProvisioningCoordinator::refresh_sec_readiness_locked() {
         sec_import_result_contract_version_ = 0;
     }
     readiness_ = r;
+}
+
+// CR-015 §22.4/§10：TSP 本地生成 SEC capability epoch。
+// 若 adapter 无法取得稳定 capability epoch，用查询失败→成功、契约版本变化与
+// NOT_FOUND 能力位变化近似“SEC 重启/能力代际变化”边界。epoch 变化时稳定化计数清零。
+void V2cKeyProvisioningCoordinator::update_sec_capability_epoch_locked(
+    tbox::sec::ErrorCode ec,
+    const tbox::sec::V2cKeyProvisioningCapability& cap) {
+    if (ec != ErrorCode::SUCCESS) {
+        // SEC 不可达：epoch 未知；恢复后（查询成功）视为新代际。
+        sec_capability_unavailable_ = true;
+        return;
+    }
+    if (sec_capability_unavailable_ ||
+        cap.capability_contract_version != last_sec_capability_contract_ ||
+        cap.business_key_import_result_not_found_v1 !=
+            last_capability_not_found_flag_) {
+        ++current_sec_capability_epoch_;   // SEC 重启/能力代际变化：递增
+    }
+    if (current_sec_capability_epoch_ == 0) {
+        current_sec_capability_epoch_ = 1;  // 首次成功查询
+    }
+    sec_capability_unavailable_ = false;
+    last_sec_capability_contract_ = cap.capability_contract_version;
+    last_capability_not_found_flag_ =
+        cap.business_key_import_result_not_found_v1;
 }
 
 bool V2cKeyProvisioningCoordinator::capability_gate_locked(
@@ -1301,22 +1748,11 @@ void V2cKeyProvisioningCoordinator::tick_locked() {
             break;
         case V2cKeyProvState::BLOCKED:
             if (blocked_reason_ == keyprov_blocked_reason::kEvidenceConflict) {
-                // CR-014 §21.4/用户裁决：EVIDENCE_CONFLICT 持续阻断直至新权威证据。
-                // 新权威事实（SEC 重启/能力代际变化 = capability 事件）立即只读重查
-                // SEC journal；其余周期退避重查（journal 状态变化/pending callback
-                // 收敛）。COMMITTED -> 恢复原 ACK；其余保持阻断并继续退避。
-                // 不得经 do_check 自动回到申请/释放流程。
-                const bool new_fact = capability_event_seen_;
-                capability_event_seen_ = false;
-                if (new_fact || next_retry_ms_ <= now) {
-                    if (reconcile_sec_journal_locked()) break;  // 已消费（含重新退避）
-                    // reconcile 返回 false：若冲突前提消失（转常规对账），状态已由
-                    // reconcile 设置并退避；仍保持 BLOCKED 时只补一次退避。
-                    if (state_ == V2cKeyProvState::BLOCKED) {
-                        schedule_retry_locked();
-                    }
-                    break;
-                }
+                // 防御路径：不应再产生 BLOCKED+EVIDENCE_CONFLICT（CR-015 已改由
+                // RECONCILE_EVIDENCE/STABILIZING 表达）；若旧记录仍在此态，
+                // 转稳定化入口处理（SEC 权威查询驱动，不永久阻断）。
+                if (next_retry_ms_ > now) break;
+                do_reconcile_locked();
                 break;
             }
             if (capability_event_seen_) {
@@ -1346,9 +1782,35 @@ void V2cKeyProvisioningCoordinator::tick_locked() {
                 send_status_request_locked();
             } else if (deadline_ms_ > 0 && now >= deadline_ms_) {
                 reconcile_status_sent_ = false;
-                schedule_retry_locked();
+                schedule_status_retry_locked();
                 persist_locked();
             }
+            break;
+        // ---- TBOX-TSP-DSN-CR-015 §22.4：证据收敛与恢复 ----
+        case V2cKeyProvState::RECONCILE_EVIDENCE:
+        case V2cKeyProvState::STABILIZING_NOT_FOUND:
+        case V2cKeyProvState::RECONCILE_REMOTE:
+            // 证据对账/稳定化/云端矩阵：SEC 权威查询 + 只读 VMD Status，
+            // 尊重退避（SEC 重启/capability 事件经 readiness 提前唤醒，不绕过退避）。
+            if (next_retry_ms_ > now) return;
+            do_reconcile_locked();
+            break;
+        case V2cKeyProvState::AWAIT_REMOTE_REPAIR:
+            // VMD ACTIVE/SUCCEEDED：绝不重开/导入；只读观察云端终态，
+            // 云端终结（FAILED）后经 handle_reconcile_status 恢复稳定化/释放。
+            if (next_retry_ms_ > now) return;
+            if (!reconcile_status_sent_) {
+                send_status_request_locked();
+            } else if (deadline_ms_ > 0 && now >= deadline_ms_) {
+                reconcile_status_sent_ = false;
+                schedule_status_retry_locked();
+                persist_locked();
+            }
+            break;
+        case V2cKeyProvState::HARD_BLOCKED:
+            // 矛盾证据：仅诊断查询（SEC 重查），不做自动变更；人工治理。
+            if (next_retry_ms_ > now) return;
+            do_reconcile_locked();
             break;
         case V2cKeyProvState::ACTIVE:
             break;
@@ -1530,8 +1992,10 @@ void V2cKeyProvisioningCoordinator::do_import_locked() {
     }
     // CR-014：先持久化 import invocation 证据再调用（崩溃点可审计"已调用"），
     // 避免"调用过但无记录"的窗口被误判为从未调用。
+    // CR-015：记录调用意图后导入意图处置转为 UNRESOLVED（需稳定化证明无副作用）。
     if (!import_invocation_recorded_) {
         import_invocation_recorded_ = true;
+        resolution_ = ImportInvocationResolution::UNRESOLVED;
         persist_locked();
     }
     tbox::sec::ImportResult res;
@@ -1628,14 +2092,11 @@ void V2cKeyProvisioningCoordinator::handle_import_result_locked(
     }
     if (ec == ErrorCode::SUCCESS &&
         result.state == BusinessKeyImportState::NOT_FOUND) {
-        // CR-014：import 已调用但 SEC 结构化证明无记录 -> 证据冲突，持续阻断
-        // （不自动重试/释放；等待新权威证据）。
+        // CR-015：import 已调用但 SEC 结构化证明无记录 -> 进入证据稳定化
+        // （旧行为：永久 EVIDENCE_CONFLICT 阻断；新行为：RECONCILE_EVIDENCE
+        // 稳定化入口，连续强 NOT_FOUND 后按云端终态收敛，不立即释放）。
         pending_callback_ = false;
-        blocked_reason_ = keyprov_blocked_reason::kEvidenceConflict;
-        record_.last_error = "evidence_conflict";
-        count_blocked_reason_locked(keyprov_blocked_reason::kEvidenceConflict);
-        state_ = V2cKeyProvState::BLOCKED;
-        persist_locked();
+        enter_reconcile_evidence_locked("import_result_not_found");
         return;
     }
     if (ec == ErrorCode::BUSINESS_KEY_IMPORT_UNKNOWN ||
@@ -1798,6 +2259,19 @@ void V2cKeyProvisioningCoordinator::persist_locked() {
     record_.sec_evidence_observed_store_generation = store_generation_;
     record_.sec_evidence_observed_at_ms = now_ms();
     record_.import_invocation = import_invocation_recorded_;
+    // CR-015 v4：导入意图处置与稳定化（非敏感；wall clock 仅诊断）
+    record_.import_invocation_resolution =
+        static_cast<int>(resolution_);
+    record_.sec_not_found_count = stab_.consecutive_count;
+    record_.sec_not_found_first_observed_ms =
+        sec_not_found_first_observed_wall_ms_;
+    record_.sec_not_found_last_observed_ms =
+        sec_not_found_last_observed_wall_ms_;
+    record_.sec_capability_epoch = stab_.sec_capability_epoch;
+    record_.sec_contract_version = stab_.sec_contract_version;
+    record_.recovery_phase = recovery_phase_;
+    record_.successor_request_id = successor_request_id_;
+    record_.successor_request_id_digest = successor_request_id_digest_;
     if (!frozen_snapshot_.purposes.empty()) {
         record_.purposes.clear();
         for (int p : frozen_snapshot_.purposes) {

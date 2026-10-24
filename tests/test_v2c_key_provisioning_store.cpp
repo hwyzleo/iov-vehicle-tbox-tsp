@@ -260,6 +260,119 @@ TEST(V2cKeyProvisioningStoreTest, StoreGenerationPersisted) {
     EXPECT_EQ(store.load().store_generation, 42u);
 }
 
+// ============================================================
+// TBOX-TSP-DSN-CR-015 §22.3：schema v3 -> v4 迁移与 v4 round-trip
+// ============================================================
+
+// v4 round-trip：导入意图处置、稳定化字段与后继 digest 完整往返。
+TEST(V2cKeyProvisioningStoreTest, V4FieldsRoundTrip) {
+    auto root = temp_root();
+    V2cKeyProvisioningRecord rec = make_v2_record("kp-v4");
+    rec.import_invocation_resolution =
+        static_cast<int>(ImportInvocationResolution::NO_SIDE_EFFECT_PROVEN);
+    rec.sec_not_found_count = 3;
+    rec.sec_not_found_first_observed_ms = 111;
+    rec.sec_not_found_last_observed_ms = 222;
+    rec.sec_capability_epoch = 2;
+    rec.sec_contract_version = 2;
+    rec.recovery_phase = keyprov_recovery_phase::kStabilizingSecNotFound;
+    rec.successor_request_id = "kp-succ";
+    rec.successor_request_id_digest =
+        tbox::fw::hash::sha256_hex("kp-succ");
+    {
+        V2cKeyProvisioningStore store(root);
+        store.save(rec);
+    }
+    V2cKeyProvisioningStore store(root);
+    auto loaded = store.load();
+    ASSERT_TRUE(loaded.valid);
+    EXPECT_EQ(loaded.schema_version, kV2cStoreSchemaVersion);  // 4
+    EXPECT_EQ(loaded.import_invocation_resolution,
+              static_cast<int>(ImportInvocationResolution::NO_SIDE_EFFECT_PROVEN));
+    EXPECT_EQ(loaded.sec_not_found_count, 3u);
+    EXPECT_EQ(loaded.sec_not_found_first_observed_ms, 111);
+    EXPECT_EQ(loaded.sec_not_found_last_observed_ms, 222);
+    EXPECT_EQ(loaded.sec_capability_epoch, 2u);
+    EXPECT_EQ(loaded.sec_contract_version, 2u);
+    EXPECT_EQ(loaded.recovery_phase, keyprov_recovery_phase::kStabilizingSecNotFound);
+    EXPECT_EQ(loaded.successor_request_id, "kp-succ");
+    EXPECT_EQ(loaded.successor_request_id_digest,
+              tbox::fw::hash::sha256_hex("kp-succ"));
+}
+
+// v3 → v4 迁移：import_invocation 显式 false -> NO_SIDE_EFFECT_PROVEN
+// （TSP 未越过调用前持久化线性化点）；count 清零、epoch unknown、
+// recovery=RECONCILE_EVIDENCE、successor 清空。
+TEST(V2cKeyProvisioningStoreTest, V3MigratesInvocationFalseToProven) {
+    auto root = temp_root();
+    {
+        hwyz::store::Store raw = hwyz::store::Store::open("tsp", root);
+        nlohmann::json j = nlohmann::json::object();
+        j["schema_version"] = 3;
+        j["fingerprint_version"] = 1;
+        j["attempt_fingerprint"] = std::string(64, 'b');
+        j["request_id"] = "kp-v3false";
+        j["state"] = "RECONCILE_OLD_ATTEMPT";
+        j["import_invocation"] = false;  // 显式存在且为 false
+        raw.save<std::string>("keyprov.v2c.attempt.v2", j.dump());
+        raw.flush();
+    }
+    V2cKeyProvisioningStore store(root);
+    auto rec = store.load();
+    ASSERT_TRUE(rec.valid);
+    EXPECT_EQ(rec.import_invocation_resolution,
+              static_cast<int>(ImportInvocationResolution::NO_SIDE_EFFECT_PROVEN));
+    EXPECT_EQ(rec.sec_not_found_count, 0u);
+    EXPECT_EQ(rec.sec_capability_epoch, 0u);
+    EXPECT_EQ(rec.recovery_phase, keyprov_recovery_phase::kReconcileEvidence);
+    EXPECT_TRUE(rec.successor_request_id.empty());
+}
+
+// v3 → v4 迁移：import_invocation=true（已调用）-> UNRESOLVED（必须重新稳定化）；
+// 更老记录（v2 及以下缺字段）保守默认 true -> 同样 UNRESOLVED，不得因缺省值释放。
+TEST(V2cKeyProvisioningStoreTest, V3MigratesInvocationTrueToUnresolved) {
+    auto root = temp_root();
+    {
+        hwyz::store::Store raw = hwyz::store::Store::open("tsp", root);
+        nlohmann::json j = nlohmann::json::object();
+        j["schema_version"] = 3;
+        j["fingerprint_version"] = 1;
+        j["attempt_fingerprint"] = std::string(64, 'c');
+        j["request_id"] = "kp-v3true";
+        j["state"] = "BLOCKED";
+        j["blocked_reason"] = "EVIDENCE_CONFLICT";
+        j["import_invocation"] = true;
+        raw.save<std::string>("keyprov.v2c.attempt.v2", j.dump());
+        raw.flush();
+    }
+    V2cKeyProvisioningStore store(root);
+    auto rec = store.load();
+    ASSERT_TRUE(rec.valid);
+    EXPECT_EQ(rec.import_invocation_resolution,
+              static_cast<int>(ImportInvocationResolution::UNRESOLVED));
+    EXPECT_EQ(rec.recovery_phase, keyprov_recovery_phase::kReconcileEvidence);
+    EXPECT_EQ(rec.sec_not_found_count, 0u);
+
+    // v2 记录（无 import_invocation 字段）-> 保守默认 true -> UNRESOLVED。
+    auto root2 = temp_root();
+    {
+        hwyz::store::Store raw = hwyz::store::Store::open("tsp", root2);
+        nlohmann::json j = nlohmann::json::object();
+        j["schema_version"] = 2;
+        j["fingerprint_version"] = 1;
+        j["attempt_fingerprint"] = std::string(64, 'd');
+        j["request_id"] = "kp-v2missing";
+        j["state"] = "RECONCILE_OLD_ATTEMPT";
+        raw.save<std::string>("keyprov.v2c.attempt.v2", j.dump());
+        raw.flush();
+    }
+    V2cKeyProvisioningStore store2(root2);
+    auto rec2 = store2.load();
+    ASSERT_TRUE(rec2.valid);
+    EXPECT_EQ(rec2.import_invocation_resolution,
+              static_cast<int>(ImportInvocationResolution::UNRESOLVED));
+}
+
 int main(int argc, char** argv) {
     testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

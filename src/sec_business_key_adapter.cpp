@@ -51,6 +51,11 @@ SecImportEvidence sec_classify_import_result(
             break;
         case tbox::sec::BusinessKeyImportState::NOT_FOUND:
             ev.kind = SecImportEvidenceKind::NotFound;
+            // CR-015：仅“新 SEC + 强类型 NOT_FOUND + capability/contract 匹配”
+            // 才可派生无残留证明；旧契约/无法确认契约版本时不得用于稳定化。
+            ev.no_residue_proven =
+                sec_import_result_contract_version >=
+                kSecCr021NotFoundContractVersion;
             break;
         case tbox::sec::BusinessKeyImportState::REQUESTED:
         case tbox::sec::BusinessKeyImportState::STAGED:

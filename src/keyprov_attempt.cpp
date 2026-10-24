@@ -389,5 +389,33 @@ bool keyprov_is_idempotency_conflict(const KeyProvProtocolError& error) {
     return false;
 }
 
+// ============================================================
+// CR-015 §22.2：导入意图处置枚举字符串映射
+// ============================================================
+const char* keyprov_import_invocation_resolution_to_string(
+    ImportInvocationResolution r) {
+    switch (r) {
+        case ImportInvocationResolution::UNRESOLVED: return "UNRESOLVED";
+        case ImportInvocationResolution::NO_SIDE_EFFECT_PROVEN: return "NO_SIDE_EFFECT_PROVEN";
+        case ImportInvocationResolution::HARD_CONFLICT: return "HARD_CONFLICT";
+        default: return "?";
+    }
+}
+
+bool keyprov_import_invocation_resolution_from_string(
+    const std::string& s, ImportInvocationResolution& out) {
+    static const ImportInvocationResolution all[] = {
+        ImportInvocationResolution::UNRESOLVED,
+        ImportInvocationResolution::NO_SIDE_EFFECT_PROVEN,
+        ImportInvocationResolution::HARD_CONFLICT};
+    for (auto r : all) {
+        if (s == keyprov_import_invocation_resolution_to_string(r)) {
+            out = r;
+            return true;
+        }
+    }
+    return false;
+}
+
 } // namespace tsp
 } // namespace tbox

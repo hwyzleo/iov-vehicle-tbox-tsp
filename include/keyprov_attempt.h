@@ -132,7 +132,70 @@ constexpr const char* kUnknown = "UNKNOWN";
 constexpr const char* kSecImportNotFound = "SEC_IMPORT_NOT_FOUND";
 constexpr const char* kSecImportInProgress = "SEC_IMPORT_IN_PROGRESS";
 constexpr const char* kEvidenceConflict = "EVIDENCE_CONFLICT";
+// ---- TBOX-TSP-DSN-CR-015 §22.2/§22.4：证据收敛与恢复阻断细分 ----
+constexpr const char* kStabilizingSecNotFound = "STABILIZING_SEC_NOT_FOUND";
+constexpr const char* kAwaitRemoteRepair = "AWAIT_REMOTE_REPAIR";
+constexpr const char* kHardEvidenceConflict = "HARD_EVIDENCE_CONFLICT";
 } // namespace keyprov_blocked_reason
+
+// ============================================================
+// CR-015 §22.2/§22.5：导入意图处置与恢复阶段（受控枚举）
+// ============================================================
+// import_invocation_recorded 不清零（历史审计事实）；是否仍构成阻断由
+// ImportInvocationResolution 决定：
+//   - NO_SIDE_EFFECT_PROVEN：已证明/无本地调用意图（import_invocation=false）
+//   - UNRESOLVED：曾越过“调用前持久化”线性化点，尚需强 NOT_FOUND 稳定化
+//   - HARD_CONFLICT：已证明后出现矛盾证据（禁止自动释放，人工治理）
+// 数值为持久化格式，不得重排（仅追加）。
+enum class ImportInvocationResolution : uint8_t {
+    UNRESOLVED = 0,
+    NO_SIDE_EFFECT_PROVEN = 1,
+    HARD_CONFLICT = 2
+};
+
+const char* keyprov_import_invocation_resolution_to_string(
+    ImportInvocationResolution r);
+bool keyprov_import_invocation_resolution_from_string(
+    const std::string& s, ImportInvocationResolution& out);
+
+// 恢复/诊断阶段（recovery_phase 受控枚举；仅可观测性，不作为业务正确性依据）。
+namespace keyprov_recovery_phase {
+constexpr const char* kReconcileEvidence = "RECONCILE_EVIDENCE";
+constexpr const char* kStabilizingSecNotFound = "STABILIZING_SEC_NOT_FOUND";
+constexpr const char* kReconcileRemote = "RECONCILE_REMOTE";
+constexpr const char* kAwaitCloudTermination = "AWAIT_CLOUD_TERMINATION";
+constexpr const char* kAwaitRemoteRepair = "AWAIT_REMOTE_REPAIR";
+constexpr const char* kHardEvidenceConflict = "HARD_EVIDENCE_CONFLICT";
+} // namespace keyprov_recovery_phase
+
+// ============================================================
+// CR-015 §22.2：SEC NOT_FOUND 稳定化观测状态
+// ============================================================
+// 连续强 NOT_FOUND 的同 SEC 能力代际计数与时间窗。时间窗使用单调时钟
+// （重启后不得跨重启复用单调时间：重启时 first/last 置 unset 重新开始）。
+// wall-clock 仅用于诊断（persist 字段），不参与稳定窗判定。
+struct SecNotFoundStabilization {
+    uint32_t consecutive_count = 0;
+    int64_t first_observed_monotonic_ms = -1;  // 单调时钟；-1=未开始
+    int64_t last_observed_monotonic_ms = -1;
+    uint64_t sec_capability_epoch = 0;         // 0=unknown（必须重新查询）
+    uint32_t sec_contract_version = 0;         // 观测时 capability 契约版本
+    std::vector<uint8_t> request_id_digest;    // 32B raw（稳定化绑定的 requestId）
+    uint64_t attempt_generation = 0;           // store_generation（CAS 依据）
+};
+
+// ============================================================
+// CR-015 §22.5：SEC 证据对账动作（替代旧 bool consumed）
+// ============================================================
+// TERMINAL_HANDLED      ：COMMITTED/硬错误已完成状态迁移（本轮无需再发 Status）
+// WAIT_SEC              ：继续稳定化/阻断，本轮不发起新 import、不发 Status
+// ALLOW_READONLY_REMOTE ：可发送只读 VMD StatusRequest（稳定化期间只读缓存；
+//                         proven 后执行完整云端决策矩阵）
+enum class ReconcileAction : uint8_t {
+    TERMINAL_HANDLED = 0,
+    WAIT_SEC = 1,
+    ALLOW_READONLY_REMOTE = 2
+};
 
 // submission 状态受控枚举（persist_locked 使用）。
 namespace keyprov_submission {
