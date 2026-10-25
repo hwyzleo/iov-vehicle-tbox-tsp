@@ -137,6 +137,11 @@ enum class ProtocolErrorAction : uint8_t {
 // canonical VMD“批次不存在/未找到”码（ERR_NOT_FOUND）。只允许显式绑定该常量，
 // 不得以 message 文本或其它 code 推断批次不存在。
 constexpr int32_t kKeyProvErrorCodeNotFound = 806099;
+// VMD canonical 下行 ProtocolError.code 的符号名（ERR_NOT_FOUND 的实际 wire 值）；
+// 806099 是 VMD out-of-band 稳定码/旧链路透传兼容，两者都必须归一化为同一常量。
+constexpr const char* kKeyProvErrorCodeNotFoundWire =
+    "KEYPROV_PROVISIONING_NOT_FOUND";
+constexpr const char* kKeyProvErrorCodeNotFoundLegacy = "806099";
 
 // 规范化后的云端错误（Coordinator 矩阵输入；不直接依赖生成类型）。
 struct CloudProtocolError {
@@ -154,7 +159,8 @@ struct CloudStatusDecisionInput {
 };
 
 // 规范化 wire ProtocolError -> CloudProtocolError。
-// 只识别 code=="806099" -> kKeyProvErrorCodeNotFound、action=="DO_NOT_RETRY"；
+// 只识别 VMD ERR_NOT_FOUND 符号码（"KEYPROV_PROVISIONING_NOT_FOUND"）或其旧链路
+// 数字透传码（"806099"）-> kKeyProvErrorCodeNotFound、action=="DO_NOT_RETRY"；
 // 其它 code/action、缺失 error、默认 error 均映射为不匹配值（fail-closed）。
 CloudProtocolError keyprov_normalize_protocol_error(
     const KeyProvProtocolError& wire);

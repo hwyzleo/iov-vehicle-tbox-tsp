@@ -387,9 +387,11 @@ CloudProtocolError keyprov_normalize_protocol_error(
         return out;
     }
     out.present = true;
-    // code：只识别 canonical 806099；其余数值/文本一律映射 0（不可释放），
-    // 不做 message 文本匹配、不解析任意数字（未知/解析失败 fail-closed）。
-    if (wire.code == "806099") {
+    // code：只识别 VMD ERR_NOT_FOUND 符号码与旧链路数字透传码；其余数值/文本
+    // 一律映射 0（不可释放），不做 message 文本匹配、不解析任意数字
+    // （未知/解析失败 fail-closed）。
+    if (wire.code == kKeyProvErrorCodeNotFoundWire ||
+        wire.code == kKeyProvErrorCodeNotFoundLegacy) {
         out.code = kKeyProvErrorCodeNotFound;
     }
     out.retryable = wire.retryable;

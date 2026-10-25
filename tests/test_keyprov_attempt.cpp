@@ -240,6 +240,21 @@ TEST(KeyprovAttemptTest, NormalizeProtocolErrorRecognizesReleasableTuple) {
     EXPECT_EQ(e.action, ProtocolErrorAction::DO_NOT_RETRY);
 }
 
+TEST(KeyprovAttemptTest, NormalizeProtocolErrorRecognizesVmdSymbolicWireCode) {
+    // VMD canonical 下行 ProtocolError.code 实为 ERR_NOT_FOUND 符号名
+    // （"KEYPROV_PROVISIONING_NOT_FOUND"），806099 仅是 out-of-band 稳定码。
+    // 二者必须都能归一化为 kKeyProvErrorCodeNotFound（CR-016 现场回归）。
+    KeyProvProtocolError wire;
+    wire.code = kKeyProvErrorCodeNotFoundWire;
+    wire.retryable = false;
+    wire.action = "DO_NOT_RETRY";
+    auto e = keyprov_normalize_protocol_error(wire);
+    EXPECT_TRUE(e.present);
+    EXPECT_EQ(e.code, kKeyProvErrorCodeNotFound);
+    EXPECT_FALSE(e.retryable);
+    EXPECT_EQ(e.action, ProtocolErrorAction::DO_NOT_RETRY);
+}
+
 TEST(KeyprovAttemptTest, NormalizeProtocolErrorMissingErrorFailsClosed) {
     // 缺失 error（code 为空）：present=false，任何字段不得被判定为可释放。
     auto e = keyprov_normalize_protocol_error(KeyProvProtocolError{});

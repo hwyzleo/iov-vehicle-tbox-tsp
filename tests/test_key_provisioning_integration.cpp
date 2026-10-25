@@ -660,13 +660,16 @@ TEST(KeyProvisioningIntegrationTest, Unspecified806099EndToEndActive) {
     coord.handle_routed_downlink(de);
     EXPECT_EQ(coord.snapshot().state, V2cKeyProvState::RECONCILE_OLD_ATTEMPT);
 
-    // VMD 无批次：UNSPECIFIED + 806099 + retryable=false + DO_NOT_RETRY
+    // VMD 无批次：UNSPECIFIED + ERR_NOT_FOUND 符号码（VMD canonical 下行实际值）
+    // + retryable=false + DO_NOT_RETRY
     // -> 恰好一次 SUPERSEDED_REMOTE -> 唯一新 attempt（新 requestId）。
+    // 注意：VMD 下行 ProtocolError.code 是符号名 KEYPROV_PROVISIONING_NOT_FOUND
+    // （806099 仅 out-of-band 稳定码），此处必须用真实 wire 值防现场回归。
     KeyProvisioningStatusResponse st;
     st.set_request_id(rid);
     st.set_status(KEY_PROVISIONING_STATUS_UNSPECIFIED);
     auto* e = st.mutable_error();
-    e->set_code("806099");
+    e->set_code(kKeyProvErrorCodeNotFoundWire);
     e->set_retryable(false);
     e->set_action("DO_NOT_RETRY");
     std::string spayload;

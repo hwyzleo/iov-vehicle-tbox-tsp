@@ -2160,6 +2160,20 @@ void V2cKeyProvisioningCoordinator::handle_import_result_locked(
         persist_locked();
         return;
     }
+    // 确定性拒绝优先（fail-closed）：BUSINESS_KEY_NOT_READY（能力未就绪）与
+    // BUSINESS_KEY_UNSUPPORTED（算法/套件/信封格式不受支持）是确定性、非可重试的
+    // 配置/协议不匹配，必须 BLOCKED 而非按通用 FAILED 无限重发（现场：VMD 下发
+    // key_algorithm="AES" 不符协议 AES-256，SEC validate_structure 拒绝，TSP 曾
+    // 误判 import_unknown/import_failed 每 30s 无限重发）。恢复由 capability/就绪
+    // 事件或重启后的新 attempt 驱动。
+    if (ec == ErrorCode::BUSINESS_KEY_NOT_READY ||
+        ec == ErrorCode::BUSINESS_KEY_UNSUPPORTED) {
+        pending_callback_ = false;  // 能力问题，未受理，无待定回调
+        state_ = V2cKeyProvState::BLOCKED;
+        record_.last_error = "sec_not_ready";
+        persist_locked();
+        return;
+    }
     if (result.state == BusinessKeyImportState::FAILED ||
         ec == ErrorCode::WRAPPED_KEY_INVALID ||
         ec == ErrorCode::BUSINESS_KEY_CONFLICT ||
@@ -2170,14 +2184,6 @@ void V2cKeyProvisioningCoordinator::handle_import_result_locked(
         state_ = V2cKeyProvState::RETRY_WAIT;
         record_.last_error = "import_failed";
         schedule_retry_locked();
-        persist_locked();
-        return;
-    }
-    if (ec == ErrorCode::BUSINESS_KEY_NOT_READY ||
-        ec == ErrorCode::BUSINESS_KEY_UNSUPPORTED) {
-        pending_callback_ = false;  // 能力问题，未受理，无待定回调
-        state_ = V2cKeyProvState::BLOCKED;
-        record_.last_error = "sec_not_ready";
         persist_locked();
         return;
     }
