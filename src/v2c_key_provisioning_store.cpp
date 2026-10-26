@@ -169,6 +169,30 @@ nlohmann::json record_to_json(const V2cKeyProvisioningRecord& r) {
     j["recovery_phase"] = r.recovery_phase;
     j["successor_request_id"] = r.successor_request_id;
     j["successor_request_id_digest"] = r.successor_request_id_digest;
+    // ---- TBOX-TSP-DSN-CR-017 v5：KL1 预算/时间/链/迁移（非敏感） ----
+    j["lifecycle_profile"] = r.lifecycle_profile;
+    j["request_send_count"] = r.budget.request_send_count;
+    j["first_request_at_ms"] = r.budget.first_request_at_ms;
+    j["request_deadline_at_ms"] = r.budget.request_deadline_at_ms;
+    j["status_send_count"] = r.budget.status_send_count;
+    j["first_readonly_at_ms"] = r.budget.first_readonly_at_ms;
+    j["readonly_deadline_at_ms"] = r.budget.readonly_deadline_at_ms;
+    j["sec_query_count"] = r.budget.sec_query_count;
+    j["ack_send_count"] = r.budget.ack_send_count;
+    j["ack_safe_deadline_at_ms"] = r.budget.ack_safe_deadline_at_ms;
+    j["lease_expires_at_ms"] = r.lease_expires_at_ms;
+    j["expiry_freshen_count"] = r.budget.expiry_freshen_count;
+    j["budget_exhausted_reason"] = r.budget.budget_exhausted_reason;
+    j["chain_id"] = r.budget.chain_id;
+    j["chain_started_at_ms"] = r.budget.chain_started_at_ms;
+    j["chain_deadline_at_ms"] = r.budget.chain_deadline_at_ms;
+    j["chain_request_id_count"] = r.budget.chain_request_id_count;
+    j["migration_token"] = r.budget.migration_token;
+    j["migration_consumed"] = r.budget.migration_consumed;
+    j["sec_result_contract_version"] = r.sec_result_contract_version;
+    j["sec_query_semantics_version"] = r.sec_query_semantics_version;
+    j["sec_supports_lease_admission"] = r.sec_supports_lease_admission;
+    j["sec_kl1_profile_version"] = r.sec_kl1_profile_version;
     return j;
 }
 
@@ -272,6 +296,78 @@ V2cKeyProvisioningRecord V2cKeyProvisioningStore::load() const {
                 r.successor_request_id.clear();
                 r.successor_request_id_digest.clear();
             }
+            // ---- TBOX-TSP-DSN-CR-017 v5：KL1 预算/时间/链/迁移读取 ----
+            r.lifecycle_profile =
+                j.value("lifecycle_profile", std::string{});
+            r.budget.request_send_count =
+                j.value("request_send_count", 0u);
+            r.budget.first_request_at_ms =
+                j.value("first_request_at_ms", static_cast<int64_t>(0));
+            r.budget.request_deadline_at_ms =
+                j.value("request_deadline_at_ms", static_cast<int64_t>(0));
+            r.budget.status_send_count =
+                j.value("status_send_count", 0u);
+            r.budget.first_readonly_at_ms =
+                j.value("first_readonly_at_ms", static_cast<int64_t>(0));
+            r.budget.readonly_deadline_at_ms =
+                j.value("readonly_deadline_at_ms", static_cast<int64_t>(0));
+            r.budget.sec_query_count =
+                j.value("sec_query_count", 0u);
+            r.budget.ack_send_count = j.value("ack_send_count", 0u);
+            r.budget.ack_safe_deadline_at_ms =
+                j.value("ack_safe_deadline_at_ms", static_cast<int64_t>(0));
+            r.lease_expires_at_ms =
+                j.value("lease_expires_at_ms", static_cast<int64_t>(0));
+            r.budget.expiry_freshen_count =
+                j.value("expiry_freshen_count", 0u);
+            r.budget.budget_exhausted_reason =
+                j.value("budget_exhausted_reason", std::string{});
+            r.budget.chain_id = j.value("chain_id", std::string{});
+            r.budget.chain_started_at_ms =
+                j.value("chain_started_at_ms", static_cast<int64_t>(0));
+            r.budget.chain_deadline_at_ms =
+                j.value("chain_deadline_at_ms", static_cast<int64_t>(0));
+            r.budget.chain_request_id_count =
+                j.value("chain_request_id_count", 0u);
+            r.budget.migration_token =
+                j.value("migration_token", std::string{});
+            r.budget.migration_consumed =
+                j.value("migration_consumed", false);
+            r.sec_result_contract_version =
+                j.value("sec_result_contract_version", 0u);
+            r.sec_query_semantics_version =
+                j.value("sec_query_semantics_version", 0u);
+            r.sec_supports_lease_admission =
+                j.value("sec_supports_lease_admission", false);
+            r.sec_kl1_profile_version =
+                j.value("sec_kl1_profile_version", 0u);
+            // v4->v5 迁移（CR-017 §3）：旧 attempt 缺 KL1 预算/时间事实。
+            // - Request 预算判已耗尽（不重发旧 ID；现场 attempt_count=22 同理）；
+            // - 只授予一次迁移只读窗口（<=12 Status / 12 SEC / 300s），并先落盘
+            //   迁移 token；任何异常不自动新链；
+            // - 原所有 v4 字段原样保留，不因仅改 schema_version 丢状态。
+            if (r.schema_version < 5 && r.valid) {
+                r.schema_version = kV2cStoreSchemaVersion;  // 迁移后版本
+                r.lifecycle_profile = "keyprov-lifecycle-kl1-v1";
+                const uint32_t kRequestLimit = 8;  // 与共享向量 request_limit 一致
+                if (r.budget.request_send_count == 0) {
+                    r.budget.request_send_count = kRequestLimit;  // 旧 attempt 判已耗尽
+                }
+                r.budget.first_request_at_ms = 0;  // 旧事实缺失，不伪造首次时间
+                r.budget.request_deadline_at_ms = 0;
+                // 迁移只读窗口：从首次 load 起 300s 内 <=12 Status / 12 SEC。
+                if (r.budget.first_readonly_at_ms == 0) {
+                    r.budget.first_readonly_at_ms = r.updated_at_ms;
+                    r.budget.readonly_deadline_at_ms =
+                        r.updated_at_ms + 300000;
+                }
+                if (r.budget.migration_token.empty()) {
+                    r.budget.migration_token = "mig-" + r.request_id;  // 稳定、单次发放
+                }
+                r.budget.migration_consumed = false;
+            }
+            // schema/fingerprint 版本守卫：未知版本不得降级解释（CR-013 §4/§10）。
+            // 未知 schema/截断/校验错：fail-closed 隔离（不当新设备申请）。
             // schema/fingerprint 版本守卫：未知版本不得降级解释（CR-013 §4/§10）。
             if (r.schema_version > kV2cStoreSchemaVersion ||
                 (r.fingerprint_version > kAttemptFingerprintVersionCurrent)) {

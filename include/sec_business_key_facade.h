@@ -106,6 +106,32 @@ public:
         (void)out;
         return tbox::sec::ErrorCode::NOT_IMPLEMENTED;
     }
+
+    // ---- TBOX-TSP-DSN-CR-017 / TBOX-SEC-DSN-CR-023：KL1 契约快照与租约准入 ----
+    // 默认 NOT_IMPLEMENTED（fail-closed）：仅 SEC 支持时才启用 KL1 导入路径。
+    virtual tbox::sec::ErrorCode get_keyprov_contract_snapshot(
+        tbox::sec::KeyprovContractSnapshot& out) {
+        (void)out;
+        return tbox::sec::ErrorCode::NOT_IMPLEMENTED;
+    }
+    virtual tbox::sec::ErrorCode import_wrapped_business_keys_kl1(
+        const std::string& request_id,
+        const std::string& business_domain,
+        const std::vector<tbox::sec::WrappedKeyItem>& items,
+        const tbox::sec::KeyprovImportContext& context,
+        tbox::sec::ImportResult& out,
+        tbox::sec::KeyprovResultAttachment& attach) {
+        (void)request_id; (void)business_domain; (void)items; (void)context;
+        (void)out; (void)attach;
+        return tbox::sec::ErrorCode::NOT_IMPLEMENTED;
+    }
+    virtual tbox::sec::ErrorCode get_business_key_import_result_kl1(
+        const std::string& request_id,
+        tbox::sec::ImportResult& out,
+        tbox::sec::KeyprovResultAttachment& attach) {
+        (void)request_id; (void)out; (void)attach;
+        return tbox::sec::ErrorCode::NOT_IMPLEMENTED;
+    }
 };
 
 // MqttFacade 的 SEC 对应实现：包装 tbox::sec::SecClient。
@@ -138,6 +164,21 @@ public:
 
     tbox::sec::ErrorCode get_v2c_key_provisioning_capability(
         tbox::sec::V2cKeyProvisioningCapability& out) override;
+
+    // ---- TBOX-TSP-DSN-CR-017 / TBOX-SEC-DSN-CR-023：KL1 契约快照与租约准入 ----
+    tbox::sec::ErrorCode get_keyprov_contract_snapshot(
+        tbox::sec::KeyprovContractSnapshot& out) override;
+    tbox::sec::ErrorCode import_wrapped_business_keys_kl1(
+        const std::string& request_id,
+        const std::string& business_domain,
+        const std::vector<tbox::sec::WrappedKeyItem>& items,
+        const tbox::sec::KeyprovImportContext& context,
+        tbox::sec::ImportResult& out,
+        tbox::sec::KeyprovResultAttachment& attach) override;
+    tbox::sec::ErrorCode get_business_key_import_result_kl1(
+        const std::string& request_id,
+        tbox::sec::ImportResult& out,
+        tbox::sec::KeyprovResultAttachment& attach) override;
 
 private:
     std::string socket_path_;

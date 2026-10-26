@@ -266,6 +266,65 @@ public:
         return c;
     }();
 
+    // ---- TBOX-TSP-DSN-CR-017 / TBOX-SEC-DSN-CR-023：KL1 契约快照与租约准入 ----
+    // 默认不支持（NOT_IMPLEMENTED，fail-closed）；测试开启 kl1_supported 后启用。
+    bool kl1_supported = false;
+    bool kl1_lease_admission_supported = true;  // 快照成功但能力 false -> fail-closed
+    uint64_t kl1_capability_epoch = 7;      // SEC 服务端权威 epoch
+    uint32_t kl1_profile_version = 1;       // kKeyprovKl1ProfileVersion
+    uint32_t kl1_result_contract_version = 2;
+    bool kl1_admission_reject = false;      // 模拟 SEC-1029（U>=E 拒绝）
+    struct Kl1ImportCall {
+        std::string request_id;
+        int64_t admission_expire_at_ms = 0;
+        uint64_t capability_epoch = 0;
+        uint32_t kl1_profile_version = 0;
+    };
+    std::vector<Kl1ImportCall> kl1_import_calls;
+
+    tbox::sec::ErrorCode get_keyprov_contract_snapshot(
+        tbox::sec::KeyprovContractSnapshot& out) override {
+        if (!kl1_supported) return tbox::sec::ErrorCode::NOT_IMPLEMENTED;
+        out.result_contract_version = kl1_result_contract_version;
+        out.query_semantics_version = 2;
+        out.capability_epoch = kl1_capability_epoch;
+        out.storage_ready = true;
+        out.supports_atomic_dual_commit = true;
+        out.supports_lease_admission = kl1_lease_admission_supported;
+        out.kl1_profile_version = kl1_profile_version;
+        return tbox::sec::ErrorCode::SUCCESS;
+    }
+
+    tbox::sec::ErrorCode import_wrapped_business_keys_kl1(
+        const std::string& request_id,
+        const std::string& business_domain,
+        const std::vector<tbox::sec::WrappedKeyItem>& items,
+        const tbox::sec::KeyprovImportContext& context,
+        tbox::sec::ImportResult& out,
+        tbox::sec::KeyprovResultAttachment& attach) override {
+        Kl1ImportCall c;
+        c.request_id = request_id;
+        c.admission_expire_at_ms = context.admission_expire_at_ms;
+        c.capability_epoch = context.capability_epoch;
+        c.kl1_profile_version = context.kl1_profile_version;
+        kl1_import_calls.push_back(std::move(c));
+        if (kl1_admission_reject) {
+            out = tbox::sec::ImportResult{};
+            out.request_id = request_id;
+            return tbox::sec::ErrorCode::KL1_ADMISSION_REJECTED;
+        }
+        // 复用旧 import 语义（COMMITTED/UNKNOWN 等由测试配置 import_state）。
+        return import_wrapped_business_keys(request_id, business_domain, items,
+                                            out);
+    }
+
+    tbox::sec::ErrorCode get_business_key_import_result_kl1(
+        const std::string& request_id,
+        tbox::sec::ImportResult& out,
+        tbox::sec::KeyprovResultAttachment& attach) override {
+        return get_business_key_import_result(request_id, out);
+    }
+
     tbox::sec::ErrorCode get_business_key_status(
         const std::string& /*domain*/,
         const std::vector<std::string>& purposes,

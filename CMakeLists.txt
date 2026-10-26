@@ -223,9 +223,10 @@ set(TBOX_TSP_DAEMON_SOURCES
         src/tsp_event_publisher.cpp
         src/tsp_framework_server.cpp
         src/vehicle_message_gateway.cpp   # CR-009 §16: 通用 VehicleMessage 网关
-        src/keyprov_protocol.cpp         # CR-010 §4.2: keyprov wire codec
+        src/keyprov_protocol.cpp         # CR-010 §4.2: keyprov wire codec（field4=E 保持读取）
         src/keyprov_readiness.cpp        # CR-012 §8: build-lock + SEC capability 门禁
         src/keyprov_attempt.cpp          # CR-013 §3/§4: attempt snapshot + fingerprint
+        src/keyprov_lifecycle.cpp        # TBOX-TSP-DSN-CR-017: KL1 集中决策/预算账本/时间工具
         src/v2c_key_provisioning_store.cpp      # CR-010 §5 / CR-013 §10: 非敏感状态持久化
         src/v2c_key_provisioning_coordinator.cpp # CR-010 §3.1 / CR-013 §20: V2C keyprov 编排
         src/sec_business_key_adapter.cpp         # CR-010 §3.2: SEC 业务密钥适配器
@@ -245,6 +246,16 @@ target_link_libraries(tbox_tsp_lib
                tsp_proto
                nlohmann_json::nlohmann_json)
 target_compile_definitions(tbox_tsp_lib PUBLIC HAS_FRAMEWORK_LOG=1)
+
+# TBOX-TSP-DSN-CR-017：KL1 SEC SDK staging 头文件优先级提升。
+# 防止 CMAKE_PREFIX_PATH 中旧版 sec SDK（如 ~/.local）的头文件遮蔽 staging 头
+# （禁止新头搭配旧库：头文件与库必须来自同一 staging 版本）。
+# clang 对尖括号 include 先搜 -isystem，故用 SYSTEM + BEFORE 置顶。
+# 构建时通过 -DTBOX_SEC_INCLUDE_DIR=<staging>/include 显式指定。
+if(TBOX_SEC_INCLUDE_DIR)
+    target_include_directories(tbox_tsp_lib SYSTEM BEFORE PUBLIC
+        ${TBOX_SEC_INCLUDE_DIR})
+endif()
 
 # ============================================================
 # Main daemon 可执行文件 (CR-005 + CR-009: framework Application 生命周期唯一入口)

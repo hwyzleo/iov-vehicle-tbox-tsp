@@ -119,6 +119,47 @@ fields:
             type: integer
             min: 100
             max: 600000
+          # ---- TBOX-TSP-DSN-CR-017 §1/§6：KL1 参数（默认值与共享向量一致；只读消费） ----
+          kl1_ack_grace_ms:
+            type: integer
+            min: 0
+            max: 600000
+          kl1_skew_ms:
+            type: integer
+            min: 0
+            max: 600000
+          kl1_import_min_ms:
+            type: integer
+            min: 0
+            max: 600000
+          kl1_request_limit:
+            type: integer
+            min: 1
+            max: 1000
+          kl1_request_window_ms:
+            type: integer
+            min: 1000
+            max: 3600000
+          kl1_readonly_limit:
+            type: integer
+            min: 1
+            max: 1000
+          kl1_readonly_window_ms:
+            type: integer
+            min: 1000
+            max: 3600000
+          kl1_ack_limit:
+            type: integer
+            min: 1
+            max: 1000
+          kl1_chain_ids:
+            type: integer
+            min: 1
+            max: 1000
+          kl1_chain_window_ms:
+            type: integer
+            min: 1000
+            max: 3600000
       vehicle_message:
         type: map
         fields:

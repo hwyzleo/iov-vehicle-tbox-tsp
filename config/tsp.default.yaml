@@ -58,6 +58,18 @@ tsp:
     not_found_stabilization_window_ms: 0     # 0 → 自动 = sec_import_timeout + callback_grace
     status_request_initial_interval_ms: 1000 # StatusRequest 退避起始
     status_request_max_interval_ms: 30000    # StatusRequest 退避上限（有界）
+    # TBOX-TSP-DSN-CR-017 §1/§6：KL1 生命周期参数（默认值与共享向量
+    # keyprov-lifecycle-kl1-v1 一致；只读消费，正式值由 release-set 冻结）
+    kl1_ack_grace_ms: 30000          # D = E + ack_grace - skew
+    kl1_skew_ms: 2000                # 跨端允许偏差（D 安全余量）
+    kl1_import_min_ms: 15000         # 导入前 E-U 最小余量
+    kl1_request_limit: 8             # 每 requestId 应用层 Request 上限
+    kl1_request_window_ms: 120000    # 首次发送后窗口
+    kl1_readonly_limit: 12           # StatusRequest / SEC 查询上限
+    kl1_readonly_window_ms: 300000   # 首次进入只读后窗口
+    kl1_ack_limit: 3                 # ACK 应用投递上限
+    kl1_chain_ids: 3                 # 恢复链最多 requestId 数
+    kl1_chain_window_ms: 600000      # 恢复链窗口
 
   # 通用 VehicleMessage 网关 (TBOX-TSP-DSN-CR-009 §16.3)
   # 有界资源/allowlist 限制；尖括号值由实现/容量测试回填。

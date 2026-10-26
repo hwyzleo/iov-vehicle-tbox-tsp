@@ -152,5 +152,36 @@ tbox::sec::ErrorCode SecClientBusinessKeyAdapter::get_v2c_key_provisioning_capab
     return client_->get_v2c_key_provisioning_capability(out);
 }
 
+// ---- TBOX-TSP-DSN-CR-017 / TBOX-SEC-DSN-CR-023：KL1 契约快照与租约准入 ----
+tbox::sec::ErrorCode SecClientBusinessKeyAdapter::get_keyprov_contract_snapshot(
+    tbox::sec::KeyprovContractSnapshot& out) {
+    if (!client_) return tbox::sec::ErrorCode::NOT_INITIALIZED;
+    connect();
+    return client_->get_keyprov_contract_snapshot(out);
+}
+
+tbox::sec::ErrorCode SecClientBusinessKeyAdapter::import_wrapped_business_keys_kl1(
+    const std::string& request_id,
+    const std::string& business_domain,
+    const std::vector<tbox::sec::WrappedKeyItem>& items,
+    const tbox::sec::KeyprovImportContext& context,
+    tbox::sec::ImportResult& out,
+    tbox::sec::KeyprovResultAttachment& attach) {
+    if (!client_) return tbox::sec::ErrorCode::NOT_INITIALIZED;
+    connect();
+    return client_->import_wrapped_business_keys_kl1(
+        request_id, business_domain, items, context, out, attach);
+}
+
+tbox::sec::ErrorCode SecClientBusinessKeyAdapter::get_business_key_import_result_kl1(
+    const std::string& request_id,
+    tbox::sec::ImportResult& out,
+    tbox::sec::KeyprovResultAttachment& attach) {
+    if (!client_) return tbox::sec::ErrorCode::NOT_INITIALIZED;
+    connect();
+    return client_->get_business_key_import_result_kl1(
+        request_id, out, attach);
+}
+
 } // namespace tsp
 } // namespace tbox

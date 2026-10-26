@@ -62,6 +62,18 @@ struct V2cKeyProvisioningConfig {
     uint32_t not_found_stabilization_window_ms = 0;  // 0 → 自动 = import_timeout+callback_grace
     uint32_t status_request_initial_interval_ms = 1000;  // StatusRequest 退避起始（有界）
     uint32_t status_request_max_interval_ms = 30000;     // StatusRequest 退避上限（有界）
+    // ---- TBOX-TSP-DSN-CR-017 §1/§6：KL1 参数（默认值与共享向量一致；
+    // 只读消费，生产不另设默认；正式值由 release-set 冻结） ----
+    uint32_t kl1_ack_grace_ms = 30000;       // D = E + ack_grace - skew
+    uint32_t kl1_skew_ms = 2000;             // 跨端允许偏差（D 安全余量）
+    uint32_t kl1_import_min_ms = 15000;      // 导入前 E-U 最小余量
+    uint32_t kl1_request_limit = 8;          // 每 requestId 应用层 Request 上限
+    uint32_t kl1_request_window_ms = 120000; // 首次发送后窗口
+    uint32_t kl1_readonly_limit = 12;        // StatusRequest / SEC 查询上限
+    uint32_t kl1_readonly_window_ms = 300000;// 首次进入只读后窗口
+    uint32_t kl1_ack_limit = 3;              // ACK 应用投递上限
+    uint32_t kl1_chain_ids = 3;              // 恢复链最多 requestId 数
+    uint32_t kl1_chain_window_ms = 600000;   // 恢复链窗口
 };
 
 enum class V2cKeyProvState : uint8_t {
@@ -147,6 +159,14 @@ struct V2cKeyProvisioningSnapshot {
     // ---- CR-015 指标（有限枚举；result/reason 受控） ----
     std::map<std::string, uint64_t> sec_not_found_stabilization_total;  // result：REACHED/RESET_*
     std::map<std::string, uint64_t> hard_conflicts_total;               // reason：keyprov_blocked_reason::*
+    // ---- TBOX-TSP-DSN-CR-017 §1/§6：KL1 观察指标（脱敏；预算剩余/截止/动作） ----
+    uint32_t kl1_request_remaining = 0;    // Request 剩余次数（8 上限）
+    uint32_t kl1_status_remaining = 0;     // StatusRequest 剩余（12 上限）
+    uint32_t kl1_sec_query_remaining = 0;  // SEC 查询剩余（12 上限）
+    uint32_t kl1_ack_remaining = 0;        // ACK 剩余（3 上限）
+    uint32_t kl1_chain_remaining = 0;      // 恢复链剩余 rid（3 上限）
+    uint64_t kl1_freshen_total = 0;        // 同 rid freshen 发送总数
+    std::string kl1_budget_exhausted_reason;  // 上次预算耗尽原因（受控）
 };
 
 class V2cKeyProvisioningCoordinator {
@@ -186,6 +206,12 @@ public:
     // 否则发送即被云端按过期拒绝（见 /run/systemd/timesync/synchronized）。
     void set_clock_sync_check(std::function<bool()> check);
 
+    // ---- TBOX-TSP-DSN-CR-017 §2/§6：时钟源注入（仅测试装配；生产默认连接既有
+    // 可信时间源 + systemd 标记，不形成生产可配置的时间绕过开关） ----
+    void set_clock_source(std::function<int64_t()> utc_ms,
+                          std::function<int64_t()> mono_ms,
+                          std::function<KeyprovClockSource()> health);
+
 private:
     // ---- readiness 回调（MQTT SDK 执行器线程） ----
     void on_cloud_readiness(const CloudReadiness& readiness);
@@ -200,6 +226,12 @@ private:
                                      const tbox::sec::ImportResult& result);
     void do_ack_locked();
     void on_response_timeout_locked();
+    // TBOX-TSP-DSN-CR-017：过期响应专用分支（断开 response_expired->RETRY_WAIT 死循环；
+    // 至多一次同 rid freshen，其余只读对账）。
+    void handle_expired_response_locked(int64_t lease_expires_at_ms);
+    // TBOX-TSP-DSN-CR-017 P6：设备驱动的一次同 rid freshen（proven + cloud ACK_PENDING
+    // + E 已过期 + freshen 未用 + Request 预算允许）；返回是否已处理。
+    bool maybe_freshen_locked();
     void schedule_retry_locked();
     void persist_locked();
     void worker_loop();
@@ -306,8 +338,9 @@ private:
     uint32_t current_backoff_ms_locked() const;
     bool purposes_complete_locked(const std::vector<tbox::sec::BusinessKeyStatus>& items) const;
 
-    static int64_t now_ms();
-    static int64_t now_monotonic_ms();
+    int64_t now_ms() const;
+    int64_t now_monotonic_ms() const;
+    KeyprovClockSource clock_source() const;
     static std::string generate_id(const char* prefix);
 
     std::shared_ptr<MqttFacade> mqtt_;
@@ -363,6 +396,20 @@ private:
     // CR-016：与 cached_vmd_status_ 配对的规范化错误（释放判定必须同时匹配
     // status 与错误四元组；无 error 时 present=false 保持 fail-closed）。
     CloudProtocolError cached_vmd_error_;
+    // ---- TBOX-TSP-DSN-CR-017：KL1 生命周期状态 ----
+    KeyprovKl1Params kl1_params_;       // 由 config 组装（默认值与共享向量一致）
+    KeyprovBudgetLedger budget_;        // 持久预算账本（从 record_ 恢复；先预占后执行）
+    int64_t lease_expires_at_ms_ = 0;   // 当前 Response 交付租约 E（外层 field4）
+    int64_t ack_safe_deadline_ms_ = 0;  // D = E + ack_grace - skew（ACK 硬截止）
+    bool sec_lease_admission_supported_ = false;  // SEC supports_lease_admission
+    bool kl1_snapshot_available_ = false;      // KL1 契约快照接口可用（区分旧 SEC/能力不足）
+    uint32_t sec_result_contract_version_ = 0;    // SEC 结果契约版本（快照原值）
+    uint32_t sec_query_semantics_version_ = 0;    // SEC 查询语义版本（快照原值）
+    uint32_t sec_kl1_profile_version_ = 0;        // SEC KL1 profile 版本（0=UNAVAILABLE）
+    // 时钟源（测试注入；生产默认系统时钟 + timesyncd 标记）
+    std::function<int64_t()> utc_clock_fn_;
+    std::function<int64_t()> mono_clock_fn_;
+    std::function<KeyprovClockSource()> health_clock_fn_;
     // 唯一后继 requestId（supersede 幂等恢复：预生成后持久化）。
     std::string successor_request_id_;
     std::string successor_request_id_digest_;

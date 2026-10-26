@@ -22,6 +22,7 @@
 #pragma once
 
 #include "keyprov_attempt.h"
+#include "keyprov_lifecycle.h"
 #include "store.h"
 
 #include <cstdint>
@@ -33,9 +34,10 @@ namespace tbox {
 namespace tsp {
 
 // Store schema 版本（CR-013 §10 新增 v2；CR-014 §8/§21.6 新增 v3；
-// CR-015 §22.3 新增 v4：导入意图处置与 NOT_FOUND 稳定化）。
+// CR-015 §22.3 新增 v4：导入意图处置与 NOT_FOUND 稳定化；
+// TBOX-TSP-DSN-CR-017 §3 新增 v5：KL1 预算/时间/链/迁移门禁）。
 // 未知/更高版本不得降级解释。
-constexpr uint32_t kV2cStoreSchemaVersion = 4;
+constexpr uint32_t kV2cStoreSchemaVersion = 5;
 
 struct V2cKeyProvisioningRecord {
     bool valid = false;                    // Store 中是否存在记录
@@ -84,6 +86,20 @@ struct V2cKeyProvisioningRecord {
     std::string recovery_phase;           // keyprov_recovery_phase::*（诊断）
     std::string successor_request_id;     // 预生成唯一后继 requestId（幂等恢复）
     std::string successor_request_id_digest;  // sha256(successor_request_id) hex（审计）
+
+    // ---- v5 聚合字段（TBOX-TSP-DSN-CR-017 §3：KL1 预算/时间/链/迁移） ----
+    // KL1 生命周期 profile（"keyprov-lifecycle-kl1-v1"；空=非 KL1 attempt）。
+    std::string lifecycle_profile;
+    // 持久预算账本（Request 8/120s、Status 12/300s、SEC 12/300s、ACK 3+D、
+    // freshen 1、链 3/600s、迁移 token；跨重启不重置）。
+    KeyprovBudgetLedger budget;
+    // 当前 Response 交付租约 E（外层 field4；导入前 E-U>=import_min 准入）。
+    int64_t lease_expires_at_ms = 0;
+    // SEC KL1 契约快照（非敏感；缺省=UNAVAILABLE，不是支持）。
+    uint32_t sec_result_contract_version = 0;   // 0=UNAVAILABLE
+    uint32_t sec_query_semantics_version = 0;   // 0=UNAVAILABLE
+    bool sec_supports_lease_admission = false;  // false=不得调用 KL1 import
+    uint32_t sec_kl1_profile_version = 0;       // 0=UNAVAILABLE
 
     // ---- legacy 解析产物（非持久化，load() 派生） ----
     bool legacy_snapshot_unknown = false;  // 旧记录缺 snapshot/fingerprint

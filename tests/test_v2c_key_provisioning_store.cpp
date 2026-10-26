@@ -373,6 +373,106 @@ TEST(V2cKeyProvisioningStoreTest, V3MigratesInvocationTrueToUnresolved) {
               static_cast<int>(ImportInvocationResolution::UNRESOLVED));
 }
 
+// ============================================================
+// TBOX-TSP-DSN-CR-017 §3：v4 -> v5 迁移（KL1 预算/时间/链/迁移门禁）
+// ============================================================
+
+// 现场型 v4 记录（attempt_count=22 已耗尽）：迁移后 Request 预算判耗尽、
+// 授予一次迁移只读窗口、迁移 token 落盘；原 v4 证据/终态历史原样保留。
+TEST(V2cKeyProvisioningStoreTest, V4MigratesToV5BudgetExhaustedAndToken) {
+    auto root = temp_root();
+    {  // 写入 v4 记录（含现场 attempt_count=22 与完整 v4 证据字段）
+        V2cKeyProvisioningRecord rec = make_v2_record("kp-field-f55df0");
+        rec.schema_version = 4;  // v4 现场版本
+        rec.attempt_count = 22;  // 现场无限重发计数（原样保留/提升为已耗尽）
+        rec.import_invocation = true;
+        rec.import_invocation_resolution =
+            static_cast<int>(ImportInvocationResolution::UNRESOLVED);
+        rec.sec_not_found_count = 3;
+        rec.sec_capability_epoch = 2;
+        rec.recovery_phase = keyprov_recovery_phase::kStabilizingSecNotFound;
+        rec.successor_request_id = "kp-succ";
+        rec.successor_request_id_digest =
+            tbox::fw::hash::sha256_hex("kp-succ");
+        V2cKeyProvisioningStore store(root);
+        store.save(rec);
+    }
+    V2cKeyProvisioningStore store(root);
+    auto loaded = store.load();
+    ASSERT_TRUE(loaded.valid);
+    // 迁移后 schema 提升到 v5，profile 标识 KL1。
+    EXPECT_EQ(loaded.schema_version, kV2cStoreSchemaVersion);  // 5
+    EXPECT_EQ(loaded.lifecycle_profile, "keyprov-lifecycle-kl1-v1");
+    // Request 预算判已耗尽：不得重发旧 ID。
+    EXPECT_EQ(loaded.budget.request_send_count, 8u);
+    // 迁移只读窗口：首次 load 起 300s 内 <=12 Status / 12 SEC。
+    EXPECT_GT(loaded.budget.first_readonly_at_ms, 0);
+    EXPECT_EQ(loaded.budget.readonly_deadline_at_ms,
+              loaded.budget.first_readonly_at_ms + 300000);
+    // 迁移 token 单次发放且稳定绑定原 requestId。
+    EXPECT_EQ(loaded.budget.migration_token, "mig-kp-field-f55df0");
+    EXPECT_FALSE(loaded.budget.migration_consumed);
+    // 原 v4 证据/终态历史原样保留（不因仅改 schema_version 丢状态）。
+    EXPECT_EQ(loaded.attempt_count, 22u);
+    EXPECT_EQ(loaded.request_id, "kp-field-f55df0");
+    EXPECT_TRUE(loaded.import_invocation);
+    EXPECT_EQ(loaded.import_invocation_resolution,
+              static_cast<int>(ImportInvocationResolution::UNRESOLVED));
+    EXPECT_EQ(loaded.sec_not_found_count, 3u);
+    EXPECT_EQ(loaded.sec_capability_epoch, 2u);
+    EXPECT_EQ(loaded.recovery_phase,
+              keyprov_recovery_phase::kStabilizingSecNotFound);
+    EXPECT_EQ(loaded.successor_request_id, "kp-succ");
+    EXPECT_EQ(loaded.fingerprint_version, kAttemptFingerprintVersionV1);
+    EXPECT_FALSE(loaded.snapshot.purposes.empty());
+}
+
+// v5 已迁移记录：重跑 load 不重复迁移（token 保持、计数保持）。
+TEST(V2cKeyProvisioningStoreTest, V5MigrationIdempotentNoRetoken) {
+    auto root = temp_root();
+    V2cKeyProvisioningRecord rec = make_v2_record("kp-v5");
+    rec.schema_version = kV2cStoreSchemaVersion;  // 5
+    rec.budget.request_send_count = 3;
+    rec.budget.migration_token = "mig-already";
+    rec.budget.migration_consumed = true;
+    rec.budget.chain_request_id_count = 2;
+    rec.budget.chain_id = "kp-chain";
+    {
+        V2cKeyProvisioningStore store(root);
+        store.save(rec);
+    }
+    V2cKeyProvisioningStore store(root);
+    auto loaded = store.load();
+    ASSERT_TRUE(loaded.valid);
+    EXPECT_EQ(loaded.schema_version, 5u);
+    // 不重复迁移：计数/token 原样保留（重跑迁移不能重置 F/B/lease_seq）。
+    EXPECT_EQ(loaded.budget.request_send_count, 3u);
+    EXPECT_EQ(loaded.budget.migration_token, "mig-already");
+    EXPECT_TRUE(loaded.budget.migration_consumed);
+    EXPECT_EQ(loaded.budget.chain_request_id_count, 2u);
+    EXPECT_EQ(loaded.budget.chain_id, "kp-chain");
+}
+
+// 未知更高 schema：fail-closed 隔离（不当新设备申请）。
+TEST(V2cKeyProvisioningStoreTest, UnknownFutureSchemaFailClosed) {
+    auto root = temp_root();
+    {  // 手工写入未知未来 schema（模拟截断/越版本文件）
+        hwyz::store::Store raw = hwyz::store::Store::open("tsp", root);
+        nlohmann::json j = nlohmann::json::object();
+        j["schema_version"] = 99;
+        j["fingerprint_version"] = 1;
+        j["request_id"] = "kp-future";
+        j["state"] = "CHECKING";
+        raw.save<std::string>("keyprov.v2c.attempt.v2", j.dump());
+        raw.flush();
+    }
+    V2cKeyProvisioningStore store(root);
+    auto loaded = store.load();
+    ASSERT_TRUE(loaded.valid);
+    EXPECT_TRUE(loaded.legacy_snapshot_unknown)
+        << "未知 schema 必须隔离阻断，不得当作新设备申请";
+}
+
 int main(int argc, char** argv) {
     testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

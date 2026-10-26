@@ -42,6 +42,23 @@ RUN_TESTS=true
 INSTALL_AFTER_BUILD=false
 BUILD_TYPE="Debug"
 
+# ---- TBOX-TSP-DSN-CR-017：KL1 SEC SDK（隔离 staging）显式指定 ----
+# 生产/CI：TBOX_SEC_CLIENT_DIR=<sdk>/lib/cmake/TboxSecClient \
+#          TBOX_SEC_INCLUDE_DIR=<sdk>/include ./scripts/build.sh
+# 默认取项目内 sdk-stage 最新版本（头文件与库同源，禁止 .local 旧 SDK 混用）；
+# 正式 Orin 发布走 BUILD staging/release-set，不依赖个人 ~/.local。
+if [ -z "${TBOX_SEC_CLIENT_DIR:-}" ] || [ -z "${TBOX_SEC_INCLUDE_DIR:-}" ]; then
+    SEC_STAGE="$(ls -d "${PROJECT_ROOT}/../sdk-stage"/sec-kl1-* 2>/dev/null | sort | tail -1)"
+    if [ -n "${SEC_STAGE}" ]; then
+        if [ -z "${TBOX_SEC_CLIENT_DIR:-}" ]; then
+            TBOX_SEC_CLIENT_DIR="${SEC_STAGE}/lib/cmake/TboxSecClient"
+        fi
+        if [ -z "${TBOX_SEC_INCLUDE_DIR:-}" ]; then
+            TBOX_SEC_INCLUDE_DIR="${SEC_STAGE}/include"
+        fi
+    fi
+fi
+
 # 显示帮助信息
 show_help() {
     echo "用法: $0 [选项]"
@@ -211,11 +228,26 @@ configure_project() {
         CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH};${HOMEBREW_PREFIX}"
     fi
 
+    # TBOX-TSP-DSN-CR-017：KL1 SEC SDK staging 显式指定（头文件与库同源；
+    # 显式 TboxSecClient_DIR 优先，TBOX_SEC_INCLUDE_DIR 提升头文件优先级，
+    # 防止 .local 旧 SDK 头遮蔽）。
+    TBOX_SEC_ARGS=()
+    if [ -n "${TBOX_SEC_CLIENT_DIR:-}" ]; then
+        TBOX_SEC_ARGS+=("-DTboxSecClient_DIR=${TBOX_SEC_CLIENT_DIR}")
+    fi
+    if [ -n "${TBOX_SEC_INCLUDE_DIR:-}" ]; then
+        TBOX_SEC_ARGS+=("-DTBOX_SEC_INCLUDE_DIR=${TBOX_SEC_INCLUDE_DIR}")
+    fi
+    if [ -n "${TBOX_SEC_CLIENT_DIR:-}" ]; then
+        print_info "  SEC SDK: ${TBOX_SEC_CLIENT_DIR}"
+    fi
+
     cmake .. \
         -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
         -DTBoxFramework_DIR="${TBoxFramework_DIR}" \
         -DCMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH}" \
-        -DBUILD_TESTS=$([ "$RUN_TESTS" = true ] && echo "ON" || echo "OFF")
+        -DBUILD_TESTS=$([ "$RUN_TESTS" = true ] && echo "ON" || echo "OFF") \
+        ${TBOX_SEC_ARGS[@]}
 
     if [ $? -ne 0 ]; then
         print_error "CMake 配置失败"

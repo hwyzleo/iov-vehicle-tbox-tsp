@@ -190,8 +190,27 @@ bool V2cKeyProvisioningCoordinator::initialize(
     }
     config_ = config;
     counters_.sec_api_available = true;
+    // TBOX-TSP-DSN-CR-017：组装 KL1 参数（默认值与共享向量一致；config 覆盖）。
+    kl1_params_.ack_grace_ms = config.kl1_ack_grace_ms;
+    kl1_params_.skew_ms = config.kl1_skew_ms;
+    kl1_params_.import_min_ms = config.kl1_import_min_ms;
+    kl1_params_.request_limit = config.kl1_request_limit;
+    kl1_params_.request_window_ms = config.kl1_request_window_ms;
+    kl1_params_.readonly_limit = config.kl1_readonly_limit;
+    kl1_params_.readonly_window_ms = config.kl1_readonly_window_ms;
+    kl1_params_.ack_limit = config.kl1_ack_limit;
+    kl1_params_.chain_ids = config.kl1_chain_ids;
+    kl1_params_.chain_window_ms = config.kl1_chain_window_ms;
 
     record_ = store_->load();
+    // TBOX-TSP-DSN-CR-017：恢复 KL1 预算账本/租约（跨重启不重置）。
+    budget_ = record_.budget;
+    lease_expires_at_ms_ = record_.lease_expires_at_ms;
+    ack_safe_deadline_ms_ = record_.budget.ack_safe_deadline_at_ms;
+    sec_result_contract_version_ = record_.sec_result_contract_version;
+    sec_query_semantics_version_ = record_.sec_query_semantics_version;
+    sec_lease_admission_supported_ = record_.sec_supports_lease_admission;
+    sec_kl1_profile_version_ = record_.sec_kl1_profile_version;
     if (config_.enabled) {
         // CR-013：恢复 attempt 冻结状态（snapshot/fingerprint/submission/supersede/generation）。
         if (record_.valid) {
@@ -518,6 +537,20 @@ V2cKeyProvisioningSnapshot V2cKeyProvisioningCoordinator::snapshot() const {
     s.sec_capability_epoch = current_sec_capability_epoch_;
     s.sec_epoch_unknown = sec_capability_unavailable_;
     s.successor_request_id_digest = successor_request_id_digest_;
+    // ---- TBOX-TSP-DSN-CR-017：KL1 预算剩余/截止（脱敏，可观测；每次可输出
+    // 剩余预算、截止与下一动作） ----
+    const int64_t now = now_ms();
+    s.kl1_request_remaining = budget_.request_ok(kl1_params_, now)
+        ? kl1_params_.request_limit - budget_.request_send_count : 0;
+    s.kl1_status_remaining = budget_.status_ok(kl1_params_, now)
+        ? kl1_params_.readonly_limit - budget_.status_send_count : 0;
+    s.kl1_sec_query_remaining = budget_.sec_query_ok(kl1_params_, now)
+        ? kl1_params_.readonly_limit - budget_.sec_query_count : 0;
+    s.kl1_ack_remaining = budget_.ack_ok(kl1_params_, now)
+        ? kl1_params_.ack_limit - budget_.ack_send_count : 0;
+    s.kl1_chain_remaining = budget_.chain_ok(kl1_params_, now)
+        ? kl1_params_.chain_ids - budget_.chain_request_id_count : 0;
+    s.kl1_budget_exhausted_reason = budget_.budget_exhausted_reason;
     s.blocked_attempts_current =
         (state_ == V2cKeyProvState::BLOCKED ||
          state_ == V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION ||
@@ -536,6 +569,18 @@ void V2cKeyProvisioningCoordinator::set_clock_sync_check(
     std::function<bool()> check) {
     std::lock_guard<std::mutex> lock(mutex_);
     clock_sync_check_ = std::move(check);
+}
+
+// TBOX-TSP-DSN-CR-017 §2/§6：时钟源注入（仅测试装配；生产默认系统时钟 +
+// timesyncd 标记，不形成生产可配置的时间绕过开关）。
+void V2cKeyProvisioningCoordinator::set_clock_source(
+    std::function<int64_t()> utc_ms,
+    std::function<int64_t()> mono_ms,
+    std::function<KeyprovClockSource()> health) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    utc_clock_fn_ = std::move(utc_ms);
+    mono_clock_fn_ = std::move(mono_ms);
+    health_clock_fn_ = std::move(health);
 }
 
 bool V2cKeyProvisioningCoordinator::clock_check_ok() const {
@@ -604,25 +649,61 @@ void V2cKeyProvisioningCoordinator::handle_routed_downlink(
                     return;
                 }
                 if (resp.error.retryable) {
-                    state_ = V2cKeyProvState::RETRY_WAIT;
-                    schedule_retry_locked();
+                    // CR-017：传输类可恢复故障走有界退避；Request 预算耗尽则只读/阻断。
+                    if (budget_.request_ok(kl1_params_, now_ms())) {
+                        state_ = V2cKeyProvState::RETRY_WAIT;
+                        schedule_retry_locked();
+                    } else {
+                        enter_reconcile_old_attempt_locked(
+                            "request_budget_exhausted", nullptr);
+                    }
                 } else {
                     state_ = V2cKeyProvState::BLOCKED;
                 }
                 persist_locked();
                 return;
             }
-            // SUCCEEDED 必须恰为完整 purpose 集、版本非 0、算法/有效期合法
+            // SUCCEEDED：KL1 租约/新鲜度准入（CR-017 §2：U>=E 即过期，等号即过期；
+            // E-U<import_min 只读对账）。过期不再回 RETRY_WAIT 无限重发。
+            KeyprovClockSource c = clock_source();
+            const int64_t utc_upper = c.utc_now_ms + c.uncertainty_ms;
+            if (resp.expire_at_ms > 0) {
+                if (keyprov_lease_expired(utc_upper, resp.expire_at_ms)) {
+                    handle_expired_response_locked(resp.expire_at_ms);
+                    return;
+                }
+                if (!keyprov_lease_acceptable(utc_upper, resp.expire_at_ms,
+                                              kl1_params_)) {
+                    counters_.responses_rejected++;
+                    record_.last_error = "lease_too_short";
+                    enter_reconcile_old_attempt_locked("lease_too_short",
+                                                        nullptr);
+                    return;
+                }
+            }
+            // SUCCEEDED 必须恰为完整 purpose 集、版本非 0、算法/有效期合法。
             std::string err;
             if (!keyprov_response_valid_locked(resp, err)) {
                 counters_.responses_rejected++;
                 record_.last_error = err;
-                state_ = V2cKeyProvState::RETRY_WAIT;
-                schedule_retry_locked();
+                if (budget_.request_ok(kl1_params_, now_ms())) {
+                    state_ = V2cKeyProvState::RETRY_WAIT;
+                    schedule_retry_locked();
+                } else {
+                    enter_reconcile_old_attempt_locked(
+                        "request_budget_exhausted", nullptr);
+                }
                 persist_locked();
                 return;
             }
             // 保存原 Response 的非敏感 ACK 绑定材料（用于 SEC 结果逐项绑定校验）。
+            if (resp.expire_at_ms > 0) {
+                // 仅当 VMD 签发 E（field4）时启用 KL1 D 截止（E=0 为旧 VMD 兼容路径）。
+                lease_expires_at_ms_ = resp.expire_at_ms;
+                ack_safe_deadline_ms_ =
+                    keyprov_ack_safe_deadline_ms(resp.expire_at_ms, kl1_params_);
+                budget_.ack_safe_deadline_at_ms = ack_safe_deadline_ms_;
+            }
             response_binding_.clear();
             response_binding_.reserve(resp.items.size());
             for (const auto& it : resp.items) {
@@ -852,6 +933,12 @@ void V2cKeyProvisioningCoordinator::create_new_attempt_locked() {
     sec_outcome_unknown_ = false;   // 新 attempt 与旧 SEC 事实解绑，重新对账
     sec_unknown_rounds_ = 0;
     sec_unknown_alerted_ = false;
+    // TBOX-TSP-DSN-CR-017：新 attempt 重置本 attempt 预算（恢复链计数跨 attempt
+    // 保留：chain_id/count/started/deadline 不重置）。
+    budget_.reset_for_new_attempt();
+    budget_.ack_safe_deadline_at_ms = 0;
+    lease_expires_at_ms_ = 0;
+    ack_safe_deadline_ms_ = 0;
     // CR-015：新 attempt 无本地导入意图 -> 直接 NO_SIDE_EFFECT_PROVEN
     // （保持 CR-014 快速释放路径）；一旦调用 import（do_import）转 UNRESOLVED。
     import_invocation_recorded_ = false;
@@ -1131,6 +1218,7 @@ void V2cKeyProvisioningCoordinator::do_reconcile_locked() {
     //    释放判定同时消费缓存的状态与规范化错误四元组（CR-016 §23.1）。
     if (resolution_ == ImportInvocationResolution::NO_SIDE_EFFECT_PROVEN &&
         cached_vmd_status_ >= 0) {
+        if (maybe_freshen_locked()) return;  // CR-017 P6：一次同 rid freshen
         CloudStatusDecisionInput in;
         in.status = cached_vmd_status_;
         in.error = cached_vmd_error_;
@@ -1321,11 +1409,25 @@ bool V2cKeyProvisioningCoordinator::is_releasable_unspecified_locked(
 void V2cKeyProvisioningCoordinator::supersede_remote_once_locked() {
     counters_.superseded_remote++;
     record_.last_error = "vmd_batch_terminated";
+    // TBOX-TSP-DSN-CR-017：恢复链预算（最多 3 rid / 600s，跨重启持久）。
+    // 链耗尽则 BLOCKED（人工/治理），不自动新链。
+    if (!budget_.chain_ok(kl1_params_, now_ms())) {
+        blocked_reason_ = keyprov_blocked_reason::kAwaitCloudTermination;
+        record_.last_error = "chain_budget_exhausted";
+        count_blocked_reason_locked(
+            keyprov_blocked_reason::kAwaitCloudTermination);
+        transition_to_locked(V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION);
+        persist_locked();
+        return;
+    }
     if (successor_request_id_.empty()) {
         successor_request_id_ = generate_id("kp");
         successor_request_id_digest_ =
             tbox::fw::hash::sha256_hex(
                 std::string_view(successor_request_id_));
+        // 先持久化链预占，再创建新 attempt（CAS/崩溃一致性）。
+        budget_.preconsume_chain_id(kl1_params_, now_ms());
+        budget_.chain_id = successor_request_id_;
     }
     cached_vmd_status_ = -1;  // 已消费：避免同轮/后续重复触发 supersede
     cached_vmd_error_ = CloudProtocolError{};
@@ -1574,12 +1676,6 @@ void V2cKeyProvisioningCoordinator::schedule_status_retry_locked() {
     status_backoff_ms_ = static_cast<uint32_t>(next);
 }
 
-int64_t V2cKeyProvisioningCoordinator::now_monotonic_ms() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-}
-
 void V2cKeyProvisioningCoordinator::mark_submitted_locked() {
     submission_ = keyprov_submission::kSubmitted;
 }
@@ -1610,6 +1706,28 @@ void V2cKeyProvisioningCoordinator::refresh_sec_readiness_locked() {
         sec_import_result_contract_version_ = cap.capability_contract_version;
     } else {
         sec_import_result_contract_version_ = 0;
+    }
+    // TBOX-TSP-DSN-CR-017：KL1 契约快照（supports_lease_admission/epoch/profile）。
+    // 缺省=UNAVAILABLE（fail-closed：不得调用 KL1 导入路径）。
+    tbox::sec::KeyprovContractSnapshot snap;
+    ErrorCode kc = sec_->get_keyprov_contract_snapshot(snap);
+    if (kc == ErrorCode::SUCCESS) {
+        kl1_snapshot_available_ = true;
+        sec_lease_admission_supported_ = snap.supports_lease_admission;
+        sec_result_contract_version_ = snap.result_contract_version;
+        sec_query_semantics_version_ = snap.query_semantics_version;
+        sec_kl1_profile_version_ = snap.kl1_profile_version;
+        if (snap.capability_epoch != 0) {
+            current_sec_capability_epoch_ = snap.capability_epoch;  // 服务端权威 epoch
+        }
+        record_.sec_result_contract_version = sec_result_contract_version_;
+        record_.sec_query_semantics_version = sec_query_semantics_version_;
+        record_.sec_supports_lease_admission = sec_lease_admission_supported_;
+        record_.sec_kl1_profile_version = sec_kl1_profile_version_;
+    } else {
+        // 快照接口不可用（旧 SEC）：保持旧导入路径兼容（旧 release-set 回滚场景）。
+        kl1_snapshot_available_ = false;
+        sec_lease_admission_supported_ = false;
     }
     readiness_ = r;
 }
@@ -1818,7 +1936,9 @@ void V2cKeyProvisioningCoordinator::tick_locked() {
             break;
         case V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION:
             // 周期观察 VMD 终态（CR-065 受控终结后由 StatusResponse -> SUPERSEDED_REMOTE）。
+            // CR-017 P6：ACK_PENDING 且租约过期时可执行一次同 rid freshen。
             if (next_retry_ms_ > now) return;
+            if (maybe_freshen_locked()) return;
             if (!reconcile_status_sent_) {
                 send_status_request_locked();
             } else if (deadline_ms_ > 0 && now >= deadline_ms_) {
@@ -1947,6 +2067,16 @@ void V2cKeyProvisioningCoordinator::do_request_locked() {
         persist_locked();
         return;
     }
+    // TBOX-TSP-DSN-CR-017：Request 持久预算（8/120s）。发送前检查并预占；
+    // 预算耗尽只读对账，不无限重发（现场 attempt_count=22 场景）。
+    const int64_t now0 = now_ms();
+    if (!budget_.request_ok(kl1_params_, now0)) {
+        enter_reconcile_old_attempt_locked("request_budget_exhausted",
+                                            nullptr);
+        schedule_status_retry_locked();
+        persist_locked();
+        return;
+    }
     if (fingerprint_version_ > 0 &&
         !keyprov_fingerprint_equal(frozen_fingerprint_, cand_fp)) {
         AttemptChangeDimension d =
@@ -1992,6 +2122,8 @@ void V2cKeyProvisioningCoordinator::do_request_locked() {
         return;
     }
     if (publish_keyprov_locked(message_id, enc.envelope_bytes, record_.request_id)) {
+        // 先持久化预算预占，再进入 WAIT_RESPONSE（CR-017 §1：先持久化预算再发外部调用）。
+        budget_.preconsume_request(kl1_params_, now);
         state_ = V2cKeyProvState::WAIT_RESPONSE;
         deadline_ms_ = now + config_.request_timeout_ms;
         record_.attempt_count++;
@@ -2008,6 +2140,46 @@ void V2cKeyProvisioningCoordinator::do_request_locked() {
     }
 }
 
+void V2cKeyProvisioningCoordinator::handle_expired_response_locked(
+    int64_t lease_expires_at_ms) {
+    counters_.responses_rejected++;
+    record_.last_error = "response_expired";
+    // CR-017 §7：过期响应不回通用 RETRY_WAIT（根因修复：断开
+    // response_expired->RETRY_WAIT->do_check 无限重发环）。
+    // 同 rid freshen（P6）由设备在对账路径（do_reconcile_locked）主动触发：
+    // 先查 SEC proven + 云端 ACK_PENDING + 预算，再刷新，不在此处盲发。
+    enter_reconcile_old_attempt_locked("response_expired", nullptr);
+    schedule_status_retry_locked();
+    persist_locked();
+}
+
+// TBOX-TSP-DSN-CR-017 P6：设备驱动的一次同 rid freshen。
+// 前提：proven + 云端 ACK_PENDING + E 已过期 + freshen 未用 + Request 预算允许。
+// 先持久化预算预占再发外部调用；返回 true 表示已消费本轮。
+bool V2cKeyProvisioningCoordinator::maybe_freshen_locked() {
+    if (resolution_ != ImportInvocationResolution::NO_SIDE_EFFECT_PROVEN ||
+        sec_outcome_unknown_) {
+        return false;
+    }
+    if (cached_vmd_status_ != kKeyProvStatusAckPending) return false;
+    if (lease_expires_at_ms_ <= 0) return false;
+    KeyprovClockSource c = clock_source();
+    const int64_t utc_upper = c.utc_now_ms + c.uncertainty_ms;
+    if (!keyprov_lease_expired(utc_upper, lease_expires_at_ms_)) return false;
+    if (!budget_.freshen_ok() ||
+        !budget_.request_ok(kl1_params_, utc_upper)) {
+        return false;
+    }
+    budget_.preconsume_freshen();
+    budget_.preconsume_request(kl1_params_, utc_upper);
+    counters_.kl1_freshen_total++;
+    record_.last_error = "lease_freshen";
+    persist_locked();
+    state_ = V2cKeyProvState::REQUESTING;
+    do_request_locked();
+    return true;
+}
+
 void V2cKeyProvisioningCoordinator::on_response_timeout_locked() {
     if (record_.attempt_count >= config_.max_attempts_before_alert) {
         LogAdapter::keyprov().warn(
@@ -2017,11 +2189,19 @@ void V2cKeyProvisioningCoordinator::on_response_timeout_locked() {
                     static_cast<int64_t>(record_.attempt_count))}
             });
     }
-    // 原 requestId 不变；回到 CHECKING 重新查询 SEC 事实
-    state_ = V2cKeyProvState::RETRY_WAIT;
-    record_.last_error = "response_timeout";
-    schedule_retry_locked();
-    persist_locked();
+    // 原 requestId 不变；回到 CHECKING 重新查询 SEC 事实。
+    // CR-017 P9：仅 Request 预算内允许有界重试；预算耗尽转只读对账（不无限重发）。
+    if (budget_.request_ok(kl1_params_, now_ms())) {
+        state_ = V2cKeyProvState::RETRY_WAIT;
+        record_.last_error = "response_timeout";
+        schedule_retry_locked();
+        persist_locked();
+    } else {
+        enter_reconcile_old_attempt_locked("request_budget_exhausted",
+                                            nullptr);
+        schedule_status_retry_locked();
+        persist_locked();
+    }
 }
 
 void V2cKeyProvisioningCoordinator::do_import_locked() {
@@ -2039,9 +2219,45 @@ void V2cKeyProvisioningCoordinator::do_import_locked() {
         resolution_ = ImportInvocationResolution::UNRESOLVED;
         persist_locked();
     }
+    // TBOX-TSP-DSN-CR-017 §2：导入前租约 TOCTOU 重核（E-U>=import_min）。
+    // E<=0 为旧 VMD 无 field4 兼容路径（保持旧行为）。
+    if (lease_expires_at_ms_ > 0) {
+        KeyprovClockSource c = clock_source();
+        const int64_t utc_upper = c.utc_now_ms + c.uncertainty_ms;
+        if (!keyprov_lease_acceptable(utc_upper, lease_expires_at_ms_,
+                                      kl1_params_)) {
+            enter_reconcile_old_attempt_locked("lease_too_short", nullptr);
+            schedule_status_retry_locked();
+            persist_locked();
+            return;
+        }
+    }
     tbox::sec::ImportResult res;
-    ErrorCode ec = sec_->import_wrapped_business_keys(
-        record_.request_id, config_.business_domain, pending_items_, res);
+    ErrorCode ec;
+    if (sec_lease_admission_supported_) {
+        // KL1 租约准入导入：携带 E/epoch/profile 快照（SEC 服务端再验 TOCTOU）。
+        tbox::sec::KeyprovImportContext ctx;
+        ctx.admission_expire_at_ms = lease_expires_at_ms_;
+        ctx.capability_epoch = current_sec_capability_epoch_;
+        ctx.kl1_profile_version = sec_kl1_profile_version_;
+        tbox::sec::KeyprovResultAttachment attach;
+        ec = sec_->import_wrapped_business_keys_kl1(
+            record_.request_id, config_.business_domain, pending_items_, ctx,
+            res, attach);
+    } else if (kl1_snapshot_available_) {
+        // 新 SEC 契约快照存在但声明不支持租约准入：fail-closed 阻断，
+        // 不走旧接口降级导入（TBOX-SEC-DSN-CR-023 §4）。
+        pending_callback_ = false;
+        counters_.imports_failed++;
+        state_ = V2cKeyProvState::BLOCKED;
+        record_.last_error = "sec_lease_admission_unsupported";
+        persist_locked();
+        return;
+    } else {
+        // 旧 SEC（无 KL1 快照接口）：旧 release-set 回滚兼容路径。
+        ec = sec_->import_wrapped_business_keys(
+            record_.request_id, config_.business_domain, pending_items_, res);
+    }
     import_attempted_ = true;
     handle_import_result_locked(ec, res);
 }
@@ -2215,6 +2431,23 @@ void V2cKeyProvisioningCoordinator::do_ack_locked() {
     if (ack_sent_ && deadline_ms_ > 0 && now < deadline_ms_) {
         return;  // 等待 AckResult / 超时
     }
+    // TBOX-TSP-DSN-CR-017：D 后禁新 ACK（仅 Status 确认）；ACK 预算 3 次（KL-REQ-004）。
+    if (ack_safe_deadline_ms_ > 0 && now >= ack_safe_deadline_ms_) {
+        if (!status_sent_) {
+            send_status_request_locked();  // D 后只读 Status 确认云 ACTIVE
+        }
+        persist_locked();
+        return;
+    }
+    if (!budget_.ack_ok(kl1_params_, now)) {
+        // ACK 预算耗尽：不再重导入；只读 Status 确认。
+        if (!status_sent_) {
+            send_status_request_locked();
+        }
+        record_.last_error = "ack_budget_exhausted";
+        persist_locked();
+        return;
+    }
     if (ack_sent_ && now >= deadline_ms_) {
         // ACK 响应丢失：保留 requestId，重发 ACK（幂等）；超阈值后改为状态对账
         if (record_.attempt_count >= config_.max_attempts_before_alert && !status_sent_) {
@@ -2250,6 +2483,8 @@ void V2cKeyProvisioningCoordinator::do_ack_locked() {
         record_.attempt_count++;
         deadline_ms_ = now + config_.ack_timeout_ms;
         counters_.acks_sent++;
+        // 先持久化预算预占再进入等待（拒绝/崩溃不退还）。
+        budget_.preconsume_ack(kl1_params_, now);
         persist_locked();
     } else {
         persist_locked();
@@ -2319,6 +2554,15 @@ void V2cKeyProvisioningCoordinator::persist_locked() {
     record_.recovery_phase = recovery_phase_;
     record_.successor_request_id = successor_request_id_;
     record_.successor_request_id_digest = successor_request_id_digest_;
+    // ---- TBOX-TSP-DSN-CR-017 v5：KL1 预算/时间/链/迁移（非敏感） ----
+    record_.lifecycle_profile = "keyprov-lifecycle-kl1-v1";
+    record_.budget = budget_;
+    record_.lease_expires_at_ms = lease_expires_at_ms_;
+    record_.budget.ack_safe_deadline_at_ms = ack_safe_deadline_ms_;
+    record_.sec_result_contract_version = sec_result_contract_version_;
+    record_.sec_query_semantics_version = sec_query_semantics_version_;
+    record_.sec_supports_lease_admission = sec_lease_admission_supported_;
+    record_.sec_kl1_profile_version = sec_kl1_profile_version_;
     if (!frozen_snapshot_.purposes.empty()) {
         record_.purposes.clear();
         for (int p : frozen_snapshot_.purposes) {
@@ -2354,14 +2598,11 @@ bool V2cKeyProvisioningCoordinator::purposes_complete_locked(
 bool V2cKeyProvisioningCoordinator::keyprov_response_valid_locked(
     const KeyProvResponseData& resp, std::string& err) const {
     // SUCCEEDED 必须恰为配置的完整 purpose 集；每项版本非 0、keyId 非空、
-    // wrapped_key 非空且在允许大小内；TTL 未过期。
+    // wrapped_key 非空且在允许大小内。
+    // TTL/租约新鲜度（U/E、import_min）由调用方在 KL1 租约准入分支判定，
+    // 此处只做结构校验（CR-017 §2：过期不再回通用 RETRY_WAIT）。
     if (resp.items.size() != config_.purposes.size()) {
         err = "response_purpose_count_mismatch";
-        return false;
-    }
-    const int64_t now = now_ms();
-    if (resp.expire_at_ms > 0 && now >= resp.expire_at_ms) {
-        err = "response_expired";
         return false;
     }
     for (const auto& p : config_.purposes) {
@@ -2466,10 +2707,28 @@ bool V2cKeyProvisioningCoordinator::publish_keyprov_locked(
     return false;
 }
 
-int64_t V2cKeyProvisioningCoordinator::now_ms() {
+int64_t V2cKeyProvisioningCoordinator::now_ms() const {
+    if (utc_clock_fn_) return utc_clock_fn_();
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
+}
+
+int64_t V2cKeyProvisioningCoordinator::now_monotonic_ms() const {
+    if (mono_clock_fn_) return mono_clock_fn_();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// 时钟健康源（生产：timesyncd 同步标记 + 零 uncertainty；测试：注入固定值）。
+KeyprovClockSource V2cKeyProvisioningCoordinator::clock_source() const {
+    if (health_clock_fn_) return health_clock_fn_();
+    KeyprovClockSource c;
+    c.utc_now_ms = now_ms();
+    c.monotonic_ms = now_monotonic_ms();
+    c.trusted = clock_check_ok();
+    return c;
 }
 
 std::string V2cKeyProvisioningCoordinator::generate_id(const char* prefix) {

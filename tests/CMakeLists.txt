@@ -30,6 +30,11 @@ set(TEST_COMPILE_DEFS HAS_FRAMEWORK_LOG=1)
 function(tsp_add_test name)
     add_executable(${name} ${ARGN})
     target_include_directories(${name} PRIVATE ${TEST_COMMON_INCLUDES})
+    # TBOX-TSP-DSN-CR-017：KL1 SEC SDK staging 头文件优先级提升（SYSTEM+置顶，
+    # 防 .local 旧头遮蔽；clang 尖括号 include 先搜 -isystem）。
+    if(TBOX_SEC_INCLUDE_DIR)
+        target_include_directories(${name} SYSTEM BEFORE PRIVATE ${TBOX_SEC_INCLUDE_DIR})
+    endif()
     target_compile_definitions(${name} PRIVATE ${TEST_COMPILE_DEFS})
     target_link_libraries(${name} PRIVATE ${TEST_COMMON_LIBS})
     add_test(NAME ${name} COMMAND ${name})
@@ -168,10 +173,33 @@ tsp_add_test(KeyprovAttemptTest
     ${PROJECT_SOURCE_DIR}/src/keyprov_attempt.cpp
     ${PROJECT_SOURCE_DIR}/src/keyprov_protocol.cpp)
 
+# TBOX-TSP-DSN-CR-017 §6：集中生命周期决策/预算账本/时间工具纯函数单测
+# （以共享向量 keyprov-lifecycle-kl1-v1 为语义基准）
+tsp_add_test(KeyprovLifecycleTest
+    test_keyprov_lifecycle.cpp
+    ${PROJECT_SOURCE_DIR}/src/keyprov_lifecycle.cpp
+    ${PROJECT_SOURCE_DIR}/src/keyprov_attempt.cpp
+    ${PROJECT_SOURCE_DIR}/src/keyprov_protocol.cpp)
+target_compile_definitions(KeyprovLifecycleTest PRIVATE
+    TSP_SOURCE_TESTS_DIR="${PROJECT_SOURCE_DIR}/tests")
+
+# TBOX-TSP-DSN-CR-017 §6：KL1 coordinator 集成测试（fake clock；mock-VMD 语义）
+tsp_add_test(KeyprovKl1CoordinatorTest
+    test_keyprov_kl1_coordinator.cpp
+    ${PROJECT_SOURCE_DIR}/src/v2c_key_provisioning_coordinator.cpp
+    ${PROJECT_SOURCE_DIR}/src/sec_business_key_adapter.cpp
+    ${PROJECT_SOURCE_DIR}/src/keyprov_lifecycle.cpp
+    ${PROJECT_SOURCE_DIR}/src/keyprov_attempt.cpp
+    ${PROJECT_SOURCE_DIR}/src/keyprov_protocol.cpp
+    ${PROJECT_SOURCE_DIR}/src/keyprov_readiness.cpp
+    ${PROJECT_SOURCE_DIR}/src/v2c_key_provisioning_store.cpp
+    ${PROJECT_SOURCE_DIR}/src/log_adapter.cpp)
+
 tsp_add_test(V2cKeyProvisioningCoordinatorTest
     test_v2c_key_provisioning_coordinator.cpp
     ${PROJECT_SOURCE_DIR}/src/v2c_key_provisioning_coordinator.cpp
     ${PROJECT_SOURCE_DIR}/src/sec_business_key_adapter.cpp
+    ${PROJECT_SOURCE_DIR}/src/keyprov_lifecycle.cpp
     ${PROJECT_SOURCE_DIR}/src/keyprov_attempt.cpp
     ${PROJECT_SOURCE_DIR}/src/keyprov_protocol.cpp
     ${PROJECT_SOURCE_DIR}/src/keyprov_readiness.cpp
@@ -189,6 +217,7 @@ tsp_add_test(KeyProvisioningIntegrationTest
     ${PROJECT_SOURCE_DIR}/src/v2c_key_provisioning_coordinator.cpp
     ${PROJECT_SOURCE_DIR}/src/sec_business_key_adapter.cpp
     ${PROJECT_SOURCE_DIR}/src/keyprov_attempt.cpp
+    ${PROJECT_SOURCE_DIR}/src/keyprov_lifecycle.cpp
     ${PROJECT_SOURCE_DIR}/src/keyprov_protocol.cpp
     ${PROJECT_SOURCE_DIR}/src/keyprov_readiness.cpp
     ${PROJECT_SOURCE_DIR}/src/v2c_key_provisioning_store.cpp
