@@ -2234,6 +2234,20 @@ void V2cKeyProvisioningCoordinator::do_import_locked() {
     }
     tbox::sec::ImportResult res;
     ErrorCode ec;
+    // 诊断：导入前记录 pending_items_ 实际大小（定位 wrapped_key/parameters 丢失点：
+    // 现场 SEC 收到 wk=0 prm=0 但 VMD 响应 payload 达 1526B，需确认 TSP 解析后是否保有）。
+    {
+        std::string sizes;
+        for (const auto& it : pending_items_) {
+            sizes += it.purpose + ":wk=" + std::to_string(it.wrapped_key.size()) +
+                     ",prm=" + std::to_string(it.parameters.size()) + ";";
+        }
+        LogAdapter::keyprov().info(
+            "tsp.keyprov.import_items_debug", "keyprov 导入前 pending_items 大小", {
+                {"request_id", tbox::fw::log::FieldValue::makeString(record_.request_id)},
+                {"items", tbox::fw::log::FieldValue::makeString(sizes)}
+            });
+    }
     if (sec_lease_admission_supported_) {
         // KL1 租约准入导入：携带 E/epoch/profile 快照（SEC 服务端再验 TOCTOU）。
         tbox::sec::KeyprovImportContext ctx;
