@@ -1011,6 +1011,9 @@ ReconcileAction V2cKeyProvisioningCoordinator::reconcile_sec_journal_locked() {
 
     // CR-015 §6.1：迟到/错配证据（非同 attempt / CAS generation 不匹配）直接丢弃。
     if (!same_attempt_locked(ev) || !cas_generation_matches_locked(ev)) {
+        // CR-017 修复：丢弃证据同样要推进 StatusRequest 退避，防止对账态
+        // （BLOCKED_AWAIT_CLOUD_TERMINATION 等）每 poll_interval_ms 忙循环。
+        schedule_status_retry_locked();
         return ReconcileAction::WAIT_SEC;
     }
 
@@ -1167,6 +1170,8 @@ ReconcileAction V2cKeyProvisioningCoordinator::reconcile_sec_journal_locked() {
             return ReconcileAction::ALLOW_READONLY_REMOTE;
         }
     }
+    // CR-017 修复：默认路径（无匹配 evidence kind）兜底推进退避，避免对账态忙循环。
+    schedule_status_retry_locked();
     return ReconcileAction::WAIT_SEC;
 }
 
@@ -1260,7 +1265,18 @@ void V2cKeyProvisioningCoordinator::handle_reconcile_status_locked(
 
     // CR-015 §22.5：先重查 SEC 权威事实；TERMINAL_HANDLED/WAIT_SEC 已消费本轮。
     const ReconcileAction action = reconcile_sec_journal_locked();
-    if (action != ReconcileAction::ALLOW_READONLY_REMOTE) return;
+    if (action != ReconcileAction::ALLOW_READONLY_REMOTE) {
+        // CR-017 修复：SEC 对账未就绪时兜底推进退避。调用方（StatusResponse
+        // 分支）已无条件清 reconcile_status_sent_，若此处不推进 next_retry_ms_，
+        // BLOCKED_AWAIT_CLOUD_TERMINATION 态会每 poll_interval_ms(200ms)
+        // 立即重发 StatusRequest，形成无退避忙循环（云端观测到 ~200ms 一条）。
+        // 内部路径已设置退避（next_retry_ms_ 在未来）时不覆盖。
+        if (next_retry_ms_ <= now_ms()) {
+            schedule_status_retry_locked();
+            persist_locked();
+        }
+        return;
+    }
 
     // 稳定化期间只读缓存最近 VMD 观测（proven 后用于云端矩阵；不写盘风暴抑制）。
     // CR-016：释放判定必须同时匹配 status 与错误四元组，故缓存规范化错误。
@@ -1417,6 +1433,11 @@ void V2cKeyProvisioningCoordinator::supersede_remote_once_locked() {
         count_blocked_reason_locked(
             keyprov_blocked_reason::kAwaitCloudTermination);
         transition_to_locked(V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION);
+        // CR-017 修复：链耗尽进入 BLOCKED_AWAIT 时必须推进 StatusRequest 退避。
+        // 否则 tick 的 next_retry_ms_ 门失效，每 poll_interval_ms 立即重发
+        // StatusRequest，形成 200ms 忙循环（VMD 每次响应 FAILED -> 再 supersede
+        // -> chain_ok 仍 false -> 无退避 return 的闭环）。
+        schedule_status_retry_locked();
         persist_locked();
         return;
     }

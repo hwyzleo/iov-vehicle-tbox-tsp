@@ -1304,6 +1304,48 @@ TEST_F(V2cKeyProvisioningCoordinatorTest, NonTerminalNotFoundBlocksAwait) {
     EXPECT_EQ(snap.attempts_created, 1u);
 }
 
+// CR-017 回归：BLOCKED_AWAIT_CLOUD_TERMINATION 态收到 VMD FAILED 且恢复链
+// 预算耗尽（supersede 被拒）后，tick 不得立即重发 StatusRequest。
+// 此前 supersede chain 耗尽分支无 schedule_status_retry_locked()，next_retry_ms_
+// 不推进，worker 每 poll_interval_ms 都会重发 StatusRequest，形成 200ms 忙循环
+// （云端观测 uplinkType=StatusRequest 约 200ms 一条）。修复后必须有退避。
+TEST_F(V2cKeyProvisioningCoordinatorTest,
+       BlockedAwaitChainExhaustedNoStatusRequestBusyLoop) {
+    // 链预算 0：任何 supersede 均被拒 -> 保持 BLOCKED_AWAIT（chain_budget_exhausted）。
+    // kl1_params_ 在 initialize() 时固化，须在 initialize 前设置，故重新装配。
+    cfg_.kl1_chain_ids = 0;
+    coord_->stop();
+    coord_ = std::make_unique<V2cKeyProvisioningCoordinator>(mqtt_, sec_, store_);
+    coord_->set_clock_sync_check([this] { return clock_synced_; });
+    ASSERT_TRUE(coord_->initialize(cfg_));
+    ASSERT_TRUE(coord_->start(false));
+    sec_->status_items.clear();
+    sec_->query_state = kNotFound;
+    make_ready();
+    coord_->tick();
+    std::string rid = coord_->snapshot().request_id;
+
+    // 进入 BLOCKED_AWAIT：806095 幂等冲突 -> 对账；VMD REQUESTED -> 等待云端终结。
+    coord_->handle_routed_downlink(downlink(
+        make_response_error_envelope(rid, KEY_PROVISIONING_RESULT_REJECTED, "806095")));
+    coord_->handle_routed_downlink(downlink(
+        make_status_response_envelope(rid, kStatusRequested)));
+    auto snap = coord_->snapshot();
+    ASSERT_EQ(snap.state, V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION);
+
+    // VMD 终结（FAILED）：触发 supersede，但链预算耗尽 -> 仍 BLOCKED_AWAIT。
+    coord_->handle_routed_downlink(downlink(
+        make_status_response_envelope(rid, kStatusFailed)));
+    snap = coord_->snapshot();
+    ASSERT_EQ(snap.state, V2cKeyProvState::BLOCKED_AWAIT_CLOUD_TERMINATION);
+    EXPECT_EQ(snap.last_error, "chain_budget_exhausted");
+
+    // 关键回归断言：FAILED 响应后立即 tick 不得发新的 StatusRequest（退避已推进）。
+    const int up_before = publish_count_for("keyprov.uplink");
+    coord_->tick();
+    EXPECT_EQ(publish_count_for("keyprov.uplink"), up_before);
+}
+
 // CR-015：已调用 SEC import（结果待定）+ SEC NOT_FOUND -> 不再永久 EVIDENCE_CONFLICT
 // 阻断；进入稳定化（RECONCILE_EVIDENCE -> STABILIZING_NOT_FOUND），
 // 连续强 NOT_FOUND 达成后按云端终态释放（VMD FAILED + 缓存 -> 唯一 successor）。
